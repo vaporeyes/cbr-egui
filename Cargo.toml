@@ -1,0 +1,22 @@
+[package]
+name = "cbr-egui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam-channel = "0.5"
+eframe = "0.31"
+image = "0.25"
+lru = "0.13"
+natord = "1"
+notify = "6"
+pdfium-render = "0.9"
+quick-xml = { version = "0.36", features = ["serialize"] }
+rfd = "0.15"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+unrar = "0.5"
+zip = "2"

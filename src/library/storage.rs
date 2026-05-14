@@ -1,0 +1,286 @@
+use rusqlite::{Connection, OptionalExtension, params};
+
+use super::errors::LibraryError;
+use super::models::{Comic, ComicAvailability, ComicInput, Folder, Progress};
+
+pub struct LibraryStorage {
+    connection: Connection,
+}
+
+impl LibraryStorage {
+    pub fn open(path: &std::path::Path) -> Result<Self, LibraryError> {
+        let storage = Self {
+            connection: Connection::open(path)?,
+        };
+        storage.initialize_schema()?;
+        Ok(storage)
+    }
+
+    pub fn initialize_schema(&self) -> Result<(), LibraryError> {
+        self.connection.execute_batch(
+            "
+            PRAGMA foreign_keys = ON;
+
+            CREATE TABLE IF NOT EXISTS folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                parent_id INTEGER NULL,
+                FOREIGN KEY(parent_id) REFERENCES folders(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS metadata (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NULL,
+                number TEXT NULL,
+                writer TEXT NULL,
+                penciller TEXT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS comics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                hash TEXT NOT NULL,
+                page_count INTEGER NOT NULL,
+                metadata_id INTEGER NULL,
+                availability INTEGER NOT NULL DEFAULT 1,
+                thumbnail_key TEXT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS progress (
+                comic_id INTEGER PRIMARY KEY,
+                current_page INTEGER NOT NULL,
+                is_read INTEGER NOT NULL,
+                FOREIGN KEY(comic_id) REFERENCES comics(id) ON DELETE CASCADE
+            );
+            ",
+        )?;
+        self.add_column_if_missing("comics", "availability", "INTEGER NOT NULL DEFAULT 1")?;
+        self.add_column_if_missing("comics", "thumbnail_key", "TEXT NULL")?;
+        Ok(())
+    }
+
+    fn add_column_if_missing(
+        &self,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> Result<(), LibraryError> {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+        match self.connection.execute_batch(&sql) {
+            Ok(()) => Ok(()),
+            Err(err) if err.to_string().contains("duplicate column name") => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    pub fn table_exists(&self, table: &str) -> Result<bool, LibraryError> {
+        let exists = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(exists)
+    }
+
+    pub fn create_folder(
+        &self,
+        path: &str,
+        parent_id: Option<i64>,
+    ) -> Result<Folder, LibraryError> {
+        if let Some(id) = parent_id {
+            let exists = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM folders WHERE id = ?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(LibraryError::InvalidParent(id));
+            }
+        }
+
+        self.connection.execute(
+            "INSERT INTO folders (path, parent_id) VALUES (?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET parent_id = excluded.parent_id",
+            params![path, parent_id],
+        )?;
+
+        self.get_folder_by_path(path)?
+            .ok_or(LibraryError::Database(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn get_folder(&self, id: i64) -> Result<Option<Folder>, LibraryError> {
+        self.connection
+            .query_row(
+                "SELECT id, path, parent_id FROM folders WHERE id = ?1",
+                [id],
+                folder_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_folder_by_path(&self, path: &str) -> Result<Option<Folder>, LibraryError> {
+        self.connection
+            .query_row(
+                "SELECT id, path, parent_id FROM folders WHERE path = ?1",
+                [path],
+                folder_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_comic(&self, input: &ComicInput) -> Result<Comic, LibraryError> {
+        self.connection.execute(
+            "INSERT INTO comics (path, hash, page_count, metadata_id, availability) VALUES (?1, ?2, ?3, ?4, 1)
+             ON CONFLICT(path) DO UPDATE SET
+                hash = excluded.hash,
+                page_count = excluded.page_count,
+                metadata_id = excluded.metadata_id,
+                availability = 1",
+            params![input.path, input.hash, input.page_count, input.metadata_id],
+        )?;
+
+        self.get_comic_by_path(&input.path)?
+            .ok_or(LibraryError::Database(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn get_comic(&self, id: i64) -> Result<Option<Comic>, LibraryError> {
+        self.connection
+            .query_row(
+                comic_select_sql("WHERE id = ?1").as_str(),
+                [id],
+                comic_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_comic_by_path(&self, path: &str) -> Result<Option<Comic>, LibraryError> {
+        self.connection
+            .query_row(
+                comic_select_sql("WHERE path = ?1").as_str(),
+                [path],
+                comic_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_comics(&self) -> Result<Vec<Comic>, LibraryError> {
+        let sql = comic_select_sql("ORDER BY path");
+        let mut statement = self.connection.prepare(&sql)?;
+        let comics = statement
+            .query_map([], comic_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(comics)
+    }
+
+    pub fn set_comic_availability(
+        &self,
+        path: &str,
+        availability: ComicAvailability,
+    ) -> Result<(), LibraryError> {
+        self.connection.execute(
+            "UPDATE comics SET availability = ?2 WHERE path = ?1",
+            params![path, availability.as_i64()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_thumbnail_key(
+        &self,
+        path: &str,
+        thumbnail_key: Option<&str>,
+    ) -> Result<(), LibraryError> {
+        self.connection.execute(
+            "UPDATE comics SET thumbnail_key = ?2 WHERE path = ?1",
+            params![path, thumbnail_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_progress(
+        &self,
+        comic_id: i64,
+        current_page: u32,
+        is_read: bool,
+    ) -> Result<Progress, LibraryError> {
+        self.connection.execute(
+            "INSERT INTO progress (comic_id, current_page, is_read) VALUES (?1, ?2, ?3)
+             ON CONFLICT(comic_id) DO UPDATE SET
+                current_page = excluded.current_page,
+                is_read = excluded.is_read",
+            params![comic_id, current_page, is_read],
+        )?;
+
+        self.get_progress(comic_id)?
+            .ok_or(LibraryError::Database(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn get_progress(&self, comic_id: i64) -> Result<Option<Progress>, LibraryError> {
+        self.connection
+            .query_row(
+                "SELECT comic_id, current_page, is_read FROM progress WHERE comic_id = ?1",
+                [comic_id],
+                progress_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn progress_count_for_comic(&self, comic_id: i64) -> Result<u32, LibraryError> {
+        let count = self.connection.query_row(
+            "SELECT COUNT(*) FROM progress WHERE comic_id = ?1",
+            [comic_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        i64_to_u32("progress_count", count)
+    }
+
+    pub fn purge_unavailable_comics(&self) -> Result<usize, LibraryError> {
+        let deleted = self
+            .connection
+            .execute("DELETE FROM comics WHERE availability = 0", [])?;
+        Ok(deleted)
+    }
+}
+
+fn folder_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Folder> {
+    Ok(Folder {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        parent_id: row.get(2)?,
+    })
+}
+
+fn comic_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Comic> {
+    let page_count = row.get::<_, u32>(3)?;
+    Ok(Comic {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        hash: row.get(2)?,
+        page_count,
+        metadata_id: row.get(4)?,
+        availability: ComicAvailability::from_i64(row.get::<_, i64>(5)?),
+        thumbnail_key: row.get(6)?,
+    })
+}
+
+fn comic_select_sql(suffix: &str) -> String {
+    format!(
+        "SELECT id, path, hash, page_count, metadata_id, availability, thumbnail_key FROM comics {suffix}"
+    )
+}
+
+fn progress_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Progress> {
+    Ok(Progress {
+        comic_id: row.get(0)?,
+        current_page: row.get(1)?,
+        is_read: row.get(2)?,
+    })
+}
+
+fn i64_to_u32(field: &'static str, value: i64) -> Result<u32, LibraryError> {
+    u32::try_from(value).map_err(|_| LibraryError::IntegerConversion { field, value })
+}
