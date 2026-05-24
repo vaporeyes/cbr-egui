@@ -3,13 +3,18 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use crate::library::errors::LibraryError;
-use crate::vfs::{ArchiveReader, PdfArchiveReader, RarArchiveReader, ZipArchiveReader};
+use crate::library::metadata::read_archive_metadata;
+use crate::library::models::ComicMetadata;
+use crate::vfs::{
+    ArchiveError, ArchiveReader, PdfArchiveReader, RarArchiveReader, ZipArchiveReader,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedComic {
     pub path: String,
     pub fingerprint: String,
     pub page_count: u32,
+    pub metadata: Option<ComicMetadata>,
 }
 
 pub fn is_supported_archive_path(path: impl AsRef<Path>) -> bool {
@@ -69,21 +74,45 @@ pub fn source_fingerprint(path: impl AsRef<Path>) -> Result<String, LibraryError
 }
 
 pub fn archive_page_count(path: impl AsRef<Path>) -> Result<u32, LibraryError> {
-    let path = path.as_ref();
+    let mut reader = archive_reader_for_path(path.as_ref())?;
+    Ok(reader.list_pages()?.len() as u32)
+}
+
+pub fn archive_metadata(path: impl AsRef<Path>) -> Result<Option<ComicMetadata>, LibraryError> {
+    let mut reader = archive_reader_for_path(path.as_ref())?;
+    read_archive_metadata(&mut *reader).map_err(LibraryError::from)
+}
+
+fn archive_reader_for_path(path: &Path) -> Result<Box<dyn ArchiveReader>, LibraryError> {
     let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
 
-    let pages = match extension.as_str() {
-        "cbz" | "zip" => ZipArchiveReader::new(path).list_pages()?,
-        "cbr" | "rar" => RarArchiveReader::new(path).list_pages()?,
-        "pdf" => PdfArchiveReader::new(path).list_pages()?,
-        _ => Vec::new(),
+    let reader: Box<dyn ArchiveReader> = match extension.as_str() {
+        "cbz" | "zip" => Box::new(ZipArchiveReader::new(path)),
+        "cbr" | "rar" => Box::new(RarArchiveReader::new(path)),
+        "pdf" => Box::new(PdfArchiveReader::new(path)),
+        _ => {
+            return Err(LibraryError::Archive(ArchiveError::UnsupportedFormat(
+                path.display().to_string(),
+            )));
+        }
     };
+    Ok(reader)
+}
 
-    Ok(pages.len() as u32)
+fn archive_scan_details(path: &Path) -> (u32, Option<ComicMetadata>) {
+    let Ok(mut reader) = archive_reader_for_path(path) else {
+        return (0, None);
+    };
+    let page_count = reader
+        .list_pages()
+        .map(|pages| pages.len() as u32)
+        .unwrap_or(0);
+    let metadata = read_archive_metadata(&mut *reader).ok().flatten();
+    (page_count, metadata)
 }
 
 pub fn scan_library_root(root: impl AsRef<Path>) -> Result<Vec<ScannedComic>, LibraryError> {
@@ -91,11 +120,12 @@ pub fn scan_library_root(root: impl AsRef<Path>) -> Result<Vec<ScannedComic>, Li
         .into_iter()
         .map(|path| {
             let fingerprint = source_fingerprint(&path)?;
-            let page_count = archive_page_count(&path).unwrap_or(0);
+            let (page_count, metadata) = archive_scan_details(&path);
             Ok(ScannedComic {
                 path: path.to_string_lossy().into_owned(),
                 fingerprint,
                 page_count,
+                metadata,
             })
         })
         .collect()

@@ -1,3 +1,5 @@
+// ABOUTME: Decodes raw page image bytes into egui color images for display.
+// ABOUTME: Defines cancellation-aware decode request and result payloads.
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -56,6 +58,7 @@ impl Default for CancellationToken {
 pub struct DecodeResult {
     pub request_id: DecodeRequestId,
     pub page_index: usize,
+    pub purpose: DecodePurpose,
     pub outcome: Result<egui::ColorImage, DecodeError>,
 }
 
@@ -72,6 +75,7 @@ pub fn decode_page(request: DecodeRequest) -> DecodeResult {
     DecodeResult {
         request_id: request.request_id,
         page_index: request.page_index,
+        purpose: request.purpose,
         outcome,
     }
 }

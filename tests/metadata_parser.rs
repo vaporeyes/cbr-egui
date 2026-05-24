@@ -5,11 +5,12 @@ use cbr_egui::vfs::{ArchiveError, ArchiveReader, build_pages};
 #[test]
 fn parses_valid_comic_info_fields() {
     let metadata = parse_comic_info_xml(
-        br#"<ComicInfo><Title>Saga</Title><Number>1</Number><Writer>Brian K. Vaughan</Writer><Penciller>Fiona Staples</Penciller></ComicInfo>"#,
+        br#"<ComicInfo><Series>Saga</Series><Title>Chapter One</Title><Number>1</Number><Writer>Brian K. Vaughan</Writer><Penciller>Fiona Staples</Penciller></ComicInfo>"#,
     )
     .expect("valid metadata");
 
-    assert_eq!(metadata.title.as_deref(), Some("Saga"));
+    assert_eq!(metadata.series.as_deref(), Some("Saga"));
+    assert_eq!(metadata.title.as_deref(), Some("Chapter One"));
     assert_eq!(metadata.number.as_deref(), Some("1"));
     assert_eq!(metadata.writer.as_deref(), Some("Brian K. Vaughan"));
     assert_eq!(metadata.penciller.as_deref(), Some("Fiona Staples"));
@@ -21,6 +22,7 @@ fn parses_partial_metadata_as_empty_optional_fields() {
         .expect("partial metadata");
 
     assert_eq!(metadata.title.as_deref(), Some("Only Title"));
+    assert_eq!(metadata.series, None);
     assert_eq!(metadata.number, None);
     assert_eq!(metadata.writer, None);
     assert_eq!(metadata.penciller, None);

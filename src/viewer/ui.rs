@@ -76,7 +76,7 @@ fn render_ready_page(
             paint_current_page_or_spread(ui, state, texture, pixel_size, rect, image_size, offset);
 
             if response.hovered() && scroll_delta != 0.0 {
-                let factor = scroll_zoom_factor(scroll_delta);
+                let factor = scroll_zoom_factor(scroll_delta, state.zoom_sensitivity);
                 let anchor = ui
                     .input(|input| input.pointer.hover_pos())
                     .map(|pos| zoom_anchor_for_pointer(pos, rect))
@@ -233,8 +233,13 @@ fn one_to_one_zoom(base_display_size: Size2, pixel_size: Size2) -> f32 {
     (pixel_size.width / base_display_size.width).max(pixel_size.height / base_display_size.height)
 }
 
-fn scroll_zoom_factor(scroll_delta: f32) -> f32 {
-    (scroll_delta * 0.0015).exp()
+fn scroll_zoom_factor(scroll_delta: f32, sensitivity: f32) -> f32 {
+    let sensitivity = if sensitivity.is_finite() && sensitivity > 0.0 {
+        sensitivity
+    } else {
+        crate::viewer::state::DEFAULT_SCROLL_ZOOM_SENSITIVITY
+    };
+    (scroll_delta * sensitivity).exp()
 }
 
 fn zoom_anchor_for_pointer(pointer: egui::Pos2, canvas: egui::Rect) -> ZoomAnchor {

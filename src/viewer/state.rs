@@ -6,7 +6,7 @@ use crate::viewer::spread::{
 
 pub const DEFAULT_MIN_ZOOM: f32 = 1.0;
 pub const DEFAULT_MAX_ZOOM: f32 = 6.0;
-const SCROLL_ZOOM_SENSITIVITY: f32 = 0.0015;
+pub const DEFAULT_SCROLL_ZOOM_SENSITIVITY: f32 = 0.0015;
 
 pub use crate::viewer::layout::PageId;
 
@@ -37,7 +37,16 @@ impl Default for ZoomPanState {
 
 impl ZoomPanState {
     pub fn apply_scroll_zoom(&mut self, scroll_delta: f32) {
-        let multiplier = (scroll_delta * SCROLL_ZOOM_SENSITIVITY).exp();
+        self.apply_scroll_zoom_with_sensitivity(scroll_delta, DEFAULT_SCROLL_ZOOM_SENSITIVITY);
+    }
+
+    pub fn apply_scroll_zoom_with_sensitivity(&mut self, scroll_delta: f32, sensitivity: f32) {
+        let sensitivity = if sensitivity.is_finite() && sensitivity > 0.0 {
+            sensitivity
+        } else {
+            DEFAULT_SCROLL_ZOOM_SENSITIVITY
+        };
+        let multiplier = (scroll_delta * sensitivity).exp();
         self.apply_zoom_factor(multiplier, ZoomAnchor::CENTER);
     }
 
@@ -263,6 +272,7 @@ impl Default for ViewerChrome {
 pub struct ViewerState<T> {
     pub current_page_id: Option<PageId>,
     pub view_mode: ViewMode,
+    pub zoom_sensitivity: f32,
     pub zoom_pan: ZoomPanState,
     pub page_status: PageStatus<T>,
     pub viewport_size: Size2,
@@ -285,6 +295,7 @@ impl<T> Default for ViewerState<T> {
         Self {
             current_page_id: None,
             view_mode: ViewMode::Fit,
+            zoom_sensitivity: DEFAULT_SCROLL_ZOOM_SENSITIVITY,
             zoom_pan: ZoomPanState::default(),
             page_status: PageStatus::Empty,
             viewport_size: Size2::ZERO,

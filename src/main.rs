@@ -3,6 +3,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "cbr-egui",
         options,
-        Box::new(|_cc| Ok(Box::new(cbr_egui::app::ui::EguiComicReaderApp::new()))),
+        Box::new(|cc| {
+            let app = cbr_egui::app::ui::EguiComicReaderApp::new();
+            app.apply_config_to_context(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
     )
 }

@@ -7,6 +7,10 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use image::imageops::FilterType;
 use thiserror::Error;
 
+use crate::vfs::{
+    ArchiveError, ArchiveReader, PdfArchiveReader, RarArchiveReader, ZipArchiveReader,
+};
+
 use crate::library::models::ArchivePage;
 
 pub const MAX_THUMBNAIL_HEIGHT: u32 = 300;
@@ -38,7 +42,6 @@ pub struct ThumbnailCacheEntry {
 pub struct ThumbnailRequest {
     pub source_path: String,
     pub source_fingerprint: String,
-    pub bytes: Vec<u8>,
     pub cache_path: PathBuf,
 }
 
@@ -160,8 +163,11 @@ fn spawn_thumbnail_worker(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         while let Ok(request) = request_receiver.recv() {
-            let outcome =
-                write_thumbnail(&request.bytes, &request.cache_path).map_err(|err| err.to_string());
+            let outcome = read_cover_bytes(Path::new(&request.source_path))
+                .map_err(|err| err.to_string())
+                .and_then(|bytes| {
+                    write_thumbnail(&bytes, &request.cache_path).map_err(|err| err.to_string())
+                });
             let result = ThumbnailResult {
                 source_path: request.source_path,
                 cache_path: request.cache_path,
@@ -172,4 +178,27 @@ fn spawn_thumbnail_worker(
             }
         }
     })
+}
+
+fn read_cover_bytes(archive_path: &Path) -> Result<Vec<u8>, ArchiveError> {
+    let mut reader = archive_reader_for_path(archive_path)?;
+    let pages = reader.list_pages()?;
+    let page = cover_request_for_pages(&pages)
+        .ok_or_else(|| ArchiveError::NotFound("cover page".to_owned()))?;
+    reader.read_page(&page.path)
+}
+
+fn archive_reader_for_path(path: &Path) -> Result<Box<dyn ArchiveReader>, ArchiveError> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+
+    match extension.as_str() {
+        "cbz" | "zip" => Ok(Box::new(ZipArchiveReader::new(path))),
+        "cbr" | "rar" => Ok(Box::new(RarArchiveReader::new(path))),
+        "pdf" => Ok(Box::new(PdfArchiveReader::new(path))),
+        _ => Err(ArchiveError::UnsupportedFormat(path.display().to_string())),
+    }
 }

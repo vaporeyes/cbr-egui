@@ -53,6 +53,21 @@ fn scan_reports_archives_and_page_counts_when_readable() {
 }
 
 #[test]
+fn scan_captures_comic_info_metadata_when_present() {
+    let dir = tempfile::tempdir().expect("dir");
+    let archive = dir.path().join("book.cbz");
+    zip_fixture_with_metadata(&archive);
+
+    let scanned = scan_library_root(dir.path()).expect("scan");
+
+    let metadata = scanned[0].metadata.as_ref().expect("metadata");
+    assert_eq!(metadata.series.as_deref(), Some("Saga"));
+    assert_eq!(metadata.title.as_deref(), Some("Chapter One"));
+    assert_eq!(metadata.number.as_deref(), Some("12"));
+    assert_eq!(metadata.writer.as_deref(), Some("Brian K. Vaughan"));
+}
+
+#[test]
 fn reconciliation_updates_removed_paths_without_duplicates() {
     let dir = tempfile::tempdir().expect("db");
     let service = LibraryService::initialize(&dir.path().join("library.sqlite")).expect("service");
@@ -70,6 +85,7 @@ fn reconciliation_updates_removed_paths_without_duplicates() {
             path: "/library/new.cbz".to_owned(),
             fingerprint: "new".to_owned(),
             page_count: 2,
+            metadata: None,
         }])
         .expect("reconcile");
 
@@ -87,5 +103,19 @@ fn zip_fixture(path: &std::path::Path) {
     zip.write_all(b"one").expect("page 1 bytes");
     zip.start_file("page_2.jpg", options).expect("page 2");
     zip.write_all(b"two").expect("page 2 bytes");
+    zip.finish().expect("finish zip");
+}
+
+fn zip_fixture_with_metadata(path: &std::path::Path) {
+    let file = std::fs::File::create(path).expect("zip file");
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    zip.start_file("ComicInfo.xml", options).expect("metadata");
+    zip.write_all(
+        br#"<ComicInfo><Series>Saga</Series><Title>Chapter One</Title><Number>12</Number><Writer>Brian K. Vaughan</Writer></ComicInfo>"#,
+    )
+    .expect("metadata bytes");
+    zip.start_file("page_1.jpg", options).expect("page 1");
+    zip.write_all(b"one").expect("page 1 bytes");
     zip.finish().expect("finish zip");
 }

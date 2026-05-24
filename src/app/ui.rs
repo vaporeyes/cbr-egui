@@ -1,3 +1,5 @@
+// ABOUTME: Renders the egui application shell, library controls, and reader toolbar.
+// ABOUTME: Connects UI events to the app state without owning archive or storage logic.
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -6,20 +8,24 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, bounded};
 use eframe::egui;
 
-use crate::app::{AppState, CachedPage, ComicReaderApp, LibraryViewMode, ReadingSession};
+use crate::app::{
+    AppState, CachedPage, ComicReaderApp, LibraryViewMode, ProgressSnapshot, ReadingSession,
+};
+use crate::config::{AppConfig, default_config_path, default_library_db_path};
 use crate::decode::{
     CancellationToken, DecodePurpose, DecodeRequest, DecodeRequestId, DecodeResult, decode_page,
 };
 use crate::library::{
-    ComicAvailability, LibraryGridItem, ThumbnailRequest, ThumbnailStatus, ThumbnailWorkerPool,
-    cache_path_for_source, scan_library_root, source_fingerprint,
+    ActiveLibraryFilter, ComicAvailability, LibraryGridItem, LibraryGroupKind, LibraryService,
+    ScannedComic, ThumbnailRequest, ThumbnailStatus, ThumbnailWorkerPool, cache_path_for_source,
+    scan_library_root,
 };
 use crate::vfs::{ArchiveReader, PdfArchiveReader, RarArchiveReader, ZipArchiveReader};
 use crate::viewer::layout::{Size2, ViewMode};
 use crate::viewer::{
     self, ContinuousPage, ContinuousPageStatus, PageId, PageNavigationCommand, PageStatus,
-    ReadingLayoutMode, ViewCommand, anchor_for_viewport, build_virtual_canvas, prefetch_candidates,
-    scroll_top_for_anchor,
+    ReadingDirection, ReadingLayoutMode, ViewCommand, anchor_for_viewport, build_virtual_canvas,
+    prefetch_candidates, scroll_top_for_anchor,
 };
 
 pub const GRID_TILE_WIDTH: f32 = 190.0;
@@ -28,6 +34,34 @@ const LIST_THUMBNAIL_WIDTH: f32 = 56.0;
 const LIST_THUMBNAIL_HEIGHT: f32 = 74.0;
 const EMPTY_LIBRARY_TITLE: &str = "No library loaded";
 const EMPTY_LIBRARY_DETAIL: &str = "Add a library root to scan comics and build the cover grid.";
+const EDITOR_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(44, 58, 60);
+const EDITOR_PANEL: egui::Color32 = egui::Color32::from_rgb(50, 68, 70);
+const EDITOR_PANEL_DARK: egui::Color32 = egui::Color32::from_rgb(39, 53, 55);
+const EDITOR_PANEL_ACTIVE: egui::Color32 = egui::Color32::from_rgb(63, 98, 104);
+const EDITOR_WIDGET: egui::Color32 = egui::Color32::from_rgb(57, 78, 80);
+const EDITOR_WIDGET_HOVER: egui::Color32 = egui::Color32::from_rgb(70, 102, 106);
+const EDITOR_TEXT: egui::Color32 = egui::Color32::from_rgb(221, 226, 220);
+const EDITOR_TEXT_MUTED: egui::Color32 = egui::Color32::from_rgb(154, 164, 160);
+const EDITOR_GREEN: egui::Color32 = egui::Color32::from_rgb(82, 190, 145);
+const EDITOR_CYAN: egui::Color32 = egui::Color32::from_rgb(117, 219, 210);
+const EDITOR_ORANGE: egui::Color32 = egui::Color32::from_rgb(222, 129, 70);
+const EDITOR_PURPLE: egui::Color32 = egui::Color32::from_rgb(176, 127, 218);
+
+fn editor_panel_frame() -> egui::Frame {
+    egui::Frame::new()
+        .inner_margin(egui::Margin::same(14))
+        .fill(EDITOR_BACKGROUND)
+}
+
+fn editor_toolbar_frame() -> egui::Frame {
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .fill(EDITOR_PANEL_DARK)
+}
+
+fn editor_card_stroke() -> egui::Stroke {
+    egui::Stroke::new(1.0, EDITOR_GREEN)
+}
 
 pub fn responsive_grid_columns(available_width: f32, tile_width: f32, gap: f32) -> usize {
     if !available_width.is_finite() || available_width <= 0.0 || tile_width <= 0.0 {
@@ -42,9 +76,10 @@ pub fn responsive_grid_columns(available_width: f32, tile_width: f32, gap: f32) 
 pub fn render_library_grid<T>(
     ui: &mut egui::Ui,
     items: &[LibraryGridItem],
+    visible_indices: &[usize],
     thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
 ) -> Option<LibraryGridItem> {
-    if items.is_empty() {
+    if visible_indices.is_empty() {
         render_empty_library(ui);
         return None;
     }
@@ -56,7 +91,11 @@ pub fn render_library_grid<T>(
         egui::Grid::new("library_grid")
             .spacing(egui::vec2(GRID_GAP, GRID_GAP))
             .show(ui, |ui| {
-                for (index, item) in items.iter().enumerate() {
+                for (index, item) in visible_indices
+                    .iter()
+                    .filter_map(|item_index| items.get(*item_index))
+                    .enumerate()
+                {
                     if library_tile(ui, item, thumbnail_textures).clicked() {
                         selected = Some(item.clone());
                     }
@@ -73,9 +112,10 @@ pub fn render_library_grid<T>(
 pub fn render_library_list(
     ui: &mut egui::Ui,
     items: &[LibraryGridItem],
+    visible_indices: &[usize],
     thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
 ) -> Option<LibraryGridItem> {
-    if items.is_empty() {
+    if visible_indices.is_empty() {
         render_empty_library(ui);
         return None;
     }
@@ -83,7 +123,10 @@ pub fn render_library_list(
     let mut selected = None;
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 6.0;
-        for item in items {
+        for item in visible_indices
+            .iter()
+            .filter_map(|item_index| items.get(*item_index))
+        {
             let response = library_list_row(ui, item, thumbnail_textures);
             if response.clicked() {
                 selected = Some(item.clone());
@@ -333,7 +376,25 @@ pub fn load_reader_page(
 
     session.viewer_state.set_loading(page_id);
 
-    match read_archive_page_color_image(&item.path, session.current_page_index) {
+    let already_loading_current = session
+        .prefetch
+        .in_flight
+        .get(&session.current_page_index)
+        .is_some_and(|in_flight| {
+            in_flight.generation == session.prefetch.generation
+                && in_flight.purpose == DecodePurpose::Direct
+        });
+    if already_loading_current {
+        ctx.request_repaint_after(Duration::from_millis(16));
+        return;
+    }
+
+    if submit_direct_decode_for_session(session, &item.path).is_ok() {
+        ctx.request_repaint_after(Duration::from_millis(16));
+        return;
+    }
+
+    match read_session_page_color_image(session, &item.path, session.current_page_index) {
         Ok((color_image, pixel_size)) => {
             let texture = ctx.load_texture(
                 format!(
@@ -390,7 +451,7 @@ fn ensure_spread_next_page_loaded(
     }
 
     session.viewer_state.set_next_loading(next_page_id);
-    match read_archive_page_color_image(&item.path, next_page_index) {
+    match read_session_page_color_image(session, &item.path, next_page_index) {
         Ok((color_image, pixel_size)) => {
             let texture = ctx.load_texture(
                 format!("comic:{}:page:{next_page_index}", item.comic_id),
@@ -425,6 +486,55 @@ pub fn read_archive_page_color_image(
     Ok((color_image, pixel_size))
 }
 
+fn read_session_page_color_image<T>(
+    session: &mut ReadingSession<T>,
+    archive_path: impl AsRef<Path>,
+    page_index: usize,
+) -> Result<(egui::ColorImage, Size2), String> {
+    let bytes = read_session_page_bytes(session, archive_path.as_ref(), page_index)?;
+    let result = decode_page(DecodeRequest {
+        request_id: DecodeRequestId(page_index as u64),
+        page_index,
+        purpose: DecodePurpose::Direct,
+        bytes,
+        target_size: None,
+        cancellation_token: None,
+    });
+    let color_image = result.outcome.map_err(|err| err.to_string())?;
+    let pixel_size = Size2::new(color_image.size[0] as f32, color_image.size[1] as f32);
+    Ok((color_image, pixel_size))
+}
+
+fn submit_direct_decode_for_session<T>(
+    session: &mut ReadingSession<T>,
+    archive_path: &str,
+) -> Result<(), String> {
+    let page_index = session.current_page_index;
+    let bytes = read_session_page_bytes(session, Path::new(archive_path), page_index)?;
+    let worker_pool = session
+        .decode_worker_pool
+        .as_ref()
+        .ok_or_else(|| "Decode worker pool is unavailable".to_owned())?;
+    let request_id = session.prefetch.next_request_id();
+    let cancellation_token = CancellationToken::new();
+    let request = DecodeRequest {
+        request_id,
+        page_index,
+        bytes,
+        purpose: DecodePurpose::Direct,
+        target_size: None,
+        cancellation_token: Some(cancellation_token.clone()),
+    };
+    worker_pool.submit(request).map_err(|err| err.to_string())?;
+    session.prefetch.track_in_flight(
+        page_index,
+        request_id,
+        DecodePurpose::Direct,
+        cancellation_token,
+    );
+    Ok(())
+}
+
 pub fn dispatch_prefetch_for_session<T>(
     session: &mut ReadingSession<T>,
     archive_path: &str,
@@ -438,7 +548,8 @@ pub fn dispatch_prefetch_for_session<T>(
     let mut submitted = 0;
 
     for page_index in candidates {
-        let Ok(bytes) = read_archive_page_bytes(Path::new(archive_path), page_index) else {
+        let Ok(bytes) = read_session_page_bytes(session, Path::new(archive_path), page_index)
+        else {
             session
                 .prefetch
                 .failed_pages
@@ -459,9 +570,12 @@ pub fn dispatch_prefetch_for_session<T>(
             cancellation_token: Some(cancellation_token.clone()),
         };
         if worker_pool.submit(request).is_ok() {
-            session
-                .prefetch
-                .track_in_flight(page_index, request_id, cancellation_token);
+            session.prefetch.track_in_flight(
+                page_index,
+                request_id,
+                DecodePurpose::Prefetch,
+                cancellation_token,
+            );
             submitted += 1;
         }
     }
@@ -492,7 +606,8 @@ pub fn dispatch_continuous_prefetch_for_session<T>(
         {
             continue;
         }
-        let Ok(bytes) = read_archive_page_bytes(Path::new(archive_path), page_index) else {
+        let Ok(bytes) = read_session_page_bytes(session, Path::new(archive_path), page_index)
+        else {
             session
                 .prefetch
                 .failed_pages
@@ -518,9 +633,12 @@ pub fn dispatch_continuous_prefetch_for_session<T>(
             cancellation_token: Some(cancellation_token.clone()),
         };
         if worker_pool.submit(request).is_ok() {
-            session
-                .prefetch
-                .track_in_flight(page_index, request_id, cancellation_token);
+            session.prefetch.track_in_flight(
+                page_index,
+                request_id,
+                DecodePurpose::Prefetch,
+                cancellation_token,
+            );
             submitted += 1;
         }
     }
@@ -544,20 +662,32 @@ pub fn reconcile_prefetch_result(
         Ok(color_image) => {
             let pixel_size = Size2::new(color_image.size[0] as f32, color_image.size[1] as f32);
             let texture = ctx.load_texture(
-                format!("prefetch:{}:{}", result.page_index, result.request_id.0),
+                format!(
+                    "{:?}:{}:{}",
+                    result.purpose, result.page_index, result.request_id.0
+                ),
                 color_image,
                 egui::TextureOptions::LINEAR,
             );
             let _ = session.texture_cache.insert(
                 result.page_index,
                 CachedPage {
-                    texture,
+                    texture: texture.clone(),
                     pixel_size,
                 },
             );
             session
                 .continuous_scroll
                 .record_actual(result.page_index, pixel_size);
+            if result.purpose == DecodePurpose::Direct
+                && result.page_index == session.current_page_index
+            {
+                session.viewer_state.set_ready(
+                    PageId(result.page_index as u64),
+                    texture,
+                    pixel_size,
+                );
+            }
             true
         }
         Err(error) => {
@@ -569,6 +699,13 @@ pub fn reconcile_prefetch_result(
                 Size2::ZERO,
                 error.to_string(),
             );
+            if result.purpose == DecodePurpose::Direct
+                && result.page_index == session.current_page_index
+            {
+                session
+                    .viewer_state
+                    .set_failed(PageId(result.page_index as u64), error.to_string());
+            }
             false
         }
     }
@@ -671,6 +808,28 @@ fn read_archive_page_bytes(archive_path: &Path, page_index: usize) -> Result<Vec
     reader.read_page(&page.path).map_err(|err| err.to_string())
 }
 
+fn read_session_page_bytes<T>(
+    session: &mut ReadingSession<T>,
+    archive_path: &Path,
+    page_index: usize,
+) -> Result<Vec<u8>, String> {
+    ensure_session_archive_cache(session, archive_path)?;
+    session.archive_cache.read_page(page_index)
+}
+
+fn ensure_session_archive_cache<T>(
+    session: &mut ReadingSession<T>,
+    archive_path: &Path,
+) -> Result<(), String> {
+    if session.archive_cache.is_for(archive_path) {
+        return Ok(());
+    }
+    let mut reader = archive_reader_for_path(archive_path)?;
+    let pages = reader.list_pages().map_err(|err| err.to_string())?;
+    session.archive_cache.reset(archive_path, reader, pages);
+    Ok(())
+}
+
 fn archive_reader_for_path(path: &Path) -> Result<Box<dyn ArchiveReader>, String> {
     let extension = path
         .extension()
@@ -684,10 +843,6 @@ fn archive_reader_for_path(path: &Path) -> Result<Box<dyn ArchiveReader>, String
         "pdf" => Ok(Box::new(PdfArchiveReader::new(path))),
         _ => Err(format!("Unsupported archive format: {}", path.display())),
     }
-}
-
-fn read_cover_bytes(archive_path: &Path) -> Result<Vec<u8>, String> {
-    read_archive_page_bytes(archive_path, 0)
 }
 
 fn default_thumbnail_cache_root() -> PathBuf {
@@ -731,9 +886,11 @@ pub fn route_app_update(
     ctx: &egui::Context,
     app: &mut ComicReaderApp<egui::TextureHandle>,
     library_controls: &mut LibraryRootControls,
+    settings: &mut SettingsWindowState,
+    library_service: Option<&LibraryService>,
 ) {
     poll_decode_results(ctx, app);
-    library_controls.poll_scan(app);
+    library_controls.poll_scan(app, library_service);
     library_controls.poll_thumbnails(ctx, app);
     library_controls.schedule_missing_thumbnails(app);
     if library_controls.is_scanning() || library_controls.has_pending_thumbnails() {
@@ -742,25 +899,29 @@ pub fn route_app_update(
 
     match app.state {
         AppState::Library => {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                render_library_root_controls(ui, app, library_controls);
-                ui.separator();
-                let selected = match app.library.view_mode {
-                    LibraryViewMode::Thumbnails => render_library_grid::<egui::TextureHandle>(
-                        ui,
-                        &app.library.items,
-                        &mut library_controls.thumbnail_textures,
-                    ),
-                    LibraryViewMode::List => render_library_list(
-                        ui,
-                        &app.library.items,
-                        &mut library_controls.thumbnail_textures,
-                    ),
-                };
-                if let Some(item) = selected {
-                    open_grid_item_in_reader(ctx, app, &item);
-                }
-            });
+            egui::CentralPanel::default()
+                .frame(editor_panel_frame())
+                .show(ctx, |ui| {
+                    render_library_root_controls(ui, app, library_controls, settings);
+                    ui.add_space(10.0);
+                    let selected = match app.library.view_mode {
+                        LibraryViewMode::Thumbnails => render_library_grid::<egui::TextureHandle>(
+                            ui,
+                            &app.library.items,
+                            app.library.visible_indices(),
+                            &mut library_controls.thumbnail_textures,
+                        ),
+                        LibraryViewMode::List => render_library_list(
+                            ui,
+                            &app.library.items,
+                            app.library.visible_indices(),
+                            &mut library_controls.thumbnail_textures,
+                        ),
+                    };
+                    if let Some(item) = selected {
+                        open_grid_item_in_reader(ctx, app, &item);
+                    }
+                });
         }
         AppState::Reading(_) => {
             if let Some(item) = active_library_item(app) {
@@ -776,13 +937,14 @@ pub fn route_app_update(
                 );
             }
             egui::TopBottomPanel::top("reader_nav")
+                .frame(editor_toolbar_frame())
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Library").clicked() {
                             app.return_to_library();
                         }
-                        render_reader_toolbar(ui, app);
+                        render_reader_toolbar(ui, app, settings);
                     });
                 });
             if let Some(item) = active_library_item(app) {
@@ -801,7 +963,11 @@ pub fn route_app_update(
     }
 }
 
-fn render_reader_toolbar(ui: &mut egui::Ui, app: &mut ComicReaderApp<egui::TextureHandle>) {
+fn render_reader_toolbar(
+    ui: &mut egui::Ui,
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+    settings: &mut SettingsWindowState,
+) {
     let Some(session) = &mut app.reading else {
         return;
     };
@@ -813,6 +979,10 @@ fn render_reader_toolbar(ui: &mut egui::Ui, app: &mut ComicReaderApp<egui::Textu
         session.current_page_index.saturating_add(1),
         session.page_count
     ));
+    ui.separator();
+    if ui.button("Settings").clicked() {
+        settings.open = true;
+    }
     ui.separator();
     if ui
         .add_enabled(
@@ -884,11 +1054,17 @@ fn render_reader_toolbar(ui: &mut egui::Ui, app: &mut ComicReaderApp<egui::Textu
 
 pub struct LibraryRootControls {
     pub root_path: String,
-    scan_result_receiver: Option<Receiver<Result<Vec<LibraryGridItem>, String>>>,
+    scan_result_receiver: Option<Receiver<Result<Vec<ScannedComic>, String>>>,
     thumbnail_pool: Option<ThumbnailWorkerPool>,
     pending_thumbnails: HashSet<String>,
     thumbnail_textures: HashMap<String, egui::TextureHandle>,
     thumbnail_cache_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingsWindowState {
+    pub open: bool,
+    pub last_error: Option<String>,
 }
 
 impl LibraryRootControls {
@@ -921,14 +1097,16 @@ impl LibraryRootControls {
         self.scan_result_receiver = Some(receiver);
 
         thread::spawn(move || {
-            let result = scan_library_root(&root_path)
-                .map(|comics| scanned_comics_to_grid_items(&comics))
-                .map_err(|error| error.to_string());
+            let result = scan_library_root(&root_path).map_err(|error| error.to_string());
             let _ = sender.send(result);
         });
     }
 
-    fn poll_scan(&mut self, app: &mut ComicReaderApp<egui::TextureHandle>) {
+    fn poll_scan(
+        &mut self,
+        app: &mut ComicReaderApp<egui::TextureHandle>,
+        library_service: Option<&LibraryService>,
+    ) {
         let Some(receiver) = &self.scan_result_receiver else {
             return;
         };
@@ -938,17 +1116,31 @@ impl LibraryRootControls {
 
         self.scan_result_receiver = None;
         match result {
-            Ok(items) => {
-                app.library.items = items;
-                app.library.status_text = Some(format!(
-                    "Loaded {} comic{}",
-                    app.library.items.len(),
-                    if app.library.items.len() == 1 {
-                        ""
-                    } else {
-                        "s"
+            Ok(scanned) => {
+                let mut status_text = None;
+                app.library.items = if let Some(service) = library_service {
+                    match persist_scanned_comics_to_grid_items(service, &scanned) {
+                        Ok(items) => items,
+                        Err(message) => {
+                            status_text = Some(message);
+                            scanned_comics_to_grid_items(&scanned)
+                        }
                     }
-                ));
+                } else {
+                    scanned_comics_to_grid_items(&scanned)
+                };
+                app.library.refresh_filter_cache();
+                app.library.status_text = status_text.or_else(|| {
+                    Some(format!(
+                        "Loaded {} comic{}",
+                        app.library.items.len(),
+                        if app.library.items.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ))
+                });
             }
             Err(message) => {
                 app.library.status_text = Some(message);
@@ -1006,17 +1198,11 @@ impl LibraryRootControls {
                 continue;
             }
 
-            let fingerprint = match source_fingerprint(&item.path) {
-                Ok(fingerprint) => fingerprint,
-                Err(error) => {
-                    item.thumbnail_status = ThumbnailStatus::Failed {
-                        message: error.to_string(),
-                    };
-                    continue;
-                }
-            };
-            let cache_path =
-                cache_path_for_source(&self.thumbnail_cache_root, &item.path, &fingerprint);
+            let cache_path = cache_path_for_source(
+                &self.thumbnail_cache_root,
+                &item.path,
+                &item.source_fingerprint,
+            );
             if cache_path.exists() {
                 item.thumbnail_status = ThumbnailStatus::Ready {
                     cache_path: cache_path.to_string_lossy().into_owned(),
@@ -1024,18 +1210,9 @@ impl LibraryRootControls {
                 continue;
             }
 
-            let bytes = match read_cover_bytes(Path::new(&item.path)) {
-                Ok(bytes) => bytes,
-                Err(message) => {
-                    item.thumbnail_status = ThumbnailStatus::Failed { message };
-                    continue;
-                }
-            };
-
             match pool.submit(ThumbnailRequest {
                 source_path: item.path.clone(),
-                source_fingerprint: fingerprint,
-                bytes,
+                source_fingerprint: item.source_fingerprint.clone(),
                 cache_path,
             }) {
                 Ok(()) => {
@@ -1073,68 +1250,182 @@ pub fn scanned_comics_to_grid_items(
                 .unwrap_or(&comic.path)
                 .to_owned(),
             path: comic.path.clone(),
+            source_fingerprint: comic.fingerprint.clone(),
             page_count: comic.page_count,
             thumbnail_status: ThumbnailStatus::Missing,
             availability: ComicAvailability::Available,
+            subtitle: None,
+            series: None,
+            series_key: None,
+            folder_label: std::path::Path::new(&comic.path)
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|value| value.to_str())
+                .map(str::to_owned),
+            folder_key: std::path::Path::new(&comic.path)
+                .parent()
+                .map(|parent| parent.to_string_lossy().into_owned()),
         })
         .collect()
+}
+
+pub fn persist_scanned_comics_to_grid_items(
+    service: &LibraryService,
+    comics: &[crate::library::ScannedComic],
+) -> Result<Vec<LibraryGridItem>, String> {
+    service
+        .reconcile_scanned_comics(comics)
+        .map_err(|error| format!("Library update failed: {error}"))?;
+    service
+        .library_grid_items()
+        .map_err(|error| format!("Library load failed: {error}"))
 }
 
 fn render_library_root_controls(
     ui: &mut egui::Ui,
     app: &mut ComicReaderApp<egui::TextureHandle>,
     controls: &mut LibraryRootControls,
+    settings: &mut SettingsWindowState,
 ) {
-    ui.horizontal(|ui| {
-        ui.label("Library root");
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut controls.root_path)
-                .desired_width(420.0)
-                .hint_text("/path/to/comics"),
-        );
-        let enter_pressed =
-            response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        let open_clicked = ui
-            .add_enabled(!controls.is_scanning(), egui::Button::new("Open Folder"))
-            .clicked();
-        let scan_clicked = ui
-            .add_enabled(!controls.is_scanning(), egui::Button::new("Scan"))
-            .clicked();
-        if open_clicked
-            && let Some(folder) = rfd::FileDialog::new().set_directory(".").pick_folder()
+    editor_toolbar_frame().show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Library root").color(EDITOR_GREEN));
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut controls.root_path)
+                    .desired_width(420.0)
+                    .hint_text("/path/to/comics"),
+            );
+            let enter_pressed =
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let open_clicked = ui
+                .add_enabled(!controls.is_scanning(), egui::Button::new("Open Folder"))
+                .clicked();
+            let scan_clicked = ui
+                .add_enabled(!controls.is_scanning(), egui::Button::new("Scan"))
+                .clicked();
+            if open_clicked
+                && let Some(folder) = rfd::FileDialog::new().set_directory(".").pick_folder()
+            {
+                controls.root_path = folder.to_string_lossy().into_owned();
+                controls.start_scan();
+            }
+            if enter_pressed || scan_clicked {
+                controls.start_scan();
+            }
+            if controls.is_scanning() {
+                ui.spinner();
+            }
+            ui.separator();
+            if ui.button("Settings").clicked() {
+                settings.open = true;
+            }
+            ui.separator();
+            ui.selectable_value(
+                &mut app.library.view_mode,
+                LibraryViewMode::Thumbnails,
+                "Thumbnails",
+            );
+            ui.selectable_value(&mut app.library.view_mode, LibraryViewMode::List, "List");
+        });
+        ui.add_space(6.0);
+        render_library_filter_controls(ui, app);
+
+        if let Some(status_text) = &app.library.status_text {
+            ui.label(egui::RichText::new(status_text).color(EDITOR_TEXT_MUTED));
+        }
+
+        if app
+            .library
+            .items
+            .iter()
+            .any(|item| item.availability == ComicAvailability::Unavailable)
+            && ui.button("Purge unavailable").clicked()
         {
-            controls.root_path = folder.to_string_lossy().into_owned();
-            controls.start_scan();
+            let purged = app.purge_unavailable_from_view();
+            app.library.status_text = Some(format!("Purged {purged} unavailable comic(s)"));
         }
-        if enter_pressed || scan_clicked {
-            controls.start_scan();
-        }
-        if controls.is_scanning() {
-            ui.spinner();
-        }
-        ui.separator();
-        ui.selectable_value(
-            &mut app.library.view_mode,
-            LibraryViewMode::Thumbnails,
-            "Thumbnails",
-        );
-        ui.selectable_value(&mut app.library.view_mode, LibraryViewMode::List, "List");
     });
+}
 
-    if let Some(status_text) = &app.library.status_text {
-        ui.label(egui::RichText::new(status_text).weak());
+fn render_library_filter_controls(
+    ui: &mut egui::Ui,
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+) {
+    let groups = app.library.groups().to_vec();
+    if groups.is_empty() {
+        app.library.active_filter = None;
+        return;
     }
 
-    if app
-        .library
-        .items
-        .iter()
-        .any(|item| item.availability == ComicAvailability::Unavailable)
-        && ui.button("Purge unavailable").clicked()
-    {
-        let purged = app.purge_unavailable_from_view();
-        app.library.status_text = Some(format!("Purged {purged} unavailable comic(s)"));
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Filter").color(EDITOR_GREEN));
+        let mut next_filter = app.library.active_filter.clone();
+        let selected_label = app
+            .library
+            .active_filter
+            .as_ref()
+            .and_then(|active| {
+                groups
+                    .iter()
+                    .find(|group| group.kind == active.kind && group.key == active.key)
+            })
+            .map(group_label)
+            .unwrap_or_else(|| "All comics".to_owned());
+
+        egui::ComboBox::from_id_salt("library_filter")
+            .selected_text(selected_label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut next_filter, None, "All comics");
+                for group in groups
+                    .iter()
+                    .filter(|group| group.kind == LibraryGroupKind::Series)
+                {
+                    ui.selectable_value(
+                        &mut next_filter,
+                        Some(ActiveLibraryFilter {
+                            kind: group.kind,
+                            key: group.key.clone(),
+                        }),
+                        group_label(group),
+                    );
+                }
+                for group in groups
+                    .iter()
+                    .filter(|group| group.kind == LibraryGroupKind::Folder)
+                {
+                    ui.selectable_value(
+                        &mut next_filter,
+                        Some(ActiveLibraryFilter {
+                            kind: group.kind,
+                            key: group.key.clone(),
+                        }),
+                        group_label(group),
+                    );
+                }
+            });
+        if next_filter != app.library.active_filter {
+            app.library.active_filter = next_filter;
+            app.library.refresh_filter_cache();
+        }
+    });
+}
+
+fn group_label(group: &crate::library::LibraryGroup) -> String {
+    let prefix = match group.kind {
+        LibraryGroupKind::Series => "Series",
+        LibraryGroupKind::Folder => "Folder",
+    };
+    format!("{prefix}: {} ({})", group.label, group.item_count)
+}
+
+fn ellipsize_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
     }
+    let visible_chars = max_chars.saturating_sub(3);
+    let mut shortened = text.chars().take(visible_chars).collect::<String>();
+    shortened.push_str("...");
+    shortened
 }
 
 fn library_tile(
@@ -1160,20 +1451,47 @@ fn library_tile(
                     let (rect, response) =
                         ui.allocate_exact_size(thumbnail_size, egui::Sense::click());
                     let image_rect = egui::Rect::from_center_size(rect.center(), image_size);
-                    ui.painter()
-                        .rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
+                    let fill = if response.hovered() {
+                        EDITOR_PANEL_ACTIVE
+                    } else {
+                        EDITOR_PANEL_DARK
+                    };
+                    ui.painter().rect_filled(rect, 4.0, fill);
+                    ui.painter().rect_stroke(
+                        rect,
+                        4.0,
+                        egui::Stroke::new(1.0, EDITOR_WIDGET_HOVER),
+                        egui::StrokeKind::Inside,
+                    );
                     egui::Image::new((texture.id(), image_size)).paint_at(ui, image_rect);
                     response
                 } else {
-                    ui.add_sized(thumbnail_size, egui::Button::new("Cover failed").wrap())
+                    placeholder_cover_button(ui, thumbnail_size, "Cover failed")
                 }
             }
-            _ => ui.add_sized(thumbnail_size, egui::Button::new(status).wrap()),
+            _ => placeholder_cover_button(ui, thumbnail_size, status),
         };
-        ui.label(&item.title);
+        ui.label(egui::RichText::new(ellipsize_text(&item.title, 42)).color(EDITOR_TEXT));
+        if let Some(subtitle) = &item.subtitle {
+            ui.label(
+                egui::RichText::new(ellipsize_text(subtitle, 42))
+                    .color(EDITOR_TEXT_MUTED)
+                    .small(),
+            );
+        }
         response
     })
     .inner
+}
+
+fn placeholder_cover_button(ui: &mut egui::Ui, size: egui::Vec2, label: &str) -> egui::Response {
+    ui.add_sized(
+        size,
+        egui::Button::new(egui::RichText::new(label).color(EDITOR_TEXT_MUTED))
+            .fill(EDITOR_PANEL_DARK)
+            .stroke(egui::Stroke::new(1.0, EDITOR_WIDGET_HOVER))
+            .wrap(),
+    )
 }
 
 fn library_list_row(
@@ -1181,17 +1499,25 @@ fn library_list_row(
     item: &LibraryGridItem,
     thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
 ) -> egui::Response {
-    let row_height = LIST_THUMBNAIL_HEIGHT + 10.0;
+    let row_height = LIST_THUMBNAIL_HEIGHT + 18.0;
     let available_width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(available_width, row_height),
         egui::Sense::click(),
     );
 
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
-    }
+    let row_fill = if response.hovered() {
+        EDITOR_PANEL_ACTIVE
+    } else {
+        EDITOR_PANEL
+    };
+    ui.painter().rect_filled(rect, 4.0, row_fill);
+    ui.painter().rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, EDITOR_WIDGET_HOVER),
+        egui::StrokeKind::Inside,
+    );
 
     let thumb_rect = egui::Rect::from_min_size(
         rect.min + egui::vec2(8.0, 5.0),
@@ -1201,16 +1527,31 @@ fn library_list_row(
 
     let text_x = thumb_rect.right() + 12.0;
     let title_pos = egui::pos2(text_x, rect.top() + 12.0);
-    let meta_pos = egui::pos2(text_x, rect.top() + 34.0);
-    let path_pos = egui::pos2(text_x, rect.top() + 56.0);
-    ui.painter().text(
+    let subtitle_pos = egui::pos2(text_x, rect.top() + 33.0);
+    let meta_pos = egui::pos2(text_x, rect.top() + 53.0);
+    let path_pos = egui::pos2(text_x, rect.top() + 72.0);
+    let text_clip = egui::Rect::from_min_max(
+        egui::pos2(text_x, rect.top()),
+        egui::pos2(rect.right() - 8.0, rect.bottom()),
+    );
+    let painter = ui.painter().with_clip_rect(text_clip);
+    painter.text(
         title_pos,
         egui::Align2::LEFT_TOP,
-        &item.title,
-        egui::FontId::proportional(15.0),
-        ui.visuals().text_color(),
+        ellipsize_text(&item.title, 80),
+        egui::FontId::monospace(15.0),
+        EDITOR_TEXT,
     );
-    ui.painter().text(
+    if let Some(subtitle) = &item.subtitle {
+        painter.text(
+            subtitle_pos,
+            egui::Align2::LEFT_TOP,
+            ellipsize_text(subtitle, 90),
+            egui::FontId::monospace(12.0),
+            EDITOR_PURPLE,
+        );
+    }
+    painter.text(
         meta_pos,
         egui::Align2::LEFT_TOP,
         format!(
@@ -1218,15 +1559,15 @@ fn library_list_row(
             item.page_count,
             if item.page_count == 1 { "" } else { "s" }
         ),
-        egui::FontId::proportional(12.0),
-        ui.visuals().weak_text_color(),
+        egui::FontId::monospace(12.0),
+        EDITOR_CYAN,
     );
-    ui.painter().text(
+    painter.text(
         path_pos,
         egui::Align2::LEFT_TOP,
-        &item.path,
-        egui::FontId::proportional(12.0),
-        ui.visuals().weak_text_color(),
+        ellipsize_text(&item.path, 110),
+        egui::FontId::monospace(12.0),
+        EDITOR_TEXT_MUTED,
     );
 
     response
@@ -1238,8 +1579,13 @@ fn paint_list_thumbnail(
     thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
     rect: egui::Rect,
 ) {
-    ui.painter()
-        .rect_filled(rect, 3.0, ui.visuals().faint_bg_color);
+    ui.painter().rect_filled(rect, 3.0, EDITOR_PANEL_DARK);
+    ui.painter().rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(1.0, EDITOR_WIDGET_HOVER),
+        egui::StrokeKind::Inside,
+    );
     match &item.thumbnail_status {
         ThumbnailStatus::Ready { cache_path } => {
             if let Some(texture) = load_thumbnail_texture(ui, cache_path, thumbnail_textures) {
@@ -1263,8 +1609,8 @@ fn paint_thumbnail_label(ui: &mut egui::Ui, rect: egui::Rect, label: &str) {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::proportional(11.0),
-        ui.visuals().weak_text_color(),
+        egui::FontId::monospace(11.0),
+        EDITOR_TEXT_MUTED,
     );
 }
 
@@ -1274,6 +1620,72 @@ fn fit_image_size(source: egui::Vec2, bounds: egui::Vec2) -> egui::Vec2 {
     }
     let scale = (bounds.x / source.x).min(bounds.y / source.y);
     source * scale
+}
+
+fn apply_editor_text_styles(style: &mut egui::Style) {
+    style
+        .text_styles
+        .insert(egui::TextStyle::Heading, egui::FontId::monospace(20.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::monospace(14.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::monospace(13.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, egui::FontId::monospace(11.0));
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.spacing.interact_size.y = 26.0;
+}
+
+fn editor_dark_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.override_text_color = Some(EDITOR_TEXT);
+    visuals.panel_fill = EDITOR_BACKGROUND;
+    visuals.window_fill = EDITOR_PANEL;
+    visuals.window_stroke = editor_card_stroke();
+    visuals.window_corner_radius = 4.0.into();
+    visuals.menu_corner_radius = 4.0.into();
+    visuals.faint_bg_color = EDITOR_PANEL_DARK;
+    visuals.extreme_bg_color = EDITOR_PANEL_DARK;
+    visuals.code_bg_color = EDITOR_PANEL_DARK;
+    visuals.hyperlink_color = EDITOR_CYAN;
+    visuals.warn_fg_color = EDITOR_ORANGE;
+    visuals.error_fg_color = egui::Color32::from_rgb(233, 104, 104);
+    visuals.selection.bg_fill = EDITOR_PANEL_ACTIVE;
+    visuals.selection.stroke = egui::Stroke::new(1.0, EDITOR_CYAN);
+
+    visuals.widgets.noninteractive.bg_fill = EDITOR_PANEL;
+    visuals.widgets.noninteractive.weak_bg_fill = EDITOR_PANEL_DARK;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, EDITOR_WIDGET_HOVER);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, EDITOR_TEXT);
+    visuals.widgets.noninteractive.corner_radius = 4.0.into();
+
+    visuals.widgets.inactive.bg_fill = EDITOR_WIDGET;
+    visuals.widgets.inactive.weak_bg_fill = EDITOR_WIDGET;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, EDITOR_WIDGET_HOVER);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, EDITOR_TEXT);
+    visuals.widgets.inactive.corner_radius = 4.0.into();
+
+    visuals.widgets.hovered.bg_fill = EDITOR_WIDGET_HOVER;
+    visuals.widgets.hovered.weak_bg_fill = EDITOR_PANEL_ACTIVE;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, EDITOR_CYAN);
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, EDITOR_TEXT);
+    visuals.widgets.hovered.corner_radius = 4.0.into();
+
+    visuals.widgets.active.bg_fill = EDITOR_PANEL_ACTIVE;
+    visuals.widgets.active.weak_bg_fill = EDITOR_PANEL_ACTIVE;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, EDITOR_GREEN);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, EDITOR_CYAN);
+    visuals.widgets.active.corner_radius = 4.0.into();
+
+    visuals.widgets.open = visuals.widgets.hovered;
+    visuals.button_frame = true;
+    visuals.collapsing_header_frame = true;
+    visuals.striped = false;
+    visuals
 }
 
 fn render_empty_library(ui: &mut egui::Ui) {
@@ -1289,13 +1701,252 @@ fn render_empty_library(ui: &mut egui::Ui) {
 pub struct EguiComicReaderApp {
     pub inner: ComicReaderApp<egui::TextureHandle>,
     pub library_controls: LibraryRootControls,
+    pub config: AppConfig,
+    pub config_path: PathBuf,
+    pub library_service: Option<LibraryService>,
+    pub settings: SettingsWindowState,
+    last_checkpointed_progress: Option<ProgressSnapshot>,
 }
 
 impl EguiComicReaderApp {
     pub fn new() -> Self {
-        Self {
+        Self::from_paths(default_config_path(), default_library_db_path())
+    }
+
+    pub fn from_paths(config_path: PathBuf, library_db_path: PathBuf) -> Self {
+        let config = AppConfig::load(&config_path);
+        let library_service = library_db_path
+            .parent()
+            .map(std::fs::create_dir_all)
+            .transpose()
+            .and_then(|_| {
+                LibraryService::initialize(&library_db_path).map_err(std::io::Error::other)
+            })
+            .ok();
+
+        let mut app = Self {
             inner: ComicReaderApp::default(),
             library_controls: LibraryRootControls::default(),
+            config,
+            config_path,
+            library_service,
+            settings: SettingsWindowState::default(),
+            last_checkpointed_progress: None,
+        };
+        app.hydrate_library_from_service();
+        if app.config.resume_last_session {
+            app.resume_last_session_from_service();
+        }
+        app.apply_config_to_active_session();
+        app
+    }
+
+    pub fn with_config_and_service(
+        config: AppConfig,
+        config_path: PathBuf,
+        library_service: LibraryService,
+    ) -> Self {
+        let mut app = Self {
+            inner: ComicReaderApp::default(),
+            library_controls: LibraryRootControls::default(),
+            config: config.normalized(),
+            config_path,
+            library_service: Some(library_service),
+            settings: SettingsWindowState::default(),
+            last_checkpointed_progress: None,
+        };
+        app.hydrate_library_from_service();
+        if app.config.resume_last_session {
+            app.resume_last_session_from_service();
+        }
+        app.apply_config_to_active_session();
+        app
+    }
+
+    pub fn apply_config_to_context(&self, ctx: &egui::Context) {
+        let mut style = (*ctx.style()).clone();
+        if self.config.dark_mode {
+            style.visuals = editor_dark_visuals();
+        } else {
+            style.visuals = egui::Visuals::light();
+        }
+        apply_editor_text_styles(&mut style);
+        ctx.set_style(style);
+    }
+
+    pub fn set_dark_mode(&mut self, dark_mode: bool) {
+        self.config.dark_mode = dark_mode;
+    }
+
+    pub fn set_zoom_sensitivity(&mut self, zoom_sensitivity: f32) {
+        self.config.zoom_sensitivity = crate::config::normalize_zoom_sensitivity(zoom_sensitivity);
+        self.apply_config_to_active_session();
+    }
+
+    pub fn set_reading_direction(&mut self, reading_direction: ReadingDirection) {
+        self.config.reading_direction = reading_direction;
+        self.apply_config_to_active_session();
+    }
+
+    pub fn hydrate_library_from_service(&mut self) {
+        let Some(service) = &self.library_service else {
+            return;
+        };
+        match service.library_grid_items() {
+            Ok(items) => {
+                self.inner.library.items = items;
+                self.inner.library.refresh_filter_cache();
+            }
+            Err(error) => {
+                self.record_lifecycle_error(format!("Library load failed: {error}"));
+            }
+        }
+    }
+
+    pub fn resume_last_session_from_service(&mut self) -> bool {
+        let Some(service) = &self.library_service else {
+            return false;
+        };
+        match self.inner.resume_last_session(service) {
+            Ok(resumed) => resumed,
+            Err(error) => {
+                self.record_lifecycle_error(format!("Session resume failed: {error}"));
+                false
+            }
+        }
+    }
+
+    pub fn reconcile_resume_state_after_route(&mut self, was_reading: bool) {
+        if was_reading && matches!(self.inner.state, AppState::Library) {
+            self.config.resume_last_session = false;
+            self.last_checkpointed_progress = None;
+            if let Err(error) = self.config.save(&self.config_path) {
+                self.record_lifecycle_error(format!("Config save failed: {error}"));
+            }
+        }
+    }
+
+    pub fn flush_lifecycle_state(&mut self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        let active_snapshot = self.inner.active_progress_snapshot();
+        if active_snapshot.is_some() {
+            self.config.resume_last_session = true;
+        }
+
+        if let Err(error) = self.config.save(&self.config_path) {
+            errors.push(format!("Config save failed: {error}"));
+        }
+
+        if let (Some(service), Some(snapshot)) = (&self.library_service, active_snapshot)
+            && let Err(error) =
+                service.save_progress(snapshot.comic_id, snapshot.current_page, snapshot.is_read)
+        {
+            errors.push(format!("Progress save failed: {error}"));
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let message = errors.join("; ");
+            self.record_lifecycle_error(message.clone());
+            Err(message)
+        }
+    }
+
+    pub fn checkpoint_active_progress(&mut self) -> Result<(), String> {
+        let Some(snapshot) = self.inner.active_progress_snapshot() else {
+            return Ok(());
+        };
+        if self.last_checkpointed_progress == Some(snapshot) {
+            return Ok(());
+        }
+        let Some(service) = &self.library_service else {
+            return Ok(());
+        };
+
+        match service.save_progress(snapshot.comic_id, snapshot.current_page, snapshot.is_read) {
+            Ok(_) => {
+                self.config.resume_last_session = true;
+                self.last_checkpointed_progress = Some(snapshot);
+                Ok(())
+            }
+            Err(error) => {
+                let message = format!("Progress save failed: {error}");
+                self.record_lifecycle_error(message.clone());
+                Err(message)
+            }
+        }
+    }
+
+    fn apply_config_to_active_session(&mut self) {
+        self.inner
+            .apply_reading_direction(self.config.reading_direction);
+        if let Some(reading) = &mut self.inner.reading {
+            reading.viewer_state.zoom_sensitivity = self.config.zoom_sensitivity;
+        }
+    }
+
+    fn record_lifecycle_error(&mut self, message: String) {
+        self.settings.last_error = Some(message.clone());
+        self.inner.library.status_text = Some(message.clone());
+        if let Some(reading) = &mut self.inner.reading {
+            reading.viewer_state.chrome.status_text = Some(message);
+        }
+    }
+
+    fn render_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings.open {
+            return;
+        }
+
+        let mut open = self.settings.open;
+        let mut changed = false;
+        egui::Window::new("Settings")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                changed |= ui
+                    .checkbox(&mut self.config.dark_mode, "Dark mode")
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(
+                            &mut self.config.zoom_sensitivity,
+                            AppConfig::MIN_ZOOM_SENSITIVITY..=AppConfig::MAX_ZOOM_SENSITIVITY,
+                        )
+                        .text("Zoom sensitivity"),
+                    )
+                    .changed();
+                ui.horizontal(|ui| {
+                    ui.label("Reading direction");
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.config.reading_direction,
+                            ReadingDirection::LeftToRight,
+                            "LTR",
+                        )
+                        .changed();
+                    changed |= ui
+                        .selectable_value(
+                            &mut self.config.reading_direction,
+                            ReadingDirection::RightToLeft,
+                            "RTL",
+                        )
+                        .changed();
+                });
+
+                if let Some(error) = &self.settings.last_error {
+                    ui.separator();
+                    ui.label(egui::RichText::new(error).weak());
+                }
+            });
+
+        self.settings.open = open;
+        if changed {
+            self.config = self.config.clone().normalized();
+            self.apply_config_to_context(ctx);
+            self.apply_config_to_active_session();
         }
     }
 }
@@ -1308,6 +1959,35 @@ impl Default for EguiComicReaderApp {
 
 impl eframe::App for EguiComicReaderApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        route_app_update(ctx, &mut self.inner, &mut self.library_controls);
+        self.apply_config_to_context(ctx);
+        let was_reading = matches!(self.inner.state, AppState::Reading(_));
+        route_app_update(
+            ctx,
+            &mut self.inner,
+            &mut self.library_controls,
+            &mut self.settings,
+            self.library_service.as_ref(),
+        );
+        self.reconcile_resume_state_after_route(was_reading);
+        let _ = self.checkpoint_active_progress();
+        self.render_settings_window(ctx);
+    }
+
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        let _ = self.flush_lifecycle_state();
+    }
+}
+
+impl EguiComicReaderApp {
+    pub fn test_instance() -> Self {
+        Self {
+            inner: ComicReaderApp::default(),
+            library_controls: LibraryRootControls::default(),
+            config: AppConfig::default(),
+            config_path: default_config_path(),
+            library_service: None,
+            settings: SettingsWindowState::default(),
+            last_checkpointed_progress: None,
+        }
     }
 }

@@ -1,10 +1,25 @@
-use cbr_egui::library::{ComicAvailability, ComicInput, LibraryService};
+use cbr_egui::library::{
+    ComicAvailability, ComicInput, ComicMetadata, LibraryService, ScannedComic,
+};
 
 fn service() -> (tempfile::TempDir, LibraryService) {
     let dir = tempfile::tempdir().expect("temp database directory");
     let db_path = dir.path().join("library.sqlite");
     let service = LibraryService::initialize(&db_path).expect("initialize library");
     (dir, service)
+}
+
+fn metadata(service: &LibraryService, title: &str, number: &str, writer: &str) -> ComicMetadata {
+    service
+        .insert_metadata(&ComicMetadata {
+            id: None,
+            series: Some(title.to_owned()),
+            title: Some(title.to_owned()),
+            number: Some(number.to_owned()),
+            writer: Some(writer.to_owned()),
+            penciller: None,
+        })
+        .expect("metadata")
 }
 
 #[test]
@@ -166,4 +181,143 @@ fn resumes_last_read_available_comic() {
 
     assert_eq!(resumed.id, comic.id);
     assert_eq!(progress.current_page, 9);
+}
+
+#[test]
+fn resumes_most_recently_updated_progress_not_highest_page() {
+    let (_dir, service) = service();
+    let older = service
+        .upsert_comic(ComicInput {
+            path: "/library/older.cbz".to_owned(),
+            hash: "older".to_owned(),
+            page_count: 50,
+            metadata_id: None,
+        })
+        .expect("older comic");
+    let newer = service
+        .upsert_comic(ComicInput {
+            path: "/library/newer.cbz".to_owned(),
+            hash: "newer".to_owned(),
+            page_count: 50,
+            metadata_id: None,
+        })
+        .expect("newer comic");
+
+    service
+        .save_progress(older.id, 40, false)
+        .expect("older progress");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    service
+        .save_progress(newer.id, 1, false)
+        .expect("newer progress");
+
+    let (resumed, progress) = service.last_read_comic().expect("resume").expect("session");
+
+    assert_eq!(resumed.id, newer.id);
+    assert_eq!(progress.current_page, 1);
+}
+
+#[test]
+fn library_grid_items_left_join_metadata_without_hiding_unmatched_comics() {
+    let (_dir, service) = service();
+    let metadata = metadata(&service, "Saga", "12", "Brian K. Vaughan");
+    service
+        .upsert_comic(ComicInput {
+            path: "/library/Saga/Saga 012.cbz".to_owned(),
+            hash: "hash-a".to_owned(),
+            page_count: 22,
+            metadata_id: metadata.id,
+        })
+        .expect("comic with metadata");
+    service
+        .upsert_comic(ComicInput {
+            path: "/library/Loose/No Metadata.cbz".to_owned(),
+            hash: "hash-b".to_owned(),
+            page_count: 10,
+            metadata_id: None,
+        })
+        .expect("comic without metadata");
+
+    let items = service.library_grid_items().expect("grid items");
+
+    assert_eq!(items.len(), 2);
+    let saga = items
+        .iter()
+        .find(|item| item.path.ends_with("Saga 012.cbz"))
+        .expect("saga item");
+    assert_eq!(
+        saga.subtitle.as_deref(),
+        Some("Issue #12 - Brian K. Vaughan")
+    );
+    assert_eq!(saga.series.as_deref(), Some("Saga"));
+    assert_eq!(saga.series_key.as_deref(), Some("saga"));
+    let loose = items
+        .iter()
+        .find(|item| item.path.ends_with("No Metadata.cbz"))
+        .expect("loose item");
+    assert_eq!(loose.subtitle, None);
+    assert_eq!(loose.series_key, None);
+    assert_eq!(loose.folder_label.as_deref(), Some("Loose"));
+}
+
+#[test]
+fn reconciliation_reuses_metadata_row_for_existing_comic() {
+    let (_dir, service) = service();
+    let scanned = ScannedComic {
+        path: "/library/Saga/Saga 001.cbz".to_owned(),
+        fingerprint: "hash-a".to_owned(),
+        page_count: 20,
+        metadata: Some(ComicMetadata {
+            id: None,
+            series: Some("Saga".to_owned()),
+            title: Some("Chapter One".to_owned()),
+            number: Some("1".to_owned()),
+            writer: Some("Brian K. Vaughan".to_owned()),
+            penciller: None,
+        }),
+    };
+    service
+        .reconcile_scanned_comics(std::slice::from_ref(&scanned))
+        .expect("first reconcile");
+    let first_metadata_id = service
+        .list_comics()
+        .expect("list")
+        .into_iter()
+        .find(|comic| comic.path == scanned.path)
+        .expect("first comic")
+        .metadata_id
+        .expect("first metadata");
+
+    let updated_metadata = scanned.metadata.clone().expect("metadata");
+    let updated = ScannedComic {
+        fingerprint: "hash-b".to_owned(),
+        metadata: Some(ComicMetadata {
+            number: Some("2".to_owned()),
+            ..updated_metadata
+        }),
+        ..scanned
+    };
+    service
+        .reconcile_scanned_comics(std::slice::from_ref(&updated))
+        .expect("second reconcile");
+    let second_metadata_id = service
+        .list_comics()
+        .expect("list")
+        .into_iter()
+        .find(|comic| comic.path == updated.path)
+        .expect("second comic")
+        .metadata_id
+        .expect("second metadata");
+    let item = service
+        .library_grid_items()
+        .expect("grid")
+        .into_iter()
+        .find(|item| item.path == updated.path)
+        .expect("grid item");
+
+    assert_eq!(second_metadata_id, first_metadata_id);
+    assert_eq!(
+        item.subtitle.as_deref(),
+        Some("Issue #2 - Brian K. Vaughan")
+    );
 }

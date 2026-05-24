@@ -1,6 +1,6 @@
 use cbr_egui::viewer::{
     PageId, ReadingDirection, Size2, SpreadDecision, SpreadGeneration, SpreadSideStatus,
-    continuous_canvas_height, decide_spread, ordered_spread_pages,
+    ViewerState, continuous_canvas_height, decide_spread, ordered_spread_pages,
     spread_result_matches_generation,
 };
 
@@ -116,6 +116,21 @@ fn rtl_reading_direction_swaps_spread_page_order() {
     );
     assert_eq!(
         ordered_spread_pages(PageId(1), PageId(2), ReadingDirection::RightToLeft),
+        (PageId(2), PageId(1))
+    );
+}
+
+#[test]
+fn viewer_reading_direction_preference_updates_spread_order() {
+    let mut state: ViewerState<&str> = ViewerState::new();
+    state.set_ready(PageId(1), "left", Size2::new(800.0, 1200.0));
+    state.set_next_ready(PageId(2), "right", Size2::new(800.0, 1200.0));
+    state.set_spread_mode_enabled(true);
+    state.set_reading_direction(ReadingDirection::RightToLeft);
+    state.recompute_spread_decision(Some(PageId(2)));
+
+    assert_eq!(
+        ordered_spread_pages(PageId(1), PageId(2), state.reading_direction),
         (PageId(2), PageId(1))
     );
 }

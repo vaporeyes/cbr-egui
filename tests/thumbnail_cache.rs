@@ -4,6 +4,7 @@ use cbr_egui::library::{
     thumbnail_target_size,
 };
 use image::{ImageBuffer, ImageFormat, Rgba};
+use std::io::Write;
 
 #[test]
 fn thumbnail_cache_key_is_stable_for_source_and_fingerprint() {
@@ -63,12 +64,13 @@ fn cover_request_uses_first_usable_page() {
 #[test]
 fn thumbnail_worker_generates_cache_file_in_background() {
     let dir = tempfile::tempdir().expect("dir");
+    let archive_path = dir.path().join("book.cbz");
     let cache_path = dir.path().join("thumb.png");
+    write_cbz_with_png(&archive_path, 40, 80);
     let pool = ThumbnailWorkerPool::start(1, 4).expect("pool");
     pool.submit(ThumbnailRequest {
-        source_path: "/library/book.cbz".to_owned(),
+        source_path: archive_path.to_string_lossy().into_owned(),
         source_fingerprint: "fingerprint".to_owned(),
-        bytes: png_bytes(40, 80),
         cache_path: cache_path.clone(),
     })
     .expect("submit");
@@ -93,4 +95,14 @@ fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         .write_to(&mut cursor, ImageFormat::Png)
         .expect("encode png");
     cursor.into_inner()
+}
+
+fn write_cbz_with_png(path: &std::path::Path, width: u32, height: u32) {
+    let file = std::fs::File::create(path).expect("zip file");
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    zip.start_file("page_1.png", options).expect("page");
+    zip.write_all(&png_bytes(width, height))
+        .expect("page bytes");
+    zip.finish().expect("finish zip");
 }

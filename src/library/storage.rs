@@ -1,7 +1,12 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::errors::LibraryError;
-use super::models::{Comic, ComicAvailability, ComicInput, Folder, Progress};
+use super::models::{
+    Comic, ComicAvailability, ComicInput, ComicMetadata, ComicMetadataDisplay, Folder,
+    LibraryComicRow, Progress,
+};
 
 pub struct LibraryStorage {
     connection: Connection,
@@ -30,6 +35,7 @@ impl LibraryStorage {
 
             CREATE TABLE IF NOT EXISTS metadata (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                series TEXT NULL,
                 title TEXT NULL,
                 number TEXT NULL,
                 writer TEXT NULL,
@@ -50,12 +56,15 @@ impl LibraryStorage {
                 comic_id INTEGER PRIMARY KEY,
                 current_page INTEGER NOT NULL,
                 is_read INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY(comic_id) REFERENCES comics(id) ON DELETE CASCADE
             );
             ",
         )?;
+        self.add_column_if_missing("metadata", "series", "TEXT NULL")?;
         self.add_column_if_missing("comics", "availability", "INTEGER NOT NULL DEFAULT 1")?;
         self.add_column_if_missing("comics", "thumbnail_key", "TEXT NULL")?;
+        self.add_column_if_missing("progress", "updated_at", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(())
     }
 
@@ -145,6 +154,71 @@ impl LibraryStorage {
             .ok_or(LibraryError::Database(rusqlite::Error::QueryReturnedNoRows))
     }
 
+    pub fn upsert_metadata(
+        &self,
+        existing_id: Option<i64>,
+        input: &ComicMetadata,
+    ) -> Result<ComicMetadata, LibraryError> {
+        if let Some(id) = existing_id {
+            let updated = self.connection.execute(
+                "UPDATE metadata
+                 SET series = ?2, title = ?3, number = ?4, writer = ?5, penciller = ?6
+                 WHERE id = ?1",
+                params![
+                    id,
+                    input.series,
+                    input.title,
+                    input.number,
+                    input.writer,
+                    input.penciller
+                ],
+            )?;
+            if updated > 0 {
+                return Ok(ComicMetadata {
+                    id: Some(id),
+                    series: input.series.clone(),
+                    title: input.title.clone(),
+                    number: input.number.clone(),
+                    writer: input.writer.clone(),
+                    penciller: input.penciller.clone(),
+                });
+            }
+        }
+
+        self.connection.execute(
+            "INSERT INTO metadata (series, title, number, writer, penciller) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                input.series,
+                input.title,
+                input.number,
+                input.writer,
+                input.penciller
+            ],
+        )?;
+        let id = self.connection.last_insert_rowid();
+        Ok(ComicMetadata {
+            id: Some(id),
+            series: input.series.clone(),
+            title: input.title.clone(),
+            number: input.number.clone(),
+            writer: input.writer.clone(),
+            penciller: input.penciller.clone(),
+        })
+    }
+
+    pub fn delete_metadata_if_unreferenced(&self, metadata_id: i64) -> Result<(), LibraryError> {
+        let refs = self.connection.query_row(
+            "SELECT COUNT(*) FROM comics WHERE metadata_id = ?1",
+            [metadata_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if refs == 0 {
+            self.connection
+                .execute("DELETE FROM metadata WHERE id = ?1", [metadata_id])?;
+        }
+        Ok(())
+    }
+
     pub fn get_comic(&self, id: i64) -> Result<Option<Comic>, LibraryError> {
         self.connection
             .query_row(
@@ -174,6 +248,33 @@ impl LibraryStorage {
             .query_map([], comic_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(comics)
+    }
+
+    pub fn list_library_comic_rows(&self) -> Result<Vec<LibraryComicRow>, LibraryError> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT
+                c.id,
+                c.path,
+                c.hash,
+                c.page_count,
+                c.metadata_id,
+                c.availability,
+                c.thumbnail_key,
+                m.series,
+                m.title,
+                m.number,
+                m.writer,
+                m.penciller
+            FROM comics c
+            LEFT JOIN metadata m ON m.id = c.metadata_id
+            ORDER BY c.path
+            ",
+        )?;
+        let rows = statement
+            .query_map([], library_comic_row_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn set_comic_availability(
@@ -206,12 +307,14 @@ impl LibraryStorage {
         current_page: u32,
         is_read: bool,
     ) -> Result<Progress, LibraryError> {
+        let updated_at = current_unix_timestamp();
         self.connection.execute(
-            "INSERT INTO progress (comic_id, current_page, is_read) VALUES (?1, ?2, ?3)
+            "INSERT INTO progress (comic_id, current_page, is_read, updated_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(comic_id) DO UPDATE SET
                 current_page = excluded.current_page,
-                is_read = excluded.is_read",
-            params![comic_id, current_page, is_read],
+                is_read = excluded.is_read,
+                updated_at = excluded.updated_at",
+            params![comic_id, current_page, is_read, updated_at],
         )?;
 
         self.get_progress(comic_id)?
@@ -221,7 +324,7 @@ impl LibraryStorage {
     pub fn get_progress(&self, comic_id: i64) -> Result<Option<Progress>, LibraryError> {
         self.connection
             .query_row(
-                "SELECT comic_id, current_page, is_read FROM progress WHERE comic_id = ?1",
+                "SELECT comic_id, current_page, is_read, updated_at FROM progress WHERE comic_id = ?1",
                 [comic_id],
                 progress_from_row,
             )
@@ -267,6 +370,28 @@ fn comic_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Comic> {
     })
 }
 
+fn library_comic_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryComicRow> {
+    let page_count = row.get::<_, u32>(3)?;
+    Ok(LibraryComicRow {
+        comic: Comic {
+            id: row.get(0)?,
+            path: row.get(1)?,
+            hash: row.get(2)?,
+            page_count,
+            metadata_id: row.get(4)?,
+            availability: ComicAvailability::from_i64(row.get::<_, i64>(5)?),
+            thumbnail_key: row.get(6)?,
+        },
+        metadata: ComicMetadataDisplay {
+            series: row.get(7)?,
+            title: row.get(8)?,
+            number: row.get(9)?,
+            writer: row.get(10)?,
+            penciller: row.get(11)?,
+        },
+    })
+}
+
 fn comic_select_sql(suffix: &str) -> String {
     format!(
         "SELECT id, path, hash, page_count, metadata_id, availability, thumbnail_key FROM comics {suffix}"
@@ -278,9 +403,17 @@ fn progress_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Progress> {
         comic_id: row.get(0)?,
         current_page: row.get(1)?,
         is_read: row.get(2)?,
+        updated_at: row.get(3)?,
     })
 }
 
 fn i64_to_u32(field: &'static str, value: i64) -> Result<u32, LibraryError> {
     u32::try_from(value).map_err(|_| LibraryError::IntegerConversion { field, value })
+}
+
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }

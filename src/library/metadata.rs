@@ -7,6 +7,7 @@ use crate::vfs::ArchiveReader;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ComicInfoXml {
+    series: Option<String>,
     title: Option<String>,
     number: Option<String>,
     writer: Option<String>,
@@ -21,6 +22,7 @@ pub fn parse_comic_info_xml(bytes: &[u8]) -> Result<ComicMetadata, MetadataError
 
     Ok(ComicMetadata {
         id: None,
+        series: empty_to_none(parsed.series),
         title: empty_to_none(parsed.title),
         number: empty_to_none(parsed.number),
         writer: empty_to_none(parsed.writer),

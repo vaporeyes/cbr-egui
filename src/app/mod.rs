@@ -1,9 +1,19 @@
+// ABOUTME: Defines the application state machines for library browsing and reading.
+// ABOUTME: Owns session-scoped caches, prefetch bookkeeping, and view state helpers.
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 
 use crate::cache::{PageTextureCache, PageTextureCacheError};
-use crate::decode::{CancellationToken, DecodeRequestId, WorkerPool};
-use crate::library::{ComicAvailability, LibraryError, LibraryGridItem, LibraryService};
-use crate::viewer::{ContinuousScrollState, PageGeneration, PageId, PrefetchState, ViewerState};
+use crate::decode::{CancellationToken, DecodePurpose, DecodeRequestId, WorkerPool};
+use crate::library::{
+    ActiveLibraryFilter, ArchivePage, ComicAvailability, LibraryError, LibraryGridItem,
+    LibraryGroup, LibraryGroupKind, LibraryService,
+};
+use crate::vfs::ArchiveReader;
+use crate::viewer::{
+    ContinuousScrollState, PageGeneration, PageId, PrefetchState, ReadingDirection, ViewerState,
+};
 
 pub mod ui;
 
@@ -27,6 +37,9 @@ pub struct LibraryViewState {
     pub selected_comic_id: Option<i64>,
     pub status_text: Option<String>,
     pub view_mode: LibraryViewMode,
+    pub active_filter: Option<ActiveLibraryFilter>,
+    groups: Vec<LibraryGroup>,
+    visible_indices: Vec<usize>,
 }
 
 pub struct CachedPage<T> {
@@ -34,11 +47,82 @@ pub struct CachedPage<T> {
     pub pixel_size: crate::viewer::Size2,
 }
 
+pub const DEFAULT_RAW_PAGE_CACHE_CAPACITY: usize = 9;
+
+pub struct ReadingArchiveCache {
+    source_path: Option<PathBuf>,
+    reader: Option<Box<dyn ArchiveReader>>,
+    pages: Vec<ArchivePage>,
+    raw_pages: lru::LruCache<usize, Vec<u8>>,
+}
+
+impl Default for ReadingArchiveCache {
+    fn default() -> Self {
+        Self {
+            source_path: None,
+            reader: None,
+            pages: Vec::new(),
+            raw_pages: lru::LruCache::new(
+                NonZeroUsize::new(DEFAULT_RAW_PAGE_CACHE_CAPACITY).expect("non-zero"),
+            ),
+        }
+    }
+}
+
+impl ReadingArchiveCache {
+    pub fn is_for(&self, source_path: impl AsRef<Path>) -> bool {
+        self.source_path.as_deref() == Some(source_path.as_ref())
+    }
+
+    pub fn reset(
+        &mut self,
+        source_path: impl AsRef<Path>,
+        reader: Box<dyn ArchiveReader>,
+        pages: Vec<ArchivePage>,
+    ) {
+        self.source_path = Some(source_path.as_ref().to_path_buf());
+        self.reader = Some(reader);
+        self.pages = pages;
+        self.raw_pages.clear();
+    }
+
+    pub fn read_page(&mut self, page_index: usize) -> Result<Vec<u8>, String> {
+        if let Some(bytes) = self.raw_pages.get(&page_index) {
+            return Ok(bytes.clone());
+        }
+        let page = self
+            .pages
+            .get(page_index)
+            .ok_or_else(|| format!("Page {} is not available", page_index + 1))?;
+        let reader = self
+            .reader
+            .as_mut()
+            .ok_or_else(|| "Archive reader is not initialized".to_owned())?;
+        let bytes = reader
+            .read_page(&page.path)
+            .map_err(|err| err.to_string())?;
+        self.raw_pages.push(page_index, bytes.clone());
+        Ok(bytes)
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressSnapshot {
+    pub comic_id: i64,
+    pub current_page: u32,
+    pub is_read: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct InFlightPrefetch {
     pub page_index: usize,
     pub request_id: DecodeRequestId,
     pub generation: PageGeneration,
+    pub purpose: DecodePurpose,
     pub cancellation_token: CancellationToken,
 }
 
@@ -78,6 +162,7 @@ impl PrefetchRuntime {
         &mut self,
         page_index: usize,
         request_id: DecodeRequestId,
+        purpose: DecodePurpose,
         cancellation_token: CancellationToken,
     ) {
         self.queued_pages.remove(&page_index);
@@ -87,6 +172,7 @@ impl PrefetchRuntime {
                 page_index,
                 request_id,
                 generation: self.generation,
+                purpose,
                 cancellation_token,
             },
         );
@@ -234,6 +320,7 @@ pub struct ReadingSession<T> {
     pub texture_cache: PageTextureCache<CachedPage<T>>,
     pub decode_worker_pool: Option<WorkerPool>,
     pub continuous_scroll: ContinuousScrollState,
+    pub archive_cache: ReadingArchiveCache,
 }
 
 impl<T> ReadingSession<T> {
@@ -248,6 +335,7 @@ impl<T> ReadingSession<T> {
             texture_cache: PageTextureCache::with_default_capacity(),
             decode_worker_pool: WorkerPool::start(2, 16).ok(),
             continuous_scroll: ContinuousScrollState::new(),
+            archive_cache: ReadingArchiveCache::default(),
         }
     }
 
@@ -266,6 +354,7 @@ impl<T> ReadingSession<T> {
             texture_cache: PageTextureCache::new(cache_capacity)?,
             decode_worker_pool: WorkerPool::start(2, 16).ok(),
             continuous_scroll: ContinuousScrollState::new(),
+            archive_cache: ReadingArchiveCache::default(),
         })
     }
 
@@ -282,6 +371,18 @@ impl<T> ReadingSession<T> {
     pub fn set_spread_mode_enabled(&mut self, enabled: bool) {
         self.spread_mode_enabled = enabled;
         self.viewer_state.set_spread_mode_enabled(enabled);
+    }
+
+    pub fn set_reading_direction(&mut self, direction: ReadingDirection) {
+        self.viewer_state.set_reading_direction(direction);
+    }
+
+    pub fn progress_snapshot(&self) -> ProgressSnapshot {
+        ProgressSnapshot {
+            comic_id: self.comic_id,
+            current_page: self.current_page_index as u32,
+            is_read: self.current_page_index + 1 >= self.page_count,
+        }
     }
 
     pub fn prefetch_state(&self) -> PrefetchState {
@@ -308,12 +409,23 @@ impl<T> Default for ComicReaderApp<T> {
 
 impl<T> ComicReaderApp<T> {
     pub fn open_comic(&mut self, comic_id: i64, page_count: usize) {
+        self.open_comic_with_reading_direction(comic_id, page_count, ReadingDirection::LeftToRight);
+    }
+
+    pub fn open_comic_with_reading_direction(
+        &mut self,
+        comic_id: i64,
+        page_count: usize,
+        reading_direction: ReadingDirection,
+    ) {
         if let Some(reading) = &mut self.reading {
             reading.prefetch.cancel_all();
         }
         self.state = AppState::Reading(comic_id);
         self.library.selected_comic_id = Some(comic_id);
-        self.reading = Some(ReadingSession::new(comic_id, page_count));
+        let mut session = ReadingSession::new(comic_id, page_count);
+        session.set_reading_direction(reading_direction);
+        self.reading = Some(session);
     }
 
     pub fn open_grid_item(&mut self, item: &LibraryGridItem) -> bool {
@@ -339,6 +451,7 @@ impl<T> ComicReaderApp<T> {
         self.library
             .items
             .retain(|item| item.availability == ComicAvailability::Available);
+        self.library.refresh_filter_cache();
         before - self.library.items.len()
     }
 
@@ -346,10 +459,117 @@ impl<T> ComicReaderApp<T> {
         let Some((comic, progress)) = service.last_read_comic()? else {
             return Ok(false);
         };
+        if comic.availability != ComicAvailability::Available || comic.page_count == 0 {
+            return Ok(false);
+        }
         self.open_comic(comic.id, comic.page_count as usize);
         if let Some(reading) = &mut self.reading {
             reading.set_current_page(progress.current_page as usize);
         }
         Ok(true)
+    }
+
+    pub fn active_progress_snapshot(&self) -> Option<ProgressSnapshot> {
+        self.reading.as_ref().map(ReadingSession::progress_snapshot)
+    }
+
+    pub fn apply_reading_direction(&mut self, direction: ReadingDirection) {
+        if let Some(reading) = &mut self.reading {
+            reading.set_reading_direction(direction);
+        }
+    }
+}
+
+impl LibraryViewState {
+    pub fn refresh_filter_cache(&mut self) {
+        self.groups = self.build_groups();
+        self.reconcile_active_filter();
+        self.visible_indices = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let Some(active_filter) = &self.active_filter else {
+                    return Some(index);
+                };
+                let matches_filter = match active_filter.kind {
+                    LibraryGroupKind::Series => {
+                        item.series_key.as_deref() == Some(active_filter.key.as_str())
+                    }
+                    LibraryGroupKind::Folder => {
+                        item.folder_key.as_deref() == Some(active_filter.key.as_str())
+                    }
+                };
+                matches_filter.then_some(index)
+            })
+            .collect();
+    }
+
+    pub fn groups(&self) -> &[LibraryGroup] {
+        &self.groups
+    }
+
+    pub fn visible_indices(&self) -> &[usize] {
+        &self.visible_indices
+    }
+
+    pub fn visible_items(&self) -> impl Iterator<Item = &LibraryGridItem> {
+        self.visible_indices
+            .iter()
+            .filter_map(|index| self.items.get(*index))
+    }
+
+    fn build_groups(&self) -> Vec<LibraryGroup> {
+        let mut groups =
+            std::collections::HashMap::<(LibraryGroupKind, String), LibraryGroup>::new();
+        for item in &self.items {
+            if let (Some(series_key), Some(series)) = (&item.series_key, &item.series) {
+                let key = (LibraryGroupKind::Series, series_key.clone());
+                groups
+                    .entry(key)
+                    .and_modify(|group| group.item_count += 1)
+                    .or_insert_with(|| LibraryGroup {
+                        kind: LibraryGroupKind::Series,
+                        key: series_key.clone(),
+                        label: series.clone(),
+                        item_count: 1,
+                    });
+            }
+
+            if let (Some(folder_key), Some(folder_label)) = (&item.folder_key, &item.folder_label) {
+                let key = (LibraryGroupKind::Folder, folder_key.clone());
+                groups
+                    .entry(key)
+                    .and_modify(|group| group.item_count += 1)
+                    .or_insert_with(|| LibraryGroup {
+                        kind: LibraryGroupKind::Folder,
+                        key: folder_key.clone(),
+                        label: folder_label.clone(),
+                        item_count: 1,
+                    });
+            }
+        }
+
+        let mut groups = groups.into_values().collect::<Vec<_>>();
+        groups.sort_by(|a, b| {
+            a.kind
+                .cmp(&b.kind)
+                .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        groups
+    }
+
+    pub fn reconcile_active_filter(&mut self) {
+        let Some(active_filter) = &self.active_filter else {
+            return;
+        };
+        let still_exists = self
+            .groups
+            .iter()
+            .any(|group| group.kind == active_filter.kind && group.key == active_filter.key);
+        if !still_exists {
+            self.active_filter = None;
+        }
     }
 }

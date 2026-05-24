@@ -10,8 +10,9 @@ pub mod watcher;
 pub use errors::{LibraryError, MetadataError};
 pub use metadata::{parse_comic_info_xml, read_archive_metadata};
 pub use models::{
-    ArchivePage, Comic, ComicAvailability, ComicInput, ComicMetadata, CoverThumbnail, Folder,
-    LibraryGridItem, LibraryRoot, LibraryScanStatus, Progress, ThumbnailStatus,
+    ActiveLibraryFilter, ArchivePage, Comic, ComicAvailability, ComicInput, ComicMetadata,
+    ComicMetadataDisplay, CoverThumbnail, Folder, LibraryComicRow, LibraryGridItem, LibraryGroup,
+    LibraryGroupKind, LibraryRoot, LibraryScanStatus, Progress, ThumbnailStatus,
 };
 pub use scanner::{
     ScannedComic, archive_page_count, discover_supported_archives, is_supported_archive_path,

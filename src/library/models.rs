@@ -29,15 +29,32 @@ pub struct Progress {
     pub comic_id: i64,
     pub current_page: u32,
     pub is_read: bool,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ComicMetadata {
     pub id: Option<i64>,
+    pub series: Option<String>,
     pub title: Option<String>,
     pub number: Option<String>,
     pub writer: Option<String>,
     pub penciller: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ComicMetadataDisplay {
+    pub series: Option<String>,
+    pub title: Option<String>,
+    pub number: Option<String>,
+    pub writer: Option<String>,
+    pub penciller: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryComicRow {
+    pub comic: Comic,
+    pub metadata: ComicMetadataDisplay,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,8 +128,34 @@ pub struct CoverThumbnail {
 pub struct LibraryGridItem {
     pub comic_id: i64,
     pub title: String,
+    pub subtitle: Option<String>,
     pub path: String,
+    pub source_fingerprint: String,
     pub page_count: u32,
     pub thumbnail_status: ThumbnailStatus,
     pub availability: ComicAvailability,
+    pub series: Option<String>,
+    pub series_key: Option<String>,
+    pub folder_label: Option<String>,
+    pub folder_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LibraryGroupKind {
+    Series,
+    Folder,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryGroup {
+    pub kind: LibraryGroupKind,
+    pub key: String,
+    pub label: String,
+    pub item_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveLibraryFilter {
+    pub kind: LibraryGroupKind,
+    pub key: String,
 }

@@ -14,6 +14,8 @@ pub enum LibraryError {
     Watch(String),
     #[error("thumbnail error: {0}")]
     Thumbnail(String),
+    #[error("metadata error: {0}")]
+    Metadata(#[from] MetadataError),
     #[error("inaccessible library root: {0}")]
     InaccessibleRoot(String),
     #[error("invalid parent folder id: {0}")]

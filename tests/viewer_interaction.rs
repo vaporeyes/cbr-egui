@@ -33,6 +33,17 @@ fn scroll_zoom_increases_and_decreases_within_bounds() {
 }
 
 #[test]
+fn configurable_scroll_zoom_sensitivity_changes_zoom_speed() {
+    let mut slow = ZoomPanState::default();
+    let mut fast = ZoomPanState::default();
+
+    slow.apply_scroll_zoom_with_sensitivity(120.0, 0.0005);
+    fast.apply_scroll_zoom_with_sensitivity(120.0, 0.003);
+
+    assert!(fast.zoom > slow.zoom);
+}
+
+#[test]
 fn scroll_zoom_clamps_to_minimum_and_maximum() {
     let mut zoom_pan = ZoomPanState::default();
 
