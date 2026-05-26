@@ -196,17 +196,24 @@ pub enum PageNavigationCommand {
     NextPage,
     ScrollUp,
     ScrollDown,
+    FirstPage,
+    LastPage,
+    GoToPage(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewCommand {
     Fit,
     Fill,
+    FitWidth,
+    FitHeight,
     OneToOne,
     ZoomIn,
     ZoomOut,
     ToggleSpread,
     ToggleContinuous,
+    RotateLeft,
+    RotateRight,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -288,6 +295,7 @@ pub struct ViewerState<T> {
     pub continuous_pending_scroll_top: Option<f32>,
     pub pending_navigation: Option<PageNavigationCommand>,
     pub pending_view_command: Option<ViewCommand>,
+    pub pending_bookmark_toggle: bool,
 }
 
 impl<T> Default for ViewerState<T> {
@@ -311,6 +319,7 @@ impl<T> Default for ViewerState<T> {
             continuous_pending_scroll_top: None,
             pending_navigation: None,
             pending_view_command: None,
+            pending_bookmark_toggle: false,
         }
     }
 }

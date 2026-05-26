@@ -1,18 +1,21 @@
 // ABOUTME: Defines the application state machines for library browsing and reading.
 // ABOUTME: Owns session-scoped caches, prefetch bookkeeping, and view state helpers.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use crate::cache::{PageTextureCache, PageTextureCacheError};
-use crate::decode::{CancellationToken, DecodePurpose, DecodeRequestId, WorkerPool};
+use crate::decode::{
+    CancellationToken, DecodePurpose, DecodeRequestId, ImageAdjustments, Rotation, WorkerPool,
+};
 use crate::library::{
     ActiveLibraryFilter, ArchivePage, ComicAvailability, LibraryError, LibraryGridItem,
     LibraryGroup, LibraryGroupKind, LibraryService,
 };
 use crate::vfs::ArchiveReader;
 use crate::viewer::{
-    ContinuousScrollState, PageGeneration, PageId, PrefetchState, ReadingDirection, ViewerState,
+    ContinuousScrollState, PageGeneration, PageId, PageStatus, PrefetchState, ReadingDirection,
+    ViewerState, ZoomPanState,
 };
 
 pub mod ui;
@@ -38,6 +41,8 @@ pub struct LibraryViewState {
     pub status_text: Option<String>,
     pub view_mode: LibraryViewMode,
     pub active_filter: Option<ActiveLibraryFilter>,
+    pub select_mode: bool,
+    pub selected_ids: HashSet<i64>,
     groups: Vec<LibraryGroup>,
     visible_indices: Vec<usize>,
 }
@@ -321,6 +326,12 @@ pub struct ReadingSession<T> {
     pub decode_worker_pool: Option<WorkerPool>,
     pub continuous_scroll: ContinuousScrollState,
     pub archive_cache: ReadingArchiveCache,
+    pub goto_input: String,
+    pub bookmarks: BTreeSet<usize>,
+    pub bookmarks_loaded: bool,
+    pub rotation: Rotation,
+    pub adjustments: ImageAdjustments,
+    pub show_adjustments: bool,
 }
 
 impl<T> ReadingSession<T> {
@@ -336,6 +347,12 @@ impl<T> ReadingSession<T> {
             decode_worker_pool: WorkerPool::start(2, 16).ok(),
             continuous_scroll: ContinuousScrollState::new(),
             archive_cache: ReadingArchiveCache::default(),
+            goto_input: String::new(),
+            bookmarks: BTreeSet::new(),
+            bookmarks_loaded: false,
+            rotation: Rotation::None,
+            adjustments: ImageAdjustments::default(),
+            show_adjustments: false,
         }
     }
 
@@ -355,6 +372,12 @@ impl<T> ReadingSession<T> {
             decode_worker_pool: WorkerPool::start(2, 16).ok(),
             continuous_scroll: ContinuousScrollState::new(),
             archive_cache: ReadingArchiveCache::default(),
+            goto_input: String::new(),
+            bookmarks: BTreeSet::new(),
+            bookmarks_loaded: false,
+            rotation: Rotation::None,
+            adjustments: ImageAdjustments::default(),
+            show_adjustments: false,
         })
     }
 
@@ -366,6 +389,34 @@ impl<T> ReadingSession<T> {
         self.current_page_index = next_page_index;
         self.viewer_state
             .set_current_page(PageId(self.current_page_index as u64));
+    }
+
+    /// Changes the page rotation and invalidates everything derived from the
+    /// previous orientation: cached textures, in-flight prefetch work, and
+    /// continuous-scroll measurements must all be rebuilt from the re-decode.
+    pub fn set_rotation(&mut self, rotation: Rotation) {
+        if self.rotation == rotation {
+            return;
+        }
+        self.rotation = rotation;
+        self.prefetch.cancel_all();
+        self.prefetch.failed_pages.clear();
+        self.prefetch.advance_generation();
+        self.texture_cache.clear();
+        self.continuous_scroll.reset();
+        self.viewer_state.next_page_status = PageStatus::Empty;
+        self.viewer_state.zoom_pan = ZoomPanState::default();
+    }
+
+    /// Invalidates decoded textures so pages re-decode with the current image
+    /// adjustments. Page dimensions are unchanged, so continuous measurements
+    /// and zoom/pan are preserved.
+    pub fn invalidate_for_adjustments(&mut self) {
+        self.prefetch.cancel_all();
+        self.prefetch.failed_pages.clear();
+        self.prefetch.advance_generation();
+        self.texture_cache.clear();
+        self.viewer_state.next_page_status = PageStatus::Empty;
     }
 
     pub fn set_spread_mode_enabled(&mut self, enabled: bool) {
@@ -481,7 +532,23 @@ impl<T> ComicReaderApp<T> {
 }
 
 impl LibraryViewState {
+    pub fn toggle_selection(&mut self, comic_id: i64) {
+        if !self.selected_ids.insert(comic_id) {
+            self.selected_ids.remove(&comic_id);
+        }
+    }
+
+    pub fn is_selected(&self, comic_id: i64) -> bool {
+        self.selected_ids.contains(&comic_id)
+    }
+
     pub fn refresh_filter_cache(&mut self) {
+        let existing_ids = self
+            .items
+            .iter()
+            .map(|item| item.comic_id)
+            .collect::<HashSet<_>>();
+        self.selected_ids.retain(|id| existing_ids.contains(id));
         self.groups = self.build_groups();
         self.reconcile_active_filter();
         self.visible_indices = self

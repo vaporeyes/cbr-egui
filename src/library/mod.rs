@@ -1,4 +1,5 @@
 pub mod errors;
+pub mod import;
 pub mod metadata;
 pub mod models;
 pub mod scanner;
@@ -8,11 +9,12 @@ pub mod thumbnails;
 pub mod watcher;
 
 pub use errors::{LibraryError, MetadataError};
+pub use import::{ImportSummary, ImportedComic, import_comic_file, import_paths};
 pub use metadata::{parse_comic_info_xml, read_archive_metadata};
 pub use models::{
-    ActiveLibraryFilter, ArchivePage, Comic, ComicAvailability, ComicInput, ComicMetadata,
-    ComicMetadataDisplay, CoverThumbnail, Folder, LibraryComicRow, LibraryGridItem, LibraryGroup,
-    LibraryGroupKind, LibraryRoot, LibraryScanStatus, Progress, ThumbnailStatus,
+    ActiveLibraryFilter, ArchivePage, Bookmark, Comic, ComicAvailability, ComicInput,
+    ComicMetadata, ComicMetadataDisplay, CoverThumbnail, Folder, LibraryComicRow, LibraryGridItem,
+    LibraryGroup, LibraryGroupKind, LibraryRoot, LibraryScanStatus, Progress, ThumbnailStatus,
 };
 pub use scanner::{
     ScannedComic, archive_page_count, discover_supported_archives, is_supported_archive_path,

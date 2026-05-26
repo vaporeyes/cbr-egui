@@ -75,6 +75,16 @@ impl<T> PageTextureCache<T> {
         self.entries.contains(&page_index)
     }
 
+    pub fn clear(&mut self) {
+        if let Some(evictor) = &mut self.evictor {
+            while let Some((_key, value)) = self.entries.pop_lru() {
+                evictor(value);
+            }
+        } else {
+            self.entries.clear();
+        }
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = usize> + '_ {
         self.entries.iter().map(|(key, _)| *key)
     }

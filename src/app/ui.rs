@@ -11,21 +11,24 @@ use eframe::egui;
 use crate::app::{
     AppState, CachedPage, ComicReaderApp, LibraryViewMode, ProgressSnapshot, ReadingSession,
 };
-use crate::config::{AppConfig, default_config_path, default_library_db_path};
+use crate::config::{
+    AppConfig, default_config_path, default_library_db_path, default_library_store_root,
+};
 use crate::decode::{
-    CancellationToken, DecodePurpose, DecodeRequest, DecodeRequestId, DecodeResult, decode_page,
+    CancellationToken, DecodePurpose, DecodeRequest, DecodeRequestId, DecodeResult,
+    ImageAdjustments, Rotation, decode_page,
 };
 use crate::library::{
-    ActiveLibraryFilter, ComicAvailability, LibraryGridItem, LibraryGroupKind, LibraryService,
-    ScannedComic, ThumbnailRequest, ThumbnailStatus, ThumbnailWorkerPool, cache_path_for_source,
-    scan_library_root,
+    ActiveLibraryFilter, ComicAvailability, ImportSummary, LibraryGridItem, LibraryGroupKind,
+    LibraryService, ThumbnailRequest, ThumbnailStatus, ThumbnailWorkerPool, cache_path_for_source,
+    discover_supported_archives, import_paths,
 };
 use crate::vfs::{ArchiveReader, PdfArchiveReader, RarArchiveReader, ZipArchiveReader};
 use crate::viewer::layout::{Size2, ViewMode};
 use crate::viewer::{
     self, ContinuousPage, ContinuousPageStatus, PageId, PageNavigationCommand, PageStatus,
-    ReadingDirection, ReadingLayoutMode, ViewCommand, anchor_for_viewport, build_virtual_canvas,
-    prefetch_candidates, scroll_top_for_anchor,
+    ReadingDirection, ReadingLayoutMode, ViewCommand, ZoomAnchor, anchor_for_viewport,
+    build_virtual_canvas, prefetch_candidates, scroll_top_for_anchor,
 };
 
 pub const GRID_TILE_WIDTH: f32 = 190.0;
@@ -33,7 +36,7 @@ pub const GRID_GAP: f32 = 14.0;
 const LIST_THUMBNAIL_WIDTH: f32 = 56.0;
 const LIST_THUMBNAIL_HEIGHT: f32 = 74.0;
 const EMPTY_LIBRARY_TITLE: &str = "No library loaded";
-const EMPTY_LIBRARY_DETAIL: &str = "Add a library root to scan comics and build the cover grid.";
+const EMPTY_LIBRARY_DETAIL: &str = "Add comics from a file or folder to build your library.";
 const EDITOR_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(44, 58, 60);
 const EDITOR_PANEL: egui::Color32 = egui::Color32::from_rgb(50, 68, 70);
 const EDITOR_PANEL_DARK: egui::Color32 = egui::Color32::from_rgb(39, 53, 55);
@@ -77,6 +80,7 @@ pub fn render_library_grid<T>(
     ui: &mut egui::Ui,
     items: &[LibraryGridItem],
     visible_indices: &[usize],
+    selected_ids: &HashSet<i64>,
     thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
 ) -> Option<LibraryGridItem> {
     if visible_indices.is_empty() {
@@ -96,7 +100,8 @@ pub fn render_library_grid<T>(
                     .filter_map(|item_index| items.get(*item_index))
                     .enumerate()
                 {
-                    if library_tile(ui, item, thumbnail_textures).clicked() {
+                    let is_selected = selected_ids.contains(&item.comic_id);
+                    if library_tile(ui, item, is_selected, thumbnail_textures).clicked() {
                         selected = Some(item.clone());
                     }
                     if (index + 1) % columns == 0 {
@@ -113,6 +118,7 @@ pub fn render_library_list(
     ui: &mut egui::Ui,
     items: &[LibraryGridItem],
     visible_indices: &[usize],
+    selected_ids: &HashSet<i64>,
     thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
 ) -> Option<LibraryGridItem> {
     if visible_indices.is_empty() {
@@ -127,7 +133,8 @@ pub fn render_library_list(
             .iter()
             .filter_map(|item_index| items.get(*item_index))
         {
-            let response = library_list_row(ui, item, thumbnail_textures);
+            let is_selected = selected_ids.contains(&item.comic_id);
+            let response = library_list_row(ui, item, is_selected, thumbnail_textures);
             if response.clicked() {
                 selected = Some(item.clone());
             }
@@ -160,6 +167,58 @@ fn active_library_item(app: &ComicReaderApp<egui::TextureHandle>) -> Option<Libr
         .iter()
         .find(|item| item.comic_id == comic_id)
         .cloned()
+}
+
+fn ensure_bookmarks_loaded(
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+    library_service: Option<&LibraryService>,
+) {
+    let Some(service) = library_service else {
+        return;
+    };
+    let Some(session) = &mut app.reading else {
+        return;
+    };
+    if session.bookmarks_loaded {
+        return;
+    }
+    match service.list_bookmarks(session.comic_id) {
+        Ok(bookmarks) => {
+            session.bookmarks = bookmarks
+                .into_iter()
+                .map(|bookmark| bookmark.page_index as usize)
+                .collect();
+        }
+        Err(error) => {
+            session.viewer_state.chrome.status_text =
+                Some(format!("Bookmarks load failed: {error}"));
+        }
+    }
+    session.bookmarks_loaded = true;
+}
+
+fn toggle_active_bookmark(
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+    library_service: Option<&LibraryService>,
+) {
+    let Some(service) = library_service else {
+        return;
+    };
+    let Some(session) = &mut app.reading else {
+        return;
+    };
+    let page = session.current_page_index;
+    match service.toggle_bookmark(session.comic_id, page as u32) {
+        Ok(true) => {
+            session.bookmarks.insert(page);
+        }
+        Ok(false) => {
+            session.bookmarks.remove(&page);
+        }
+        Err(error) => {
+            session.viewer_state.chrome.status_text = Some(format!("Bookmark failed: {error}"));
+        }
+    }
 }
 
 fn ensure_reader_page_loaded(
@@ -252,6 +311,25 @@ fn poll_decode_results(ctx: &egui::Context, app: &mut ComicReaderApp<egui::Textu
     }
 }
 
+pub fn resolve_navigation_target(
+    command: PageNavigationCommand,
+    current_page_index: usize,
+    page_count: usize,
+) -> usize {
+    let last_page = page_count.saturating_sub(1);
+    match command {
+        PageNavigationCommand::PreviousPage | PageNavigationCommand::ScrollUp => {
+            current_page_index.saturating_sub(1)
+        }
+        PageNavigationCommand::NextPage | PageNavigationCommand::ScrollDown => {
+            current_page_index.saturating_add(1).min(last_page)
+        }
+        PageNavigationCommand::FirstPage => 0,
+        PageNavigationCommand::LastPage => last_page,
+        PageNavigationCommand::GoToPage(index) => index.min(last_page),
+    }
+}
+
 fn process_reader_navigation(
     ctx: &egui::Context,
     app: &mut ComicReaderApp<egui::TextureHandle>,
@@ -268,14 +346,14 @@ fn process_reader_navigation(
     let Some(session) = &app.reading else {
         return;
     };
-    let next_page = match command {
-        PageNavigationCommand::PreviousPage => session.current_page_index.saturating_sub(1),
-        PageNavigationCommand::NextPage | PageNavigationCommand::ScrollDown => session
-            .current_page_index
-            .saturating_add(1)
-            .min(session.page_count.saturating_sub(1)),
-        PageNavigationCommand::ScrollUp => session.current_page_index.saturating_sub(1),
-    };
+    let next_page =
+        resolve_navigation_target(command, session.current_page_index, session.page_count);
+    let is_jump = matches!(
+        command,
+        PageNavigationCommand::FirstPage
+            | PageNavigationCommand::LastPage
+            | PageNavigationCommand::GoToPage(_)
+    );
 
     if Some(next_page)
         != app
@@ -284,6 +362,20 @@ fn process_reader_navigation(
             .map(|session| session.current_page_index)
     {
         load_reader_page(ctx, app, item, next_page);
+    }
+
+    // Explicit jumps must move the continuous viewport too, since continuous
+    // mode scrolls by viewport offset rather than swapping the current page.
+    if is_jump
+        && let Some(session) = &mut app.reading
+        && session.viewer_state.layout_mode == ReadingLayoutMode::ContinuousVertical
+        && let Some(canvas) = &session.viewer_state.continuous_canvas
+        && let Some(rect) = canvas
+            .page_rects
+            .iter()
+            .find(|rect| rect.page_index == next_page)
+    {
+        session.viewer_state.continuous_pending_scroll_top = Some(rect.y);
     }
 }
 
@@ -303,12 +395,136 @@ fn process_reader_view_command(
     match command {
         ViewCommand::ToggleSpread => toggle_reader_spread(ctx, app, item),
         ViewCommand::ToggleContinuous => toggle_reader_continuous(app),
+        ViewCommand::RotateLeft => rotate_reader(ctx, app, item, false),
+        ViewCommand::RotateRight => rotate_reader(ctx, app, item, true),
         _ => {
             if let Some(session) = &mut app.reading {
                 session.viewer_state.pending_view_command = Some(command);
             }
         }
     }
+}
+
+fn render_reader_adjustments(
+    ctx: &egui::Context,
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+    item: &LibraryGridItem,
+) {
+    let mut commit = false;
+    {
+        let Some(session) = &mut app.reading else {
+            return;
+        };
+        if !session.show_adjustments {
+            return;
+        }
+        let mut open = session.show_adjustments;
+        egui::Window::new("Image Adjustments")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let mut changed = false;
+                let mut released = false;
+                let mut dragged = false;
+
+                let brightness = ui.add(
+                    egui::Slider::new(&mut session.adjustments.brightness, -1.0..=1.0)
+                        .text("Brightness"),
+                );
+                changed |= brightness.changed();
+                released |= brightness.drag_stopped();
+                dragged |= brightness.dragged();
+
+                let contrast = ui.add(
+                    egui::Slider::new(&mut session.adjustments.contrast, -1.0..=1.0)
+                        .text("Contrast"),
+                );
+                changed |= contrast.changed();
+                released |= contrast.drag_stopped();
+                dragged |= contrast.dragged();
+
+                let gamma = ui.add(
+                    egui::Slider::new(&mut session.adjustments.gamma, 0.1..=3.0).text("Gamma"),
+                );
+                changed |= gamma.changed();
+                released |= gamma.drag_stopped();
+                dragged |= gamma.dragged();
+
+                let grayscale = ui.add_enabled(
+                    !session.adjustments.value_study,
+                    egui::Slider::new(&mut session.adjustments.grayscale, 0.0..=1.0)
+                        .text("Grayscale"),
+                );
+                changed |= grayscale.changed();
+                released |= grayscale.drag_stopped();
+                dragged |= grayscale.dragged();
+
+                let value_study_toggle = ui
+                    .checkbox(&mut session.adjustments.value_study, "Value study")
+                    .on_hover_text("Posterize luma to N bands (grayscale)");
+                if value_study_toggle.changed() {
+                    changed = true;
+                    released = true;
+                }
+                let bands = ui.add_enabled(
+                    session.adjustments.value_study,
+                    egui::Slider::new(
+                        &mut session.adjustments.value_bands,
+                        crate::decode::VALUE_BANDS_MIN..=crate::decode::VALUE_BANDS_MAX,
+                    )
+                    .text("Bands"),
+                );
+                changed |= bands.changed();
+                released |= bands.drag_stopped();
+                dragged |= bands.dragged();
+
+                if ui.button("Reset").clicked() {
+                    session.adjustments = ImageAdjustments::default();
+                    changed = true;
+                    released = true;
+                }
+
+                // Re-decode on release or on a discrete (non-drag) change, so a
+                // slider drag does not spam full-page decodes every frame.
+                commit = released || (changed && !dragged);
+            });
+        session.show_adjustments = open;
+    }
+
+    if commit {
+        let page = if let Some(session) = &mut app.reading {
+            session.invalidate_for_adjustments();
+            session.current_page_index
+        } else {
+            return;
+        };
+        load_reader_page(ctx, app, item, page);
+    }
+}
+
+fn rotate_reader(
+    ctx: &egui::Context,
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+    item: &LibraryGridItem,
+    rotate_right: bool,
+) {
+    let page = {
+        let Some(session) = &mut app.reading else {
+            return;
+        };
+        let next_rotation = if rotate_right {
+            session.rotation.rotate_right()
+        } else {
+            session.rotation.rotate_left()
+        };
+        session.set_rotation(next_rotation);
+        session.current_page_index
+    };
+    // Cache was cleared by set_rotation, so this re-decodes the current page in
+    // the new orientation; the spread next page and continuous pages refresh on
+    // the following frame.
+    load_reader_page(ctx, app, item, page);
 }
 
 fn toggle_reader_continuous(app: &mut ComicReaderApp<egui::TextureHandle>) {
@@ -479,6 +695,8 @@ pub fn read_archive_page_color_image(
         bytes,
         purpose: DecodePurpose::Direct,
         target_size: None,
+        rotation: Rotation::None,
+        adjustments: ImageAdjustments::default(),
         cancellation_token: None,
     });
     let color_image = result.outcome.map_err(|err| err.to_string())?;
@@ -498,6 +716,8 @@ fn read_session_page_color_image<T>(
         purpose: DecodePurpose::Direct,
         bytes,
         target_size: None,
+        rotation: session.rotation,
+        adjustments: session.adjustments,
         cancellation_token: None,
     });
     let color_image = result.outcome.map_err(|err| err.to_string())?;
@@ -523,6 +743,8 @@ fn submit_direct_decode_for_session<T>(
         bytes,
         purpose: DecodePurpose::Direct,
         target_size: None,
+        rotation: session.rotation,
+        adjustments: session.adjustments,
         cancellation_token: Some(cancellation_token.clone()),
     };
     worker_pool.submit(request).map_err(|err| err.to_string())?;
@@ -567,6 +789,8 @@ pub fn dispatch_prefetch_for_session<T>(
             bytes,
             purpose: DecodePurpose::Prefetch,
             target_size: None,
+            rotation: session.rotation,
+            adjustments: session.adjustments,
             cancellation_token: Some(cancellation_token.clone()),
         };
         if worker_pool.submit(request).is_ok() {
@@ -630,6 +854,8 @@ pub fn dispatch_continuous_prefetch_for_session<T>(
             bytes,
             purpose: DecodePurpose::Prefetch,
             target_size: None,
+            rotation: session.rotation,
+            adjustments: session.adjustments,
             cancellation_token: Some(cancellation_token.clone()),
         };
         if worker_pool.submit(request).is_ok() {
@@ -890,40 +1116,57 @@ pub fn route_app_update(
     library_service: Option<&LibraryService>,
 ) {
     poll_decode_results(ctx, app);
-    library_controls.poll_scan(app, library_service);
+    library_controls.poll_import(app, library_service);
     library_controls.poll_thumbnails(ctx, app);
     library_controls.schedule_missing_thumbnails(app);
-    if library_controls.is_scanning() || library_controls.has_pending_thumbnails() {
+    if library_controls.is_importing() || library_controls.has_pending_thumbnails() {
         ctx.request_repaint_after(Duration::from_millis(50));
     }
 
     match app.state {
         AppState::Library => {
+            render_library_menu_bar(ctx, app, library_controls, settings, library_service);
+            let shelf_selection = render_library_shelf(ctx, app, library_controls);
+            if let Some(item) = shelf_selection {
+                if app.library.select_mode {
+                    app.library.toggle_selection(item.comic_id);
+                } else {
+                    open_grid_item_in_reader(ctx, app, &item);
+                }
+            }
+            render_about_window(ctx, &mut library_controls.about_open);
             egui::CentralPanel::default()
                 .frame(editor_panel_frame())
                 .show(ctx, |ui| {
-                    render_library_root_controls(ui, app, library_controls, settings);
+                    render_library_status_and_filter(ui, app);
                     ui.add_space(10.0);
                     let selected = match app.library.view_mode {
                         LibraryViewMode::Thumbnails => render_library_grid::<egui::TextureHandle>(
                             ui,
                             &app.library.items,
                             app.library.visible_indices(),
+                            &app.library.selected_ids,
                             &mut library_controls.thumbnail_textures,
                         ),
                         LibraryViewMode::List => render_library_list(
                             ui,
                             &app.library.items,
                             app.library.visible_indices(),
+                            &app.library.selected_ids,
                             &mut library_controls.thumbnail_textures,
                         ),
                     };
                     if let Some(item) = selected {
-                        open_grid_item_in_reader(ctx, app, &item);
+                        if app.library.select_mode {
+                            app.library.toggle_selection(item.comic_id);
+                        } else {
+                            open_grid_item_in_reader(ctx, app, &item);
+                        }
                     }
                 });
         }
         AppState::Reading(_) => {
+            ensure_bookmarks_loaded(app, library_service);
             if let Some(item) = active_library_item(app) {
                 ensure_reader_page_loaded(ctx, app, &item);
             }
@@ -936,26 +1179,27 @@ pub fn route_app_update(
                     !is_scrolling_continuous_view,
                 );
             }
-            egui::TopBottomPanel::top("reader_nav")
-                .frame(editor_toolbar_frame())
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Library").clicked() {
-                            app.return_to_library();
-                        }
-                        render_reader_toolbar(ui, app, settings);
-                    });
-                });
+            render_reader_menu_bar(ctx, app, library_controls, settings);
+            render_reader_nav_bar(ctx, app);
+            render_about_window(ctx, &mut library_controls.about_open);
             if let Some(item) = active_library_item(app) {
                 process_reader_view_command(ctx, app, &item);
             }
             if let Some(session) = &mut app.reading {
                 viewer::ui::render_viewer_panel(ctx, &mut session.viewer_state);
             }
+            if app
+                .reading
+                .as_mut()
+                .map(|session| std::mem::take(&mut session.viewer_state.pending_bookmark_toggle))
+                .unwrap_or(false)
+            {
+                toggle_active_bookmark(app, library_service);
+            }
             if let Some(item) = active_library_item(app) {
                 process_reader_view_command(ctx, app, &item);
                 process_reader_navigation(ctx, app, &item);
+                render_reader_adjustments(ctx, app, &item);
                 dispatch_continuous_if_ready(ctx, app, &item);
                 dispatch_prefetch_if_ready(ctx, app, &item);
             }
@@ -963,57 +1207,262 @@ pub fn route_app_update(
     }
 }
 
-fn render_reader_toolbar(
+/// Parses a 1-based page number from user input into a clamped 0-based index.
+/// Returns None for empty, non-numeric, or zero input.
+pub fn parse_goto_target(input: &str, page_count: usize) -> Option<usize> {
+    let page_number: usize = input.trim().parse().ok()?;
+    if page_number == 0 || page_count == 0 {
+        return None;
+    }
+    Some((page_number - 1).min(page_count - 1))
+}
+
+fn render_reader_menu_bar(
+    ctx: &egui::Context,
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+    controls: &mut LibraryRootControls,
+    settings: &mut SettingsWindowState,
+) {
+    egui::TopBottomPanel::top("reader_menu_bar")
+        .frame(editor_toolbar_frame())
+        .resizable(false)
+        .show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Back to Library").clicked() {
+                        ui.close_menu();
+                        app.return_to_library();
+                    }
+                    ui.separator();
+                    if ui.button("Settings…").clicked() {
+                        ui.close_menu();
+                        settings.open = true;
+                    }
+                    ui.separator();
+                    if ui.button("Quit").clicked() {
+                        ui.close_menu();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+
+                ui.menu_button("Tools", |ui| {
+                    let Some(session) = &mut app.reading else {
+                        ui.label("No comic open");
+                        return;
+                    };
+                    if ui.button("Rotate left").clicked() {
+                        ui.close_menu();
+                        session.viewer_state.pending_view_command =
+                            Some(ViewCommand::RotateLeft);
+                    }
+                    if ui.button("Rotate right").clicked() {
+                        ui.close_menu();
+                        session.viewer_state.pending_view_command =
+                            Some(ViewCommand::RotateRight);
+                    }
+                    ui.separator();
+                    ui.checkbox(&mut session.show_adjustments, "Image adjustments")
+                        .on_hover_text("Brightness / contrast / gamma");
+                    ui.separator();
+                    let current_page = session.current_page_index;
+                    let bookmarked = session.bookmarks.contains(&current_page);
+                    let bookmark_label = if bookmarked {
+                        "★ Remove bookmark"
+                    } else {
+                        "☆ Add bookmark"
+                    };
+                    if ui.button(bookmark_label).clicked() {
+                        ui.close_menu();
+                        session.viewer_state.pending_bookmark_toggle = true;
+                    }
+                    if !session.bookmarks.is_empty() {
+                        ui.menu_button(
+                            format!("Bookmarks ({})", session.bookmarks.len()),
+                            |ui| {
+                                let pages: Vec<usize> =
+                                    session.bookmarks.iter().copied().collect();
+                                for page in pages {
+                                    if ui.button(format!("Page {}", page + 1)).clicked() {
+                                        ui.close_menu();
+                                        session.viewer_state.pending_navigation =
+                                            Some(PageNavigationCommand::GoToPage(page));
+                                    }
+                                }
+                            },
+                        );
+                    }
+                });
+
+                ui.menu_button("Options", |ui| {
+                    let Some(session) = &mut app.reading else {
+                        ui.label("No comic open");
+                        return;
+                    };
+                    ui.label(egui::RichText::new("Zoom").color(EDITOR_TEXT_MUTED));
+                    if ui.button("Fit").clicked() {
+                        ui.close_menu();
+                        session.viewer_state.pending_view_command = Some(ViewCommand::Fit);
+                    }
+                    if ui.button("Fill").clicked() {
+                        ui.close_menu();
+                        session.viewer_state.pending_view_command = Some(ViewCommand::Fill);
+                    }
+                    if ui.button("Fit width").clicked() {
+                        ui.close_menu();
+                        session.viewer_state.pending_view_command =
+                            Some(ViewCommand::FitWidth);
+                    }
+                    if ui.button("Fit height").clicked() {
+                        ui.close_menu();
+                        session.viewer_state.pending_view_command =
+                            Some(ViewCommand::FitHeight);
+                    }
+                    if ui.button("Actual size (1:1)").clicked() {
+                        ui.close_menu();
+                        session.viewer_state.pending_view_command =
+                            Some(ViewCommand::OneToOne);
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("Layout").color(EDITOR_TEXT_MUTED));
+                    let mut continuous_enabled = session.viewer_state.layout_mode
+                        == ReadingLayoutMode::ContinuousVertical;
+                    if ui.checkbox(&mut continuous_enabled, "Continuous scroll").changed() {
+                        session.viewer_state.pending_view_command =
+                            Some(ViewCommand::ToggleContinuous);
+                    }
+                    let mut spread_enabled = session.spread_mode_enabled;
+                    let spread_allowed = session.viewer_state.layout_mode
+                        != ReadingLayoutMode::ContinuousVertical;
+                    if ui
+                        .add_enabled_ui(spread_allowed, |ui| {
+                            ui.checkbox(&mut spread_enabled, "Two-page spread")
+                        })
+                        .inner
+                        .changed()
+                    {
+                        session.viewer_state.pending_view_command =
+                            Some(ViewCommand::ToggleSpread);
+                    }
+                    let mut fill_crop = session.viewer_state.view_mode == ViewMode::Fill;
+                    if ui.checkbox(&mut fill_crop, "Crop fill").changed() {
+                        session.viewer_state.pending_view_command = Some(if fill_crop {
+                            ViewCommand::Fill
+                        } else {
+                            ViewCommand::Fit
+                        });
+                    }
+                });
+
+                ui.menu_button("Help", |ui| {
+                    if ui.button("About").clicked() {
+                        ui.close_menu();
+                        controls.about_open = true;
+                    }
+                });
+            });
+        });
+}
+
+fn render_reader_nav_bar(
+    ctx: &egui::Context,
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+) {
+    egui::TopBottomPanel::top("reader_nav_bar")
+        .frame(editor_toolbar_frame())
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                render_reader_nav_controls(ui, app);
+            });
+        });
+}
+
+fn render_reader_nav_controls(
     ui: &mut egui::Ui,
     app: &mut ComicReaderApp<egui::TextureHandle>,
-    settings: &mut SettingsWindowState,
 ) {
     let Some(session) = &mut app.reading else {
         return;
     };
 
     ui.spacing_mut().item_spacing.x = 6.0;
-    ui.separator();
     ui.label(format!(
         "{} / {}",
         session.current_page_index.saturating_add(1),
         session.page_count
     ));
     ui.separator();
-    if ui.button("Settings").clicked() {
-        settings.open = true;
-    }
-    ui.separator();
+    let is_first = session.current_page_index == 0;
+    let is_last = session.current_page_index + 1 >= session.page_count;
     if ui
-        .add_enabled(
-            session.current_page_index > 0,
-            egui::Button::new("Prev").small(),
-        )
+        .add_enabled(!is_first, egui::Button::new("|<").small())
+        .on_hover_text("First page (Home)")
+        .clicked()
+    {
+        session.viewer_state.pending_navigation = Some(PageNavigationCommand::FirstPage);
+    }
+    if ui
+        .add_enabled(!is_first, egui::Button::new("Prev").small())
         .clicked()
     {
         session.viewer_state.pending_navigation = Some(PageNavigationCommand::PreviousPage);
     }
     if ui
-        .add_enabled(
-            session.current_page_index + 1 < session.page_count,
-            egui::Button::new("Next").small(),
-        )
+        .add_enabled(!is_last, egui::Button::new("Next").small())
         .clicked()
     {
         session.viewer_state.pending_navigation = Some(PageNavigationCommand::NextPage);
     }
+    if ui
+        .add_enabled(!is_last, egui::Button::new(">|").small())
+        .on_hover_text("Last page (End)")
+        .clicked()
+    {
+        session.viewer_state.pending_navigation = Some(PageNavigationCommand::LastPage);
+    }
+    let goto_response = ui.add(
+        egui::TextEdit::singleline(&mut session.goto_input)
+            .desired_width(46.0)
+            .hint_text("page"),
+    );
+    let go_submitted = ui.button("Go").clicked()
+        || (goto_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+    if go_submitted {
+        if let Some(target) = parse_goto_target(&session.goto_input, session.page_count) {
+            session.viewer_state.pending_navigation = Some(PageNavigationCommand::GoToPage(target));
+        }
+        session.goto_input.clear();
+    }
     ui.separator();
-    if ui.button("Fit").clicked() {
-        session.viewer_state.pending_view_command = Some(ViewCommand::Fit);
+    let current_page = session.current_page_index;
+    let bookmarked = session.bookmarks.contains(&current_page);
+    let star = if bookmarked { "★" } else { "☆" };
+    if ui
+        .add(egui::Button::new(star).small())
+        .on_hover_text("Toggle bookmark (B)")
+        .clicked()
+    {
+        session.viewer_state.pending_bookmark_toggle = true;
     }
-    if ui.button("Fill").clicked() {
-        session.viewer_state.pending_view_command = Some(ViewCommand::Fill);
-    }
-    if ui.button("1:1").clicked() {
-        session.viewer_state.pending_view_command = Some(ViewCommand::OneToOne);
-    }
+    ui.separator();
     if ui.button("-").clicked() {
         session.viewer_state.pending_view_command = Some(ViewCommand::ZoomOut);
+    }
+    let current_zoom = session.viewer_state.zoom_pan.zoom;
+    let min_zoom = session.viewer_state.zoom_pan.min_zoom;
+    let max_zoom = session.viewer_state.zoom_pan.max_zoom;
+    let mut slider_zoom = current_zoom;
+    ui.spacing_mut().slider_width = 90.0;
+    if ui
+        .add(egui::Slider::new(&mut slider_zoom, min_zoom..=max_zoom).show_value(false))
+        .changed()
+        && current_zoom > 0.0
+        && slider_zoom != current_zoom
+    {
+        session
+            .viewer_state
+            .zoom_pan
+            .apply_zoom_factor(slider_zoom / current_zoom, ZoomAnchor::CENTER);
     }
     ui.label(format!(
         "{:.0}%",
@@ -1022,43 +1471,17 @@ fn render_reader_toolbar(
     if ui.button("+").clicked() {
         session.viewer_state.pending_view_command = Some(ViewCommand::ZoomIn);
     }
-    ui.separator();
-    let mut continuous_enabled =
-        session.viewer_state.layout_mode == ReadingLayoutMode::ContinuousVertical;
-    if ui
-        .toggle_value(&mut continuous_enabled, "Continuous")
-        .changed()
-    {
-        session.viewer_state.pending_view_command = Some(ViewCommand::ToggleContinuous);
-    }
-    let mut spread_enabled = session.spread_mode_enabled;
-    if ui
-        .add_enabled_ui(
-            session.viewer_state.layout_mode != ReadingLayoutMode::ContinuousVertical,
-            |ui| ui.toggle_value(&mut spread_enabled, "2 pages"),
-        )
-        .inner
-        .changed()
-    {
-        session.viewer_state.pending_view_command = Some(ViewCommand::ToggleSpread);
-    }
-    let mut fill = session.viewer_state.view_mode == ViewMode::Fill;
-    if ui.toggle_value(&mut fill, "Crop fill").changed() {
-        session.viewer_state.pending_view_command = Some(if fill {
-            ViewCommand::Fill
-        } else {
-            ViewCommand::Fit
-        });
-    }
 }
 
 pub struct LibraryRootControls {
-    pub root_path: String,
-    scan_result_receiver: Option<Receiver<Result<Vec<ScannedComic>, String>>>,
+    import_result_receiver: Option<Receiver<Result<ImportSummary, String>>>,
+    store_root: PathBuf,
     thumbnail_pool: Option<ThumbnailWorkerPool>,
     pending_thumbnails: HashSet<String>,
     thumbnail_textures: HashMap<String, egui::TextureHandle>,
     thumbnail_cache_root: PathBuf,
+    pub shelf_open: bool,
+    pub about_open: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1070,77 +1493,88 @@ pub struct SettingsWindowState {
 impl LibraryRootControls {
     pub fn new() -> Self {
         Self {
-            root_path: String::new(),
-            scan_result_receiver: None,
+            import_result_receiver: None,
+            store_root: default_library_store_root(),
             thumbnail_pool: ThumbnailWorkerPool::start(2, 16).ok(),
             pending_thumbnails: HashSet::new(),
             thumbnail_textures: HashMap::new(),
             thumbnail_cache_root: default_thumbnail_cache_root(),
+            shelf_open: false,
+            about_open: false,
         }
     }
 
-    fn is_scanning(&self) -> bool {
-        self.scan_result_receiver.is_some()
+    fn is_importing(&self) -> bool {
+        self.import_result_receiver.is_some()
     }
 
     fn has_pending_thumbnails(&self) -> bool {
         !self.pending_thumbnails.is_empty()
     }
 
-    fn start_scan(&mut self) {
-        if self.root_path.trim().is_empty() || self.is_scanning() {
+    fn start_import_files(&mut self, files: Vec<PathBuf>) {
+        if self.is_importing() || files.is_empty() {
             return;
         }
-
-        let root_path = self.root_path.trim().to_owned();
+        let store_root = self.store_root.clone();
         let (sender, receiver) = bounded(1);
-        self.scan_result_receiver = Some(receiver);
-
+        self.import_result_receiver = Some(receiver);
         thread::spawn(move || {
-            let result = scan_library_root(&root_path).map_err(|error| error.to_string());
+            let _ = sender.send(Ok(import_paths(&files, &store_root)));
+        });
+    }
+
+    fn start_import_folder(&mut self, folder: PathBuf) {
+        if self.is_importing() {
+            return;
+        }
+        let store_root = self.store_root.clone();
+        let (sender, receiver) = bounded(1);
+        self.import_result_receiver = Some(receiver);
+        thread::spawn(move || {
+            let result = discover_supported_archives(&folder)
+                .map_err(|error| error.to_string())
+                .map(|paths| import_paths(&paths, &store_root));
             let _ = sender.send(result);
         });
     }
 
-    fn poll_scan(
+    fn poll_import(
         &mut self,
         app: &mut ComicReaderApp<egui::TextureHandle>,
         library_service: Option<&LibraryService>,
     ) {
-        let Some(receiver) = &self.scan_result_receiver else {
+        let Some(receiver) = &self.import_result_receiver else {
             return;
         };
         let Ok(result) = receiver.try_recv() else {
             return;
         };
 
-        self.scan_result_receiver = None;
+        self.import_result_receiver = None;
         match result {
-            Ok(scanned) => {
-                let mut status_text = None;
-                app.library.items = if let Some(service) = library_service {
-                    match persist_scanned_comics_to_grid_items(service, &scanned) {
-                        Ok(items) => items,
-                        Err(message) => {
-                            status_text = Some(message);
-                            scanned_comics_to_grid_items(&scanned)
-                        }
-                    }
-                } else {
-                    scanned_comics_to_grid_items(&scanned)
+            Ok(summary) => {
+                let Some(service) = library_service else {
+                    app.library.status_text = Some("Library database unavailable".to_owned());
+                    return;
                 };
-                app.library.refresh_filter_cache();
-                app.library.status_text = status_text.or_else(|| {
-                    Some(format!(
-                        "Loaded {} comic{}",
-                        app.library.items.len(),
-                        if app.library.items.len() == 1 {
-                            ""
-                        } else {
-                            "s"
-                        }
-                    ))
-                });
+                let mut added = 0usize;
+                let mut error_text = None;
+                for imported in &summary.imported {
+                    match service.persist_imported_comic(imported) {
+                        Ok(_) => added += 1,
+                        Err(error) => error_text = Some(error.to_string()),
+                    }
+                }
+                match service.library_grid_items() {
+                    Ok(items) => {
+                        app.library.items = items;
+                        app.library.refresh_filter_cache();
+                    }
+                    Err(error) => error_text = Some(error.to_string()),
+                }
+                app.library.status_text =
+                    Some(import_status_text(added, summary.failures.len(), error_text));
             }
             Err(message) => {
                 app.library.status_text = Some(message);
@@ -1178,6 +1612,66 @@ impl LibraryRootControls {
             }
             ctx.request_repaint();
         }
+    }
+
+    fn remove_selected(
+        &mut self,
+        app: &mut ComicReaderApp<egui::TextureHandle>,
+        library_service: Option<&LibraryService>,
+    ) {
+        let Some(service) = library_service else {
+            app.library.status_text = Some("Library database unavailable".to_owned());
+            return;
+        };
+        if app.library.selected_ids.is_empty() {
+            return;
+        }
+
+        let targets = app
+            .library
+            .items
+            .iter()
+            .filter(|item| app.library.selected_ids.contains(&item.comic_id))
+            .map(|item| {
+                (
+                    item.comic_id,
+                    item.path.clone(),
+                    item.source_fingerprint.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut removed = 0usize;
+        let mut error_text = None;
+        for (comic_id, path, fingerprint) in &targets {
+            match service.remove_comic(*comic_id) {
+                Ok(Some(_)) => {
+                    removed += 1;
+                    delete_store_file(path, &self.store_root);
+                    let thumbnail =
+                        cache_path_for_source(&self.thumbnail_cache_root, path, fingerprint);
+                    let _ = std::fs::remove_file(&thumbnail);
+                    self.thumbnail_textures
+                        .remove(&thumbnail.to_string_lossy().into_owned());
+                    self.pending_thumbnails.remove(path);
+                }
+                Ok(None) => {}
+                Err(error) => error_text = Some(error.to_string()),
+            }
+        }
+
+        match service.library_grid_items() {
+            Ok(items) => app.library.items = items,
+            Err(error) => error_text = Some(error.to_string()),
+        }
+        app.library.selected_ids.clear();
+        app.library.refresh_filter_cache();
+        app.library.status_text = Some(error_text.unwrap_or_else(|| {
+            format!(
+                "Removed {removed} comic{}",
+                if removed == 1 { "" } else { "s" }
+            )
+        }));
     }
 
     fn schedule_missing_thumbnails(&mut self, app: &mut ComicReaderApp<egui::TextureHandle>) {
@@ -1236,6 +1730,38 @@ impl Default for LibraryRootControls {
     }
 }
 
+/// Deletes a comic's managed copy and removes its now-empty hash directory.
+/// Only files inside the managed store are deleted, so an external original
+/// (e.g. a legacy in-place library row) is never touched.
+fn delete_store_file(path: &str, store_root: &Path) {
+    let path = Path::new(path);
+    if !path.starts_with(store_root) {
+        return;
+    }
+    if std::fs::remove_file(path).is_err() {
+        return;
+    }
+    if let Some(parent) = path.parent()
+        && parent
+            .read_dir()
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+    {
+        let _ = std::fs::remove_dir(parent);
+    }
+}
+
+fn import_status_text(added: usize, skipped: usize, error: Option<String>) -> String {
+    if let Some(error) = error {
+        return error;
+    }
+    let mut text = format!("Added {added} comic{}", if added == 1 { "" } else { "s" });
+    if skipped > 0 {
+        text.push_str(&format!(" ({skipped} skipped)"));
+    }
+    text
+}
+
 pub fn scanned_comics_to_grid_items(
     comics: &[crate::library::ScannedComic],
 ) -> Vec<LibraryGridItem> {
@@ -1281,70 +1807,203 @@ pub fn persist_scanned_comics_to_grid_items(
         .map_err(|error| format!("Library load failed: {error}"))
 }
 
-fn render_library_root_controls(
-    ui: &mut egui::Ui,
+fn render_library_menu_bar(
+    ctx: &egui::Context,
     app: &mut ComicReaderApp<egui::TextureHandle>,
     controls: &mut LibraryRootControls,
     settings: &mut SettingsWindowState,
+    library_service: Option<&LibraryService>,
 ) {
-    editor_toolbar_frame().show(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Library root").color(EDITOR_GREEN));
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut controls.root_path)
-                    .desired_width(420.0)
-                    .hint_text("/path/to/comics"),
-            );
-            let enter_pressed =
-                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            let open_clicked = ui
-                .add_enabled(!controls.is_scanning(), egui::Button::new("Open Folder"))
-                .clicked();
-            let scan_clicked = ui
-                .add_enabled(!controls.is_scanning(), egui::Button::new("Scan"))
-                .clicked();
-            if open_clicked
-                && let Some(folder) = rfd::FileDialog::new().set_directory(".").pick_folder()
-            {
-                controls.root_path = folder.to_string_lossy().into_owned();
-                controls.start_scan();
-            }
-            if enter_pressed || scan_clicked {
-                controls.start_scan();
-            }
-            if controls.is_scanning() {
-                ui.spinner();
-            }
-            ui.separator();
-            if ui.button("Settings").clicked() {
-                settings.open = true;
-            }
-            ui.separator();
-            ui.selectable_value(
-                &mut app.library.view_mode,
-                LibraryViewMode::Thumbnails,
-                "Thumbnails",
-            );
-            ui.selectable_value(&mut app.library.view_mode, LibraryViewMode::List, "List");
+    egui::TopBottomPanel::top("library_menu_bar")
+        .frame(editor_toolbar_frame())
+        .show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    let add_files = ui
+                        .add_enabled(
+                            !controls.is_importing(),
+                            egui::Button::new("Add Files…"),
+                        )
+                        .clicked();
+                    if add_files {
+                        ui.close_menu();
+                        if let Some(files) = rfd::FileDialog::new()
+                            .add_filter("Comics", &["cbz", "cbr", "pdf"])
+                            .set_directory(".")
+                            .pick_files()
+                        {
+                            controls.start_import_files(files);
+                        }
+                    }
+                    let add_folder = ui
+                        .add_enabled(
+                            !controls.is_importing(),
+                            egui::Button::new("Add Folder to Library…"),
+                        )
+                        .clicked();
+                    if add_folder {
+                        ui.close_menu();
+                        if let Some(folder) =
+                            rfd::FileDialog::new().set_directory(".").pick_folder()
+                        {
+                            controls.start_import_folder(folder);
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Settings…").clicked() {
+                        ui.close_menu();
+                        settings.open = true;
+                    }
+                    ui.separator();
+                    if ui.button("Quit").clicked() {
+                        ui.close_menu();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+
+                ui.menu_button("Tools", |ui| {
+                    ui.label(egui::RichText::new("View").color(EDITOR_TEXT_MUTED));
+                    ui.selectable_value(
+                        &mut app.library.view_mode,
+                        LibraryViewMode::Thumbnails,
+                        "Thumbnails",
+                    );
+                    ui.selectable_value(
+                        &mut app.library.view_mode,
+                        LibraryViewMode::List,
+                        "List",
+                    );
+                    ui.separator();
+                    let mut select_mode = app.library.select_mode;
+                    if ui.checkbox(&mut select_mode, "Select mode").changed() {
+                        app.library.select_mode = select_mode;
+                        if !select_mode {
+                            app.library.selected_ids.clear();
+                        }
+                    }
+                    ui.checkbox(&mut controls.shelf_open, "Show shelf");
+                    ui.separator();
+                    let has_unavailable = app
+                        .library
+                        .items
+                        .iter()
+                        .any(|item| item.availability == ComicAvailability::Unavailable);
+                    if ui
+                        .add_enabled(
+                            has_unavailable,
+                            egui::Button::new("Purge unavailable"),
+                        )
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        let purged = app.purge_unavailable_from_view();
+                        app.library.status_text =
+                            Some(format!("Purged {purged} unavailable comic(s)"));
+                    }
+                });
+
+                ui.menu_button("Help", |ui| {
+                    if ui.button("About").clicked() {
+                        ui.close_menu();
+                        controls.about_open = true;
+                    }
+                });
+
+                if controls.is_importing() {
+                    ui.separator();
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("Importing…").color(EDITOR_TEXT_MUTED),
+                    );
+                }
+
+                if app.library.select_mode {
+                    ui.separator();
+                    let count = app.library.selected_ids.len();
+                    if ui
+                        .add_enabled(
+                            count > 0,
+                            egui::Button::new(format!("Remove selected ({count})")),
+                        )
+                        .clicked()
+                    {
+                        controls.remove_selected(app, library_service);
+                    }
+                }
+            });
         });
-        ui.add_space(6.0);
-        render_library_filter_controls(ui, app);
+}
 
-        if let Some(status_text) = &app.library.status_text {
-            ui.label(egui::RichText::new(status_text).color(EDITOR_TEXT_MUTED));
-        }
+fn render_library_shelf(
+    ctx: &egui::Context,
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+    controls: &mut LibraryRootControls,
+) -> Option<LibraryGridItem> {
+    let mut clicked = None;
+    let mut shelf_open = controls.shelf_open;
+    egui::SidePanel::left("library_shelf")
+        .resizable(true)
+        .default_width(220.0)
+        .width_range(160.0..=400.0)
+        .show_animated(ctx, shelf_open, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Shelf");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✕").on_hover_text("Hide shelf").clicked() {
+                        shelf_open = false;
+                    }
+                });
+            });
+            ui.separator();
+            let visible: Vec<LibraryGridItem> =
+                app.library.visible_items().cloned().collect();
+            if visible.is_empty() {
+                ui.label(egui::RichText::new("Library is empty").color(EDITOR_TEXT_MUTED));
+                return;
+            }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for item in &visible {
+                    let is_selected = app.library.selected_ids.contains(&item.comic_id)
+                        || app.library.selected_comic_id == Some(item.comic_id);
+                    let response = ui
+                        .selectable_label(is_selected, &item.title)
+                        .on_hover_text(&item.path);
+                    if response.clicked() {
+                        clicked = Some(item.clone());
+                    }
+                }
+            });
+        });
+    controls.shelf_open = shelf_open;
+    clicked
+}
 
-        if app
-            .library
-            .items
-            .iter()
-            .any(|item| item.availability == ComicAvailability::Unavailable)
-            && ui.button("Purge unavailable").clicked()
-        {
-            let purged = app.purge_unavailable_from_view();
-            app.library.status_text = Some(format!("Purged {purged} unavailable comic(s)"));
-        }
-    });
+fn render_library_status_and_filter(
+    ui: &mut egui::Ui,
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+) {
+    render_library_filter_controls(ui, app);
+    if let Some(status_text) = &app.library.status_text {
+        ui.label(egui::RichText::new(status_text).color(EDITOR_TEXT_MUTED));
+    }
+}
+
+fn render_about_window(ctx: &egui::Context, open: &mut bool) {
+    if !*open {
+        return;
+    }
+    egui::Window::new("About cbr-egui")
+        .open(open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label("cbr-egui");
+            ui.label(
+                egui::RichText::new("A CBR/CBZ/PDF comic reader.").color(EDITOR_TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+        });
 }
 
 fn render_library_filter_controls(
@@ -1431,6 +2090,7 @@ fn ellipsize_text(text: &str, max_chars: usize) -> String {
 fn library_tile(
     ui: &mut egui::Ui,
     item: &LibraryGridItem,
+    is_selected: bool,
     thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
 ) -> egui::Response {
     let status = match &item.thumbnail_status {
@@ -1471,7 +2131,16 @@ fn library_tile(
             }
             _ => placeholder_cover_button(ui, thumbnail_size, status),
         };
-        ui.label(egui::RichText::new(ellipsize_text(&item.title, 42)).color(EDITOR_TEXT));
+        if is_selected {
+            ui.painter().rect_stroke(
+                response.rect,
+                4.0,
+                egui::Stroke::new(2.0, EDITOR_GREEN),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let title_color = if is_selected { EDITOR_GREEN } else { EDITOR_TEXT };
+        ui.label(egui::RichText::new(ellipsize_text(&item.title, 42)).color(title_color));
         if let Some(subtitle) = &item.subtitle {
             ui.label(
                 egui::RichText::new(ellipsize_text(subtitle, 42))
@@ -1497,6 +2166,7 @@ fn placeholder_cover_button(ui: &mut egui::Ui, size: egui::Vec2, label: &str) ->
 fn library_list_row(
     ui: &mut egui::Ui,
     item: &LibraryGridItem,
+    is_selected: bool,
     thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
 ) -> egui::Response {
     let row_height = LIST_THUMBNAIL_HEIGHT + 18.0;
@@ -1512,10 +2182,15 @@ fn library_list_row(
         EDITOR_PANEL
     };
     ui.painter().rect_filled(rect, 4.0, row_fill);
+    let (border_width, border_color) = if is_selected {
+        (2.0, EDITOR_GREEN)
+    } else {
+        (1.0, EDITOR_WIDGET_HOVER)
+    };
     ui.painter().rect_stroke(
         rect,
         4.0,
-        egui::Stroke::new(1.0, EDITOR_WIDGET_HOVER),
+        egui::Stroke::new(border_width, border_color),
         egui::StrokeKind::Inside,
     );
 

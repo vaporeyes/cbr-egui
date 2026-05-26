@@ -52,6 +52,8 @@ pub enum ViewMode {
     #[default]
     Fit,
     Fill,
+    FitWidth,
+    FitHeight,
 }
 
 pub fn page_display_size(page: Size2, viewport: Size2, mode: ViewMode) -> Size2 {
@@ -64,6 +66,8 @@ pub fn page_display_size(page: Size2, viewport: Size2, mode: ViewMode) -> Size2 
     let scale = match mode {
         ViewMode::Fit => width_scale.min(height_scale),
         ViewMode::Fill => width_scale.max(height_scale),
+        ViewMode::FitWidth => width_scale,
+        ViewMode::FitHeight => height_scale,
     };
 
     page.scaled(scale)

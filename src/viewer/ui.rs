@@ -125,6 +125,14 @@ fn apply_pending_view_command(
             state.view_mode = ViewMode::Fill;
             state.zoom_pan.reset_zoom();
         }
+        ViewCommand::FitWidth => {
+            state.view_mode = ViewMode::FitWidth;
+            state.zoom_pan.reset_zoom();
+        }
+        ViewCommand::FitHeight => {
+            state.view_mode = ViewMode::FitHeight;
+            state.zoom_pan.reset_zoom();
+        }
         ViewCommand::OneToOne => {
             state.view_mode = ViewMode::Fit;
             let one_to_one_zoom = one_to_one_zoom(base_display_size, pixel_size);
@@ -144,6 +152,10 @@ fn apply_pending_view_command(
         }
         ViewCommand::ToggleSpread => {}
         ViewCommand::ToggleContinuous => {}
+        // Rotation is handled at the app layer (re-decode + cache invalidation);
+        // the viewer never consumes these.
+        ViewCommand::RotateLeft => {}
+        ViewCommand::RotateRight => {}
     }
 }
 
@@ -340,6 +352,10 @@ fn handle_keybindings(ui: &mut egui::Ui, state: &mut ViewerState<egui::TextureHa
             state.pending_navigation = Some(PageNavigationCommand::ScrollDown);
         } else if input.key_pressed(egui::Key::ArrowUp) {
             state.pending_navigation = Some(PageNavigationCommand::ScrollUp);
+        } else if input.key_pressed(egui::Key::Home) {
+            state.pending_navigation = Some(PageNavigationCommand::FirstPage);
+        } else if input.key_pressed(egui::Key::End) {
+            state.pending_navigation = Some(PageNavigationCommand::LastPage);
         }
 
         if input.key_pressed(egui::Key::F) {
@@ -348,6 +364,10 @@ fn handle_keybindings(ui: &mut egui::Ui, state: &mut ViewerState<egui::TextureHa
             } else {
                 ViewCommand::Fit
             });
+        } else if input.key_pressed(egui::Key::W) {
+            state.pending_view_command = Some(ViewCommand::FitWidth);
+        } else if input.key_pressed(egui::Key::H) {
+            state.pending_view_command = Some(ViewCommand::FitHeight);
         } else if input.key_pressed(egui::Key::Num1) {
             state.pending_view_command = Some(ViewCommand::OneToOne);
         } else if input.key_pressed(egui::Key::Equals) || input.key_pressed(egui::Key::Plus) {
@@ -358,6 +378,16 @@ fn handle_keybindings(ui: &mut egui::Ui, state: &mut ViewerState<egui::TextureHa
             state.pending_view_command = Some(ViewCommand::ToggleSpread);
         } else if input.key_pressed(egui::Key::V) {
             state.pending_view_command = Some(ViewCommand::ToggleContinuous);
+        } else if input.key_pressed(egui::Key::R) {
+            state.pending_view_command = Some(if input.modifiers.shift {
+                ViewCommand::RotateLeft
+            } else {
+                ViewCommand::RotateRight
+            });
+        }
+
+        if input.key_pressed(egui::Key::B) {
+            state.pending_bookmark_toggle = true;
         }
     });
 }

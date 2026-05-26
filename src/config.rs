@@ -72,6 +72,10 @@ pub fn default_library_db_path() -> PathBuf {
     data_root().join("library.sqlite")
 }
 
+pub fn default_library_store_root() -> PathBuf {
+    data_root().join("comics")
+}
+
 fn config_root() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)

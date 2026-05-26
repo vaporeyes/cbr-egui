@@ -26,7 +26,7 @@ fn metadata(service: &LibraryService, title: &str, number: &str, writer: &str) -
 fn initializes_required_schema() {
     let (_dir, service) = service();
 
-    for table in ["folders", "metadata", "comics", "progress"] {
+    for table in ["folders", "metadata", "comics", "progress", "bookmarks"] {
         assert!(service.table_exists(table).expect("table lookup"));
     }
 }
@@ -162,6 +162,43 @@ fn purges_unavailable_comics() {
 
     assert_eq!(service.purge_unavailable_comics().expect("purge"), 1);
     assert!(service.list_comics().expect("list").is_empty());
+}
+
+#[test]
+fn remove_comic_deletes_row_progress_and_returns_comic() {
+    let (_dir, service) = service();
+    let meta = metadata(&service, "Saga", "1", "Brian K. Vaughan");
+    let comic = service
+        .upsert_comic(ComicInput {
+            path: "/library/Saga/001.cbz".to_owned(),
+            hash: "hash".to_owned(),
+            page_count: 10,
+            metadata_id: meta.id,
+        })
+        .expect("comic");
+    service.save_progress(comic.id, 4, false).expect("progress");
+
+    let removed = service
+        .remove_comic(comic.id)
+        .expect("remove")
+        .expect("was present");
+
+    assert_eq!(removed.path, comic.path);
+    assert!(service.get_comic(comic.id).expect("lookup").is_none());
+    assert_eq!(
+        service
+            .progress_count_for_comic(comic.id)
+            .expect("progress count"),
+        0
+    );
+    assert!(service.list_comics().expect("list").is_empty());
+}
+
+#[test]
+fn remove_comic_returns_none_for_unknown_id() {
+    let (_dir, service) = service();
+
+    assert!(service.remove_comic(999).expect("remove").is_none());
 }
 
 #[test]

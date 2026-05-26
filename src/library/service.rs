@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use super::errors::LibraryError;
+use super::import::ImportedComic;
 use super::models::{
-    Comic, ComicAvailability, ComicInput, ComicMetadata, ComicMetadataDisplay, Folder,
+    Bookmark, Comic, ComicAvailability, ComicInput, ComicMetadata, ComicMetadataDisplay, Folder,
     LibraryGridItem, Progress, ThumbnailStatus,
 };
 use super::scanner::ScannedComic;
@@ -103,6 +104,37 @@ impl LibraryService {
         self.list_comics()
     }
 
+    /// Records an imported (copied) comic in the database, keyed by its managed
+    /// store path. Re-importing the same file reuses the existing metadata row
+    /// and refreshes the comic in place.
+    pub fn persist_imported_comic(
+        &self,
+        imported: &ImportedComic,
+    ) -> Result<Comic, LibraryError> {
+        let path = imported.stored_path.to_string_lossy().into_owned();
+        let existing = self.storage.get_comic_by_path(&path)?;
+        let previous_metadata_id = existing.as_ref().and_then(|comic| comic.metadata_id);
+        let metadata_id = imported
+            .metadata
+            .as_ref()
+            .map(|metadata| self.storage.upsert_metadata(previous_metadata_id, metadata))
+            .transpose()?
+            .and_then(|metadata| metadata.id);
+        let comic = self.storage.upsert_comic(&ComicInput {
+            path,
+            hash: imported.content_hash.clone(),
+            page_count: imported.page_count,
+            metadata_id,
+        })?;
+        if let Some(previous_metadata_id) = previous_metadata_id
+            && Some(previous_metadata_id) != metadata_id
+        {
+            self.storage
+                .delete_metadata_if_unreferenced(previous_metadata_id)?;
+        }
+        Ok(comic)
+    }
+
     pub fn library_grid_items(&self) -> Result<Vec<LibraryGridItem>, LibraryError> {
         Ok(self
             .storage
@@ -150,6 +182,25 @@ impl LibraryService {
         self.storage.get_progress(comic_id)
     }
 
+    pub fn list_bookmarks(&self, comic_id: i64) -> Result<Vec<Bookmark>, LibraryError> {
+        self.storage.list_bookmarks(comic_id)
+    }
+
+    pub fn is_bookmarked(&self, comic_id: i64, page_index: u32) -> Result<bool, LibraryError> {
+        self.storage.is_bookmarked(comic_id, page_index)
+    }
+
+    /// Toggles the bookmark for a page, returning the resulting bookmarked state.
+    pub fn toggle_bookmark(&self, comic_id: i64, page_index: u32) -> Result<bool, LibraryError> {
+        if self.storage.is_bookmarked(comic_id, page_index)? {
+            self.storage.remove_bookmark(comic_id, page_index)?;
+            Ok(false)
+        } else {
+            self.storage.add_bookmark(comic_id, page_index)?;
+            Ok(true)
+        }
+    }
+
     pub fn last_read_comic(&self) -> Result<Option<(Comic, Progress)>, LibraryError> {
         let mut candidates = self
             .list_comics()?
@@ -164,6 +215,20 @@ impl LibraryService {
             .collect::<Vec<_>>();
         candidates.sort_by_key(|(_, progress)| progress.updated_at);
         Ok(candidates.pop())
+    }
+
+    /// Removes a comic from the library. The comic row and its progress are
+    /// deleted; an orphaned metadata row is cleaned up. Returns the removed
+    /// comic so the caller can delete the managed copy on disk, or None if the
+    /// comic was already gone.
+    pub fn remove_comic(&self, comic_id: i64) -> Result<Option<Comic>, LibraryError> {
+        let Some(comic) = self.storage.delete_comic(comic_id)? else {
+            return Ok(None);
+        };
+        if let Some(metadata_id) = comic.metadata_id {
+            self.storage.delete_metadata_if_unreferenced(metadata_id)?;
+        }
+        Ok(Some(comic))
     }
 
     pub fn purge_unavailable_comics(&self) -> Result<usize, LibraryError> {

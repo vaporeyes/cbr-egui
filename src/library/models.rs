@@ -32,6 +32,13 @@ pub struct Progress {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bookmark {
+    pub comic_id: i64,
+    pub page_index: u32,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ComicMetadata {
     pub id: Option<i64>,

@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::errors::LibraryError;
 use super::models::{
-    Comic, ComicAvailability, ComicInput, ComicMetadata, ComicMetadataDisplay, Folder,
+    Bookmark, Comic, ComicAvailability, ComicInput, ComicMetadata, ComicMetadataDisplay, Folder,
     LibraryComicRow, Progress,
 };
 
@@ -57,6 +57,14 @@ impl LibraryStorage {
                 current_page INTEGER NOT NULL,
                 is_read INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(comic_id) REFERENCES comics(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS bookmarks (
+                comic_id INTEGER NOT NULL,
+                page_index INTEGER NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (comic_id, page_index),
                 FOREIGN KEY(comic_id) REFERENCES comics(id) ON DELETE CASCADE
             );
             ",
@@ -341,6 +349,52 @@ impl LibraryStorage {
         i64_to_u32("progress_count", count)
     }
 
+    pub fn add_bookmark(&self, comic_id: i64, page_index: u32) -> Result<(), LibraryError> {
+        self.connection.execute(
+            "INSERT INTO bookmarks (comic_id, page_index, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(comic_id, page_index) DO NOTHING",
+            params![comic_id, page_index, current_unix_timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_bookmark(&self, comic_id: i64, page_index: u32) -> Result<(), LibraryError> {
+        self.connection.execute(
+            "DELETE FROM bookmarks WHERE comic_id = ?1 AND page_index = ?2",
+            params![comic_id, page_index],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_bookmarked(&self, comic_id: i64, page_index: u32) -> Result<bool, LibraryError> {
+        let exists = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bookmarks WHERE comic_id = ?1 AND page_index = ?2)",
+            params![comic_id, page_index],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(exists)
+    }
+
+    pub fn list_bookmarks(&self, comic_id: i64) -> Result<Vec<Bookmark>, LibraryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT comic_id, page_index, created_at FROM bookmarks
+             WHERE comic_id = ?1 ORDER BY page_index",
+        )?;
+        let bookmarks = statement
+            .query_map([comic_id], bookmark_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(bookmarks)
+    }
+
+    pub fn delete_comic(&self, comic_id: i64) -> Result<Option<Comic>, LibraryError> {
+        let Some(comic) = self.get_comic(comic_id)? else {
+            return Ok(None);
+        };
+        self.connection
+            .execute("DELETE FROM comics WHERE id = ?1", [comic_id])?;
+        Ok(Some(comic))
+    }
+
     pub fn purge_unavailable_comics(&self) -> Result<usize, LibraryError> {
         let deleted = self
             .connection
@@ -396,6 +450,14 @@ fn comic_select_sql(suffix: &str) -> String {
     format!(
         "SELECT id, path, hash, page_count, metadata_id, availability, thumbnail_key FROM comics {suffix}"
     )
+}
+
+fn bookmark_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Bookmark> {
+    Ok(Bookmark {
+        comic_id: row.get(0)?,
+        page_index: row.get(1)?,
+        created_at: row.get(2)?,
+    })
 }
 
 fn progress_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Progress> {

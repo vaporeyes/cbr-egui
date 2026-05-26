@@ -1,9 +1,9 @@
 use cbr_egui::app::ui::{
     EguiComicReaderApp, dispatch_continuous_prefetch_for_session, dispatch_prefetch_for_session,
-    empty_library_text, load_reader_page, persist_scanned_comics_to_grid_items,
+    empty_library_text, load_reader_page, parse_goto_target, persist_scanned_comics_to_grid_items,
     read_archive_page_color_image, reconcile_prefetch_result, refresh_continuous_viewer_state,
-    refresh_continuous_viewer_state_with_restore, responsive_grid_columns,
-    scanned_comics_to_grid_items,
+    refresh_continuous_viewer_state_with_restore, resolve_navigation_target,
+    responsive_grid_columns, scanned_comics_to_grid_items,
 };
 use cbr_egui::app::{AppState, CachedPage, ComicReaderApp, LibraryViewMode, ReadingSession};
 use cbr_egui::config::AppConfig;
@@ -16,7 +16,8 @@ use cbr_egui::library::{
     LibraryGroupKind, LibraryService, ScannedComic, ThumbnailStatus,
 };
 use cbr_egui::viewer::{
-    ContinuousPageStatus, PageId, PageStatus, ReadingLayoutMode, Size2, VisiblePageWindow,
+    ContinuousPageStatus, PageId, PageNavigationCommand, PageStatus, ReadingLayoutMode, Size2,
+    VisiblePageWindow,
 };
 use eframe::egui;
 use image::{ImageBuffer, ImageFormat, Rgba};
@@ -67,6 +68,73 @@ fn series_item(comic_id: i64, title: &str, series: &str, path: &str) -> LibraryG
 }
 
 #[test]
+fn navigation_target_resolves_relative_and_absolute_commands() {
+    assert_eq!(
+        resolve_navigation_target(PageNavigationCommand::NextPage, 2, 10),
+        3
+    );
+    assert_eq!(
+        resolve_navigation_target(PageNavigationCommand::NextPage, 9, 10),
+        9
+    );
+    assert_eq!(
+        resolve_navigation_target(PageNavigationCommand::PreviousPage, 0, 10),
+        0
+    );
+    assert_eq!(
+        resolve_navigation_target(PageNavigationCommand::FirstPage, 5, 10),
+        0
+    );
+    assert_eq!(
+        resolve_navigation_target(PageNavigationCommand::LastPage, 5, 10),
+        9
+    );
+    assert_eq!(
+        resolve_navigation_target(PageNavigationCommand::GoToPage(4), 0, 10),
+        4
+    );
+    assert_eq!(
+        resolve_navigation_target(PageNavigationCommand::GoToPage(999), 0, 10),
+        9
+    );
+}
+
+#[test]
+fn goto_target_parses_one_based_input_with_clamping() {
+    assert_eq!(parse_goto_target("5", 10), Some(4));
+    assert_eq!(parse_goto_target(" 3 ", 10), Some(2));
+    assert_eq!(parse_goto_target("999", 10), Some(9));
+    assert_eq!(parse_goto_target("0", 10), None);
+    assert_eq!(parse_goto_target("abc", 10), None);
+    assert_eq!(parse_goto_target("", 10), None);
+    assert_eq!(parse_goto_target("5", 0), None);
+}
+
+#[test]
+fn selection_toggle_adds_and_removes_ids() {
+    let mut app: ComicReaderApp<&str> = ComicReaderApp::default();
+
+    app.library.toggle_selection(7);
+    assert!(app.library.is_selected(7));
+
+    app.library.toggle_selection(7);
+    assert!(!app.library.is_selected(7));
+}
+
+#[test]
+fn refresh_prunes_selection_for_removed_items() {
+    let mut app: ComicReaderApp<&str> = ComicReaderApp::default();
+    app.library.items = vec![grid_item(1, "A", "/library/a.cbz")];
+    app.library.toggle_selection(1);
+    app.library.toggle_selection(2);
+
+    app.library.refresh_filter_cache();
+
+    assert!(app.library.is_selected(1));
+    assert!(!app.library.is_selected(2));
+}
+
+#[test]
 fn responsive_grid_columns_never_drops_below_one() {
     assert_eq!(responsive_grid_columns(0.0, 190.0, 14.0), 1);
     assert_eq!(responsive_grid_columns(189.0, 190.0, 14.0), 1);
@@ -113,7 +181,7 @@ fn empty_library_has_visible_startup_message() {
     let (title, detail) = empty_library_text();
 
     assert_eq!(title, "No library loaded");
-    assert!(detail.contains("library root"));
+    assert!(detail.contains("library"));
 }
 
 #[test]

@@ -64,6 +64,26 @@ fn fill_mode_preserves_aspect_ratio_and_fills_viewport() {
 }
 
 #[test]
+fn fit_width_scales_to_viewport_width_allowing_vertical_overflow() {
+    let size = page_display_size(
+        Size2::new(500.0, 1000.0),
+        Size2::new(1000.0, 800.0),
+        ViewMode::FitWidth,
+    );
+    assert_size_close(size, Size2::new(1000.0, 2000.0));
+}
+
+#[test]
+fn fit_height_scales_to_viewport_height_allowing_horizontal_overflow() {
+    let size = page_display_size(
+        Size2::new(500.0, 1000.0),
+        Size2::new(1000.0, 800.0),
+        ViewMode::FitHeight,
+    );
+    assert_size_close(size, Size2::new(400.0, 800.0));
+}
+
+#[test]
 fn invalid_dimensions_return_zero_size() {
     let viewport = Size2::new(1000.0, 1000.0);
 
