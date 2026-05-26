@@ -503,6 +503,258 @@ fn render_reader_adjustments(
     }
 }
 
+const PAGE_SIDEBAR_THUMB_W: f32 = 110.0;
+const PAGE_SIDEBAR_THUMB_H: f32 = 150.0;
+const PAGE_SIDEBAR_ROW_HEIGHT: f32 = PAGE_SIDEBAR_THUMB_H + 26.0;
+const PAGE_SIDEBAR_THUMB_TARGET: [u32; 2] = [220, 300];
+const PAGE_SIDEBAR_MAX_SUBMITS_PER_FRAME: usize = 4;
+
+fn render_reader_page_sidebar(
+    ctx: &egui::Context,
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+    item: &LibraryGridItem,
+) {
+    let (show, page_count) = {
+        let Some(session) = &app.reading else {
+            return;
+        };
+        (session.show_page_sidebar, session.page_count)
+    };
+    if !show || page_count == 0 {
+        return;
+    }
+
+    let mut jump_to: Option<usize> = None;
+    let mut visible_pages: Vec<usize> = Vec::new();
+    let mut show_flag = show;
+
+    egui::SidePanel::left("reader_page_sidebar")
+        .resizable(true)
+        .default_width(PAGE_SIDEBAR_THUMB_W + 36.0)
+        .width_range(120.0..=260.0)
+        .frame(egui::Frame::new().inner_margin(egui::Margin::same(8)).fill(EDITOR_PANEL_DARK))
+        .show_animated(ctx, show_flag, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Pages").color(EDITOR_GREEN));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✕").on_hover_text("Hide page sidebar").clicked() {
+                        show_flag = false;
+                    }
+                });
+            });
+            ui.separator();
+
+            let current_page = app
+                .reading
+                .as_ref()
+                .map(|session| session.current_page_index)
+                .unwrap_or(0);
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show_rows(ui, PAGE_SIDEBAR_ROW_HEIGHT, page_count, |ui, row_range| {
+                    for page_index in row_range.clone() {
+                        visible_pages.push(page_index);
+                        if render_page_sidebar_row(
+                            ui,
+                            app,
+                            page_index,
+                            current_page,
+                        ) {
+                            jump_to = Some(page_index);
+                        }
+                    }
+                });
+        });
+
+    if let Some(session) = &mut app.reading {
+        session.show_page_sidebar = show_flag;
+    }
+
+    if let Some(page) = jump_to
+        && let Some(session) = &mut app.reading
+    {
+        session.viewer_state.pending_navigation =
+            Some(PageNavigationCommand::GoToPage(page));
+    }
+
+    schedule_page_sidebar_thumbnails(app, item, &visible_pages);
+}
+
+fn render_page_sidebar_row(
+    ui: &mut egui::Ui,
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+    page_index: usize,
+    current_page: usize,
+) -> bool {
+    let Some(session) = &app.reading else {
+        return false;
+    };
+    let thumbnail = session.page_thumbnails.get(&page_index).cloned();
+    let failed = session.failed_page_thumbnails.contains(&page_index);
+
+    let row_size = egui::vec2(ui.available_width(), PAGE_SIDEBAR_ROW_HEIGHT - 4.0);
+    let (rect, response) = ui.allocate_exact_size(row_size, egui::Sense::click());
+
+    let is_current = page_index == current_page;
+    let fill = if is_current {
+        EDITOR_PANEL_ACTIVE
+    } else if response.hovered() {
+        EDITOR_PANEL
+    } else {
+        EDITOR_PANEL_DARK
+    };
+    ui.painter().rect_filled(rect, 4.0, fill);
+    if is_current {
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(2.0, EDITOR_GREEN),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let thumb_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.top() + 6.0 + PAGE_SIDEBAR_THUMB_H / 2.0),
+        egui::vec2(PAGE_SIDEBAR_THUMB_W, PAGE_SIDEBAR_THUMB_H),
+    );
+    ui.painter().rect_filled(thumb_rect, 3.0, EDITOR_BACKGROUND);
+    ui.painter().rect_stroke(
+        thumb_rect,
+        3.0,
+        egui::Stroke::new(1.0, EDITOR_WIDGET_HOVER),
+        egui::StrokeKind::Inside,
+    );
+
+    if let Some(texture) = &thumbnail {
+        let fitted = fit_image_size(texture.size_vec2(), thumb_rect.size());
+        let image_rect = egui::Rect::from_center_size(thumb_rect.center(), fitted);
+        egui::Image::new((texture.id(), fitted)).paint_at(ui, image_rect);
+    } else {
+        let label = if failed { "Failed" } else { "Loading" };
+        ui.painter().text(
+            thumb_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::monospace(11.0),
+            EDITOR_TEXT_MUTED,
+        );
+    }
+
+    let label_color = if is_current { EDITOR_GREEN } else { EDITOR_TEXT };
+    ui.painter().text(
+        egui::pos2(rect.center().x, thumb_rect.bottom() + 6.0),
+        egui::Align2::CENTER_TOP,
+        format!("{}", page_index + 1),
+        egui::FontId::monospace(12.0),
+        label_color,
+    );
+
+    response.clicked()
+}
+
+fn schedule_page_sidebar_thumbnails(
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+    item: &LibraryGridItem,
+    visible_pages: &[usize],
+) {
+    let Some(session) = &mut app.reading else {
+        return;
+    };
+    if session.page_thumbnail_pool.is_none() {
+        return;
+    }
+
+    let mut submitted = 0usize;
+    for &page_index in visible_pages {
+        if submitted >= PAGE_SIDEBAR_MAX_SUBMITS_PER_FRAME {
+            break;
+        }
+        if session.page_thumbnails.contains_key(&page_index)
+            || session.pending_page_thumbnails.contains(&page_index)
+            || session.failed_page_thumbnails.contains(&page_index)
+        {
+            continue;
+        }
+
+        let bytes = match read_session_page_bytes(
+            session,
+            Path::new(&item.path),
+            page_index,
+        ) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                session.failed_page_thumbnails.insert(page_index);
+                continue;
+            }
+        };
+
+        let request = DecodeRequest {
+            request_id: DecodeRequestId(page_index as u64),
+            page_index,
+            bytes,
+            purpose: DecodePurpose::Thumbnail,
+            target_size: Some(PAGE_SIDEBAR_THUMB_TARGET),
+            rotation: session.rotation,
+            adjustments: ImageAdjustments::default(),
+            cancellation_token: None,
+        };
+
+        let Some(pool) = &session.page_thumbnail_pool else {
+            break;
+        };
+        match pool.submit(request) {
+            Ok(()) => {
+                session.pending_page_thumbnails.insert(page_index);
+                submitted += 1;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn poll_page_thumbnail_results(
+    ctx: &egui::Context,
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+) {
+    let Some(session) = &mut app.reading else {
+        return;
+    };
+    let Some(pool) = &session.page_thumbnail_pool else {
+        return;
+    };
+
+    let mut results = Vec::new();
+    while let Some(result) = pool.try_recv() {
+        results.push(result);
+    }
+    if results.is_empty() {
+        return;
+    }
+
+    for result in results {
+        if result.purpose != DecodePurpose::Thumbnail {
+            continue;
+        }
+        session.pending_page_thumbnails.remove(&result.page_index);
+        match result.outcome {
+            Ok(color_image) => {
+                let texture = ctx.load_texture(
+                    format!("page_thumb:{}:{}", session.comic_id, result.page_index),
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                );
+                session.page_thumbnails.insert(result.page_index, texture);
+                session.failed_page_thumbnails.remove(&result.page_index);
+            }
+            Err(_) => {
+                session.failed_page_thumbnails.insert(result.page_index);
+            }
+        }
+    }
+    ctx.request_repaint();
+}
+
 fn rotate_reader(
     ctx: &egui::Context,
     app: &mut ComicReaderApp<egui::TextureHandle>,
@@ -1183,6 +1435,8 @@ pub fn route_app_update(
             render_reader_nav_bar(ctx, app);
             render_about_window(ctx, &mut library_controls.about_open);
             if let Some(item) = active_library_item(app) {
+                poll_page_thumbnail_results(ctx, app);
+                render_reader_page_sidebar(ctx, app, &item);
                 process_reader_view_command(ctx, app, &item);
             }
             if let Some(session) = &mut app.reading {
@@ -1322,6 +1576,8 @@ fn render_reader_menu_bar(
                         session.viewer_state.pending_view_command =
                             Some(ViewCommand::OneToOne);
                     }
+                    ui.separator();
+                    ui.checkbox(&mut session.show_page_sidebar, "Page sidebar");
                     ui.separator();
                     ui.label(egui::RichText::new("Layout").color(EDITOR_TEXT_MUTED));
                     let mut continuous_enabled = session.viewer_state.layout_mode

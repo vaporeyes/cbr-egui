@@ -19,6 +19,7 @@ pub struct DecodeRequestId(pub u64);
 pub enum DecodePurpose {
     Direct,
     Prefetch,
+    Thumbnail,
 }
 
 /// Clockwise page rotation applied during decode, so cached textures and layout

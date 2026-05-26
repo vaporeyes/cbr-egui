@@ -332,6 +332,11 @@ pub struct ReadingSession<T> {
     pub rotation: Rotation,
     pub adjustments: ImageAdjustments,
     pub show_adjustments: bool,
+    pub show_page_sidebar: bool,
+    pub page_thumbnails: HashMap<usize, T>,
+    pub pending_page_thumbnails: HashSet<usize>,
+    pub failed_page_thumbnails: HashSet<usize>,
+    pub page_thumbnail_pool: Option<WorkerPool>,
 }
 
 impl<T> ReadingSession<T> {
@@ -353,7 +358,18 @@ impl<T> ReadingSession<T> {
             rotation: Rotation::None,
             adjustments: ImageAdjustments::default(),
             show_adjustments: false,
+            show_page_sidebar: true,
+            page_thumbnails: HashMap::new(),
+            pending_page_thumbnails: HashSet::new(),
+            failed_page_thumbnails: HashSet::new(),
+            page_thumbnail_pool: WorkerPool::start(1, 64).ok(),
         }
+    }
+
+    pub fn invalidate_page_thumbnails(&mut self) {
+        self.page_thumbnails.clear();
+        self.pending_page_thumbnails.clear();
+        self.failed_page_thumbnails.clear();
     }
 
     pub fn try_new(
@@ -378,6 +394,11 @@ impl<T> ReadingSession<T> {
             rotation: Rotation::None,
             adjustments: ImageAdjustments::default(),
             show_adjustments: false,
+            show_page_sidebar: true,
+            page_thumbnails: HashMap::new(),
+            pending_page_thumbnails: HashSet::new(),
+            failed_page_thumbnails: HashSet::new(),
+            page_thumbnail_pool: WorkerPool::start(1, 64).ok(),
         })
     }
 
@@ -406,6 +427,7 @@ impl<T> ReadingSession<T> {
         self.continuous_scroll.reset();
         self.viewer_state.next_page_status = PageStatus::Empty;
         self.viewer_state.zoom_pan = ZoomPanState::default();
+        self.invalidate_page_thumbnails();
     }
 
     /// Invalidates decoded textures so pages re-decode with the current image
