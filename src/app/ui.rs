@@ -1965,9 +1965,13 @@ fn render_library_shelf(
                 for item in &visible {
                     let is_selected = app.library.selected_ids.contains(&item.comic_id)
                         || app.library.selected_comic_id == Some(item.comic_id);
-                    let response = ui
-                        .selectable_label(is_selected, &item.title)
-                        .on_hover_text(&item.path);
+                    let response = ui.selectable_label(is_selected, &item.title);
+                    response.context_menu(|ui| {
+                        if ui.button("Open file location").clicked() {
+                            ui.close_menu();
+                            open_file_location(&item.path);
+                        }
+                    });
                     if response.clicked() {
                         clicked = Some(item.clone());
                     }
@@ -2148,6 +2152,12 @@ fn library_tile(
                     .small(),
             );
         }
+        response.context_menu(|ui| {
+            if ui.button("Open file location").clicked() {
+                ui.close_menu();
+                open_file_location(&item.path);
+            }
+        });
         response
     })
     .inner
@@ -2169,7 +2179,7 @@ fn library_list_row(
     is_selected: bool,
     thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
 ) -> egui::Response {
-    let row_height = LIST_THUMBNAIL_HEIGHT + 18.0;
+    let row_height = LIST_THUMBNAIL_HEIGHT + 8.0;
     let available_width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(available_width, row_height),
@@ -2204,7 +2214,6 @@ fn library_list_row(
     let title_pos = egui::pos2(text_x, rect.top() + 12.0);
     let subtitle_pos = egui::pos2(text_x, rect.top() + 33.0);
     let meta_pos = egui::pos2(text_x, rect.top() + 53.0);
-    let path_pos = egui::pos2(text_x, rect.top() + 72.0);
     let text_clip = egui::Rect::from_min_max(
         egui::pos2(text_x, rect.top()),
         egui::pos2(rect.right() - 8.0, rect.bottom()),
@@ -2237,13 +2246,13 @@ fn library_list_row(
         egui::FontId::monospace(12.0),
         EDITOR_CYAN,
     );
-    painter.text(
-        path_pos,
-        egui::Align2::LEFT_TOP,
-        ellipsize_text(&item.path, 110),
-        egui::FontId::monospace(12.0),
-        EDITOR_TEXT_MUTED,
-    );
+
+    response.context_menu(|ui| {
+        if ui.button("Open file location").clicked() {
+            ui.close_menu();
+            open_file_location(&item.path);
+        }
+    });
 
     response
 }
@@ -2361,6 +2370,27 @@ fn editor_dark_visuals() -> egui::Visuals {
     visuals.collapsing_header_frame = true;
     visuals.striped = false;
     visuals
+}
+
+fn open_file_location(path: &str) {
+    let path = Path::new(path);
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let arg = format!("/select,{}", path.display());
+        let _ = std::process::Command::new("explorer").arg(arg).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let target = path.parent().unwrap_or(path);
+        let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+    }
 }
 
 fn render_empty_library(ui: &mut egui::Ui) {
