@@ -340,6 +340,16 @@ impl LibraryStorage {
             .map_err(Into::into)
     }
 
+    pub fn list_read_comic_ids(&self) -> Result<std::collections::HashSet<i64>, LibraryError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT comic_id FROM progress WHERE is_read = 1")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+        Ok(ids)
+    }
+
     pub fn progress_count_for_comic(&self, comic_id: i64) -> Result<u32, LibraryError> {
         let count = self.connection.query_row(
             "SELECT COUNT(*) FROM progress WHERE comic_id = ?1",

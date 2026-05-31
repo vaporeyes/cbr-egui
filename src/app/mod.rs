@@ -511,6 +511,47 @@ impl<T> ComicReaderApp<T> {
         true
     }
 
+    /// Opens a comic and restores the saved reading position, if any.
+    pub fn open_grid_item_resuming(
+        &mut self,
+        service: &LibraryService,
+        item: &LibraryGridItem,
+    ) -> bool {
+        if !self.open_grid_item(item) {
+            return false;
+        }
+        if let Ok(Some(progress)) = service.get_progress(item.comic_id) {
+            let last_index = item.page_count.saturating_sub(1) as usize;
+            let target = (progress.current_page as usize).min(last_index);
+            if let Some(reading) = &mut self.reading {
+                reading.set_current_page(target);
+            }
+        }
+        true
+    }
+
+    pub fn set_comic_read(
+        &mut self,
+        service: &LibraryService,
+        comic_id: i64,
+        is_read: bool,
+    ) -> Result<(), LibraryError> {
+        let current_page = service
+            .get_progress(comic_id)?
+            .map(|progress| progress.current_page)
+            .unwrap_or(0);
+        service.save_progress(comic_id, current_page, is_read)?;
+        if let Some(item) = self
+            .library
+            .items
+            .iter_mut()
+            .find(|item| item.comic_id == comic_id)
+        {
+            item.is_read = is_read;
+        }
+        Ok(())
+    }
+
     pub fn return_to_library(&mut self) {
         if let Some(reading) = &mut self.reading {
             reading.prefetch.cancel_all();

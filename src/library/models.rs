@@ -145,6 +145,7 @@ pub struct LibraryGridItem {
     pub series_key: Option<String>,
     pub folder_label: Option<String>,
     pub folder_key: Option<String>,
+    pub is_read: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -50,6 +50,7 @@ fn grid_item(comic_id: i64, title: &str, path: &str) -> LibraryGridItem {
         folder_key: std::path::Path::new(path)
             .parent()
             .map(|parent| parent.to_string_lossy().into_owned()),
+        is_read: false,
     }
 }
 
@@ -510,6 +511,50 @@ fn app_can_resume_last_read_session_from_library_service() {
     assert!(app.resume_last_session(&service).expect("resume"));
     assert_eq!(app.state, AppState::Reading(comic.id));
     assert_eq!(app.reading.expect("reading").current_page_index, 5);
+}
+
+#[test]
+fn reopening_grid_item_restores_saved_page() {
+    let dir = tempfile::tempdir().expect("dir");
+    let service = LibraryService::initialize(&dir.path().join("library.sqlite")).expect("service");
+    let items = persist_scanned_comics_to_grid_items(
+        &service,
+        &[ScannedComic {
+            path: "/library/My Book.cbz".to_owned(),
+            fingerprint: "fingerprint".to_owned(),
+            page_count: 24,
+            metadata: None,
+        }],
+    )
+    .expect("persisted items");
+    let item = items.first().expect("item").clone();
+    service.save_progress(item.comic_id, 7, false).expect("progress");
+
+    let mut app: ComicReaderApp<&str> = ComicReaderApp::default();
+    assert!(app.open_grid_item_resuming(&service, &item));
+    assert_eq!(app.reading.expect("reading").current_page_index, 7);
+}
+
+#[test]
+fn reopening_grid_item_clamps_saved_page_to_last_page() {
+    let dir = tempfile::tempdir().expect("dir");
+    let service = LibraryService::initialize(&dir.path().join("library.sqlite")).expect("service");
+    let items = persist_scanned_comics_to_grid_items(
+        &service,
+        &[ScannedComic {
+            path: "/library/Short.cbz".to_owned(),
+            fingerprint: "fingerprint".to_owned(),
+            page_count: 5,
+            metadata: None,
+        }],
+    )
+    .expect("persisted items");
+    let item = items.first().expect("item").clone();
+    service.save_progress(item.comic_id, 99, true).expect("progress");
+
+    let mut app: ComicReaderApp<&str> = ComicReaderApp::default();
+    assert!(app.open_grid_item_resuming(&service, &item));
+    assert_eq!(app.reading.expect("reading").current_page_index, 4);
 }
 
 #[test]

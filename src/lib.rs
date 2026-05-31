@@ -3,5 +3,7 @@ pub mod cache;
 pub mod config;
 pub mod decode;
 pub mod library;
+pub mod mac_activation;
+pub mod mac_bundle;
 pub mod vfs;
 pub mod viewer;
