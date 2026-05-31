@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, bounded};
 use eframe::egui;
+use egui_phosphor::regular as icon;
 
 use crate::app::{
     AppState, CachedPage, ComicReaderApp, LibraryViewMode, ProgressSnapshot, ReadingSession,
@@ -64,6 +65,44 @@ fn editor_toolbar_frame() -> egui::Frame {
 
 fn editor_card_stroke() -> egui::Stroke {
     egui::Stroke::new(1.0, EDITOR_GREEN)
+}
+
+const TOOLBAR_ICON_SIZE: f32 = 17.0;
+
+/// Merges the Phosphor icon font into the egui context. Phosphor attaches to the
+/// Proportional family, so icon glyphs must be rendered with a proportional FontId
+/// (our default text style is monospace). Call once at startup.
+pub fn install_icon_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
+}
+
+fn icon_text(glyph: &str) -> egui::RichText {
+    egui::RichText::new(glyph).font(egui::FontId::proportional(TOOLBAR_ICON_SIZE))
+}
+
+/// A compact icon-only toolbar button with a hover tooltip.
+fn icon_button(ui: &mut egui::Ui, glyph: &str, tooltip: &str) -> egui::Response {
+    ui.add(egui::Button::new(icon_text(glyph)))
+        .on_hover_text(tooltip)
+}
+
+/// An icon button that is disabled when `enabled` is false.
+fn icon_button_enabled(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    glyph: &str,
+    tooltip: &str,
+) -> egui::Response {
+    ui.add_enabled(enabled, egui::Button::new(icon_text(glyph)))
+        .on_hover_text(tooltip)
+}
+
+/// An icon button that renders in a pressed/active state when `active` is true.
+fn icon_toggle(ui: &mut egui::Ui, active: bool, glyph: &str, tooltip: &str) -> egui::Response {
+    ui.add(egui::Button::new(icon_text(glyph)).selected(active))
+        .on_hover_text(tooltip)
 }
 
 pub fn responsive_grid_columns(available_width: f32, tile_width: f32, gap: f32) -> usize {
@@ -1417,13 +1456,15 @@ pub fn route_app_update(
     match app.state {
         AppState::Library => {
             render_library_menu_bar(ctx, app, library_controls, settings, library_service);
+            render_library_toolbar(ctx, app, library_controls);
             let shelf_event = render_library_shelf(ctx, app, library_controls);
             handle_library_item_event(ctx, app, library_service, shelf_event);
             render_about_window(ctx, &mut library_controls.about_open);
+            render_shortcuts_window(ctx, &mut library_controls.shortcuts_open);
             egui::CentralPanel::default()
                 .frame(editor_panel_frame())
                 .show(ctx, |ui| {
-                    render_library_status_and_filter(ui, app);
+                    render_library_status(ui, app);
                     ui.add_space(10.0);
                     let selected = match app.library.view_mode {
                         LibraryViewMode::Thumbnails => render_library_grid::<egui::TextureHandle>(
@@ -1445,6 +1486,10 @@ pub fn route_app_update(
                 });
         }
         AppState::Reading(_) => {
+            if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                app.return_to_library();
+                return;
+            }
             ensure_bookmarks_loaded(app, library_service);
             if let Some(item) = active_library_item(app) {
                 ensure_reader_page_loaded(ctx, app, &item);
@@ -1461,6 +1506,7 @@ pub fn route_app_update(
             render_reader_menu_bar(ctx, app, library_controls, settings);
             render_reader_nav_bar(ctx, app);
             render_about_window(ctx, &mut library_controls.about_open);
+            render_shortcuts_window(ctx, &mut library_controls.shortcuts_open);
             if let Some(item) = active_library_item(app) {
                 poll_page_thumbnail_results(ctx, app);
                 render_reader_page_sidebar(ctx, app, &item);
@@ -1637,6 +1683,10 @@ fn render_reader_menu_bar(
                 });
 
                 ui.menu_button("Help", |ui| {
+                    if ui.button("Keyboard Shortcuts").clicked() {
+                        ui.close_menu();
+                        controls.shortcuts_open = true;
+                    }
                     if ui.button("About").clicked() {
                         ui.close_menu();
                         controls.about_open = true;
@@ -1668,60 +1718,47 @@ fn render_reader_nav_controls(
         return;
     }
 
-    ui.spacing_mut().item_spacing.x = 6.0;
-    let back_clicked = ui
-        .button("← Library")
-        .on_hover_text("Return to library")
-        .clicked();
-    ui.separator();
-    if back_clicked {
+    ui.spacing_mut().item_spacing.x = 4.0;
+
+    if icon_button(ui, icon::ARROW_ARC_LEFT, "Return to library (Esc)").clicked() {
         app.return_to_library();
         return;
     }
+    ui.separator();
+
     let Some(session) = &mut app.reading else {
         return;
     };
+    let is_first = session.current_page_index == 0;
+    let is_last = session.current_page_index + 1 >= session.page_count;
+
+    // Page navigation.
+    if icon_button_enabled(ui, !is_first, icon::CARET_DOUBLE_LEFT, "First page (Home)").clicked() {
+        session.viewer_state.pending_navigation = Some(PageNavigationCommand::FirstPage);
+    }
+    if icon_button_enabled(ui, !is_first, icon::CARET_LEFT, "Previous page (Left)").clicked() {
+        session.viewer_state.pending_navigation = Some(PageNavigationCommand::PreviousPage);
+    }
+    if icon_button_enabled(ui, !is_last, icon::CARET_RIGHT, "Next page (Right)").clicked() {
+        session.viewer_state.pending_navigation = Some(PageNavigationCommand::NextPage);
+    }
+    if icon_button_enabled(ui, !is_last, icon::CARET_DOUBLE_RIGHT, "Last page (End)").clicked() {
+        session.viewer_state.pending_navigation = Some(PageNavigationCommand::LastPage);
+    }
+
+    // Page counter and go-to field.
     ui.label(format!(
         "{} / {}",
         session.current_page_index.saturating_add(1),
         session.page_count
     ));
-    ui.separator();
-    let is_first = session.current_page_index == 0;
-    let is_last = session.current_page_index + 1 >= session.page_count;
-    if ui
-        .add_enabled(!is_first, egui::Button::new("|<").small())
-        .on_hover_text("First page (Home)")
-        .clicked()
-    {
-        session.viewer_state.pending_navigation = Some(PageNavigationCommand::FirstPage);
-    }
-    if ui
-        .add_enabled(!is_first, egui::Button::new("Prev").small())
-        .clicked()
-    {
-        session.viewer_state.pending_navigation = Some(PageNavigationCommand::PreviousPage);
-    }
-    if ui
-        .add_enabled(!is_last, egui::Button::new("Next").small())
-        .clicked()
-    {
-        session.viewer_state.pending_navigation = Some(PageNavigationCommand::NextPage);
-    }
-    if ui
-        .add_enabled(!is_last, egui::Button::new(">|").small())
-        .on_hover_text("Last page (End)")
-        .clicked()
-    {
-        session.viewer_state.pending_navigation = Some(PageNavigationCommand::LastPage);
-    }
     let goto_response = ui.add(
         egui::TextEdit::singleline(&mut session.goto_input)
-            .desired_width(46.0)
-            .hint_text("page"),
+            .desired_width(40.0)
+            .hint_text("#"),
     );
-    let go_submitted = ui.button("Go").clicked()
-        || (goto_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+    let go_submitted = goto_response.lost_focus()
+        && ui.input(|input| input.key_pressed(egui::Key::Enter));
     if go_submitted {
         if let Some(target) = parse_goto_target(&session.goto_input, session.page_count) {
             session.viewer_state.pending_navigation = Some(PageNavigationCommand::GoToPage(target));
@@ -1729,25 +1766,33 @@ fn render_reader_nav_controls(
         session.goto_input.clear();
     }
     ui.separator();
-    let current_page = session.current_page_index;
-    let bookmarked = session.bookmarks.contains(&current_page);
-    let star = if bookmarked { "★" } else { "☆" };
-    if ui
-        .add(egui::Button::new(star).small())
-        .on_hover_text("Toggle bookmark (B)")
+
+    // Zoom presets and steppers.
+    let view_mode = session.viewer_state.view_mode;
+    if icon_toggle(ui, view_mode == ViewMode::Fit, icon::ARROWS_OUT, "Fit to window (F)").clicked() {
+        session.viewer_state.pending_view_command = Some(ViewCommand::Fit);
+    }
+    if icon_toggle(ui, view_mode == ViewMode::FitWidth, icon::ARROWS_HORIZONTAL, "Fit width (W)")
         .clicked()
     {
-        session.viewer_state.pending_bookmark_toggle = true;
+        session.viewer_state.pending_view_command = Some(ViewCommand::FitWidth);
     }
-    ui.separator();
-    if ui.button("-").clicked() {
+    if icon_toggle(ui, view_mode == ViewMode::FitHeight, icon::ARROWS_VERTICAL, "Fit height (H)")
+        .clicked()
+    {
+        session.viewer_state.pending_view_command = Some(ViewCommand::FitHeight);
+    }
+    if icon_button(ui, icon::CORNERS_OUT, "Actual size 1:1 (1)").clicked() {
+        session.viewer_state.pending_view_command = Some(ViewCommand::OneToOne);
+    }
+    if icon_button(ui, icon::MAGNIFYING_GLASS_MINUS, "Zoom out (-)").clicked() {
         session.viewer_state.pending_view_command = Some(ViewCommand::ZoomOut);
     }
     let current_zoom = session.viewer_state.zoom_pan.zoom;
     let min_zoom = session.viewer_state.zoom_pan.min_zoom;
     let max_zoom = session.viewer_state.zoom_pan.max_zoom;
     let mut slider_zoom = current_zoom;
-    ui.spacing_mut().slider_width = 90.0;
+    ui.spacing_mut().slider_width = 80.0;
     if ui
         .add(egui::Slider::new(&mut slider_zoom, min_zoom..=max_zoom).show_value(false))
         .changed()
@@ -1759,12 +1804,42 @@ fn render_reader_nav_controls(
             .zoom_pan
             .apply_zoom_factor(slider_zoom / current_zoom, ZoomAnchor::CENTER);
     }
-    ui.label(format!(
-        "{:.0}%",
-        session.viewer_state.zoom_pan.zoom * 100.0
-    ));
-    if ui.button("+").clicked() {
+    if icon_button(ui, icon::MAGNIFYING_GLASS_PLUS, "Zoom in (+)").clicked() {
         session.viewer_state.pending_view_command = Some(ViewCommand::ZoomIn);
+    }
+    ui.label(format!("{:.0}%", session.viewer_state.zoom_pan.zoom * 100.0));
+    ui.separator();
+
+    // Layout toggles.
+    let continuous = session.viewer_state.layout_mode == ReadingLayoutMode::ContinuousVertical;
+    if icon_toggle(ui, continuous, icon::SCROLL, "Continuous scroll (V)").clicked() {
+        session.viewer_state.pending_view_command = Some(ViewCommand::ToggleContinuous);
+    }
+    let spread_allowed = !continuous;
+    let spread_active = session.spread_mode_enabled && spread_allowed;
+    if ui
+        .add_enabled(
+            spread_allowed,
+            egui::Button::new(icon_text(icon::BOOK_OPEN)).selected(spread_active),
+        )
+        .on_hover_text("Two-page spread (S)")
+        .clicked()
+    {
+        session.viewer_state.pending_view_command = Some(ViewCommand::ToggleSpread);
+    }
+    if icon_button(ui, icon::ARROW_COUNTER_CLOCKWISE, "Rotate left (Shift+R)").clicked() {
+        session.viewer_state.pending_view_command = Some(ViewCommand::RotateLeft);
+    }
+    if icon_button(ui, icon::ARROW_CLOCKWISE, "Rotate right (R)").clicked() {
+        session.viewer_state.pending_view_command = Some(ViewCommand::RotateRight);
+    }
+    ui.separator();
+
+    // Bookmark (highlighted when the current page is bookmarked).
+    let bookmarked = session.bookmarks.contains(&session.current_page_index);
+    let bookmark_glyph = if bookmarked { icon::BOOKMARK } else { icon::BOOKMARK_SIMPLE };
+    if icon_toggle(ui, bookmarked, bookmark_glyph, "Toggle bookmark (B)").clicked() {
+        session.viewer_state.pending_bookmark_toggle = true;
     }
 }
 
@@ -1777,6 +1852,7 @@ pub struct LibraryRootControls {
     thumbnail_cache_root: PathBuf,
     pub shelf_open: bool,
     pub about_open: bool,
+    pub shortcuts_open: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1796,6 +1872,7 @@ impl LibraryRootControls {
             thumbnail_cache_root: default_thumbnail_cache_root(),
             shelf_open: false,
             about_open: false,
+            shortcuts_open: false,
         }
     }
 
@@ -2158,27 +2235,8 @@ fn render_library_menu_bar(
                 });
 
                 ui.menu_button("Tools", |ui| {
-                    ui.label(egui::RichText::new("View").color(EDITOR_TEXT_MUTED));
-                    ui.selectable_value(
-                        &mut app.library.view_mode,
-                        LibraryViewMode::Thumbnails,
-                        "Thumbnails",
-                    );
-                    ui.selectable_value(
-                        &mut app.library.view_mode,
-                        LibraryViewMode::List,
-                        "List",
-                    );
-                    ui.separator();
-                    let mut select_mode = app.library.select_mode;
-                    if ui.checkbox(&mut select_mode, "Select mode").changed() {
-                        app.library.select_mode = select_mode;
-                        if !select_mode {
-                            app.library.selected_ids.clear();
-                        }
-                    }
-                    ui.checkbox(&mut controls.shelf_open, "Show shelf");
-                    ui.separator();
+                    // View, Shelf, and Select toggles live on the library toolbar;
+                    // the menu keeps only actions that have no toolbar equivalent.
                     let has_unavailable = app
                         .library
                         .items
@@ -2199,6 +2257,10 @@ fn render_library_menu_bar(
                 });
 
                 ui.menu_button("Help", |ui| {
+                    if ui.button("Keyboard Shortcuts").clicked() {
+                        ui.close_menu();
+                        controls.shortcuts_open = true;
+                    }
                     if ui.button("About").clicked() {
                         ui.close_menu();
                         controls.about_open = true;
@@ -2291,11 +2353,10 @@ fn render_library_shelf(
     event
 }
 
-fn render_library_status_and_filter(
+fn render_library_status(
     ui: &mut egui::Ui,
     app: &mut ComicReaderApp<egui::TextureHandle>,
 ) {
-    render_library_filter_controls(ui, app);
     if let Some(status_text) = &app.library.status_text {
         ui.label(egui::RichText::new(status_text).color(EDITOR_TEXT_MUTED));
     }
@@ -2319,6 +2380,139 @@ fn render_about_window(ctx: &egui::Context, open: &mut bool) {
         });
 }
 
+/// Reader keyboard shortcuts grouped for the Help reference window. Keep in sync
+/// with `handle_keybindings` in src/viewer/ui.rs and the README.
+const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Navigation",
+        &[
+            ("\u{2192}  /  Page Down", "Next page"),
+            ("\u{2190}  /  Page Up", "Previous page"),
+            ("Space  /  \u{2193}", "Scroll down"),
+            ("\u{2191}", "Scroll up"),
+            ("Home", "First page"),
+            ("End", "Last page"),
+            ("Esc", "Back to library"),
+        ],
+    ),
+    (
+        "View and zoom",
+        &[
+            ("F", "Fit to window"),
+            ("Shift + F", "Fill window"),
+            ("W", "Fit width"),
+            ("H", "Fit height"),
+            ("1", "Actual size (1:1)"),
+            ("+  /  =", "Zoom in"),
+            ("-", "Zoom out"),
+            ("S", "Toggle two-page spread"),
+            ("V", "Toggle continuous scroll"),
+            ("R", "Rotate right"),
+            ("Shift + R", "Rotate left"),
+        ],
+    ),
+    ("Bookmarks", &[("B", "Toggle bookmark on current page")]),
+];
+
+fn render_shortcuts_window(ctx: &egui::Context, open: &mut bool) {
+    if !*open {
+        return;
+    }
+    egui::Window::new("Keyboard Shortcuts")
+        .open(open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new("Shortcuts apply while reading a comic.")
+                    .color(EDITOR_TEXT_MUTED),
+            );
+            ui.add_space(8.0);
+            for (group, entries) in SHORTCUT_GROUPS {
+                ui.label(egui::RichText::new(*group).color(EDITOR_GREEN).strong());
+                egui::Grid::new(format!("shortcut_grid_{group}"))
+                    .num_columns(2)
+                    .spacing(egui::vec2(18.0, 4.0))
+                    .show(ui, |ui| {
+                        for (keys, action) in *entries {
+                            ui.label(egui::RichText::new(*keys).monospace().color(EDITOR_CYAN));
+                            ui.label(*action);
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(8.0);
+            }
+        });
+}
+
+fn render_library_toolbar(
+    ctx: &egui::Context,
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+    controls: &mut LibraryRootControls,
+) {
+    egui::TopBottomPanel::top("library_toolbar")
+        .frame(editor_toolbar_frame())
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let importing = controls.is_importing();
+                if icon_button_enabled(ui, !importing, icon::FILE_PLUS, "Add comic files\u{2026}")
+                    .clicked()
+                    && let Some(files) = rfd::FileDialog::new()
+                        .add_filter("Comics", &["cbz", "cbr", "pdf"])
+                        .set_directory(".")
+                        .pick_files()
+                {
+                    controls.start_import_files(files);
+                }
+                if icon_button_enabled(ui, !importing, icon::FOLDER_PLUS, "Add a folder\u{2026}")
+                    .clicked()
+                    && let Some(folder) = rfd::FileDialog::new().set_directory(".").pick_folder()
+                {
+                    controls.start_import_folder(folder);
+                }
+
+                ui.separator();
+                let is_thumbnails = app.library.view_mode == LibraryViewMode::Thumbnails;
+                if icon_toggle(ui, is_thumbnails, icon::SQUARES_FOUR, "Thumbnail view").clicked() {
+                    app.library.view_mode = LibraryViewMode::Thumbnails;
+                }
+                if icon_toggle(ui, !is_thumbnails, icon::LIST, "List view").clicked() {
+                    app.library.view_mode = LibraryViewMode::List;
+                }
+
+                ui.separator();
+                if icon_toggle(ui, controls.shelf_open, icon::SIDEBAR_SIMPLE, "Toggle shelf")
+                    .clicked()
+                {
+                    controls.shelf_open = !controls.shelf_open;
+                }
+                let mut select_mode = app.library.select_mode;
+                if icon_toggle(ui, select_mode, icon::CHECK_SQUARE, "Select multiple comics")
+                    .clicked()
+                {
+                    select_mode = !select_mode;
+                    app.library.select_mode = select_mode;
+                    if !select_mode {
+                        app.library.selected_ids.clear();
+                    }
+                }
+
+                ui.separator();
+                render_library_filter_controls(ui, app);
+
+                if controls.is_importing() {
+                    ui.separator();
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Importing\u{2026}").color(EDITOR_TEXT_MUTED));
+                }
+            });
+        });
+}
+
 fn render_library_filter_controls(
     ui: &mut egui::Ui,
     app: &mut ComicReaderApp<egui::TextureHandle>,
@@ -2330,7 +2524,8 @@ fn render_library_filter_controls(
     }
 
     ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new("Filter").color(EDITOR_GREEN));
+        ui.label(icon_text(icon::FUNNEL).color(EDITOR_GREEN))
+            .on_hover_text("Filter by series or folder");
         let mut next_filter = app.library.active_filter.clone();
         let selected_label = app
             .library

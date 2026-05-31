@@ -18,9 +18,53 @@ A native CBR / CBZ / PDF comic reader built in Rust with [egui].
   value-study mode that posterizes luma into 2–8 bands.
 - **Familiar menu bar**: File / Tools / Options / Help in both the library
   and reader views.
-- **Right-click any comic** for "Open file location" to reveal the source
-  file in the OS file manager.
-- Resumes the last reading session on launch (toggle in Settings).
+- **Library toolbar**: one-click buttons for Add Files, Add Folder,
+  Thumbnails / List view, Shelf, Select mode, and the series / folder filter.
+- **Right-click any comic** for "Mark as read / unread" and "Open file
+  location" (reveals the source file in the OS file manager).
+- Resumes the last reading session on launch, and restores each comic to the
+  page you left off on when you reopen it (toggle in Settings).
+- **Keyboard shortcuts** for every reader action, listed in-app under
+  Help > Keyboard Shortcuts and in the table below.
+
+## Keyboard shortcuts
+
+These apply while reading a comic. The same list is available in-app from
+Help > Keyboard Shortcuts.
+
+### Navigation
+
+| Key | Action |
+|-----|--------|
+| `Right` / `Page Down` | Next page |
+| `Left` / `Page Up` | Previous page |
+| `Space` / `Down` | Scroll down |
+| `Up` | Scroll up |
+| `Home` | First page |
+| `End` | Last page |
+| `Esc` | Back to library |
+
+### View and zoom
+
+| Key | Action |
+|-----|--------|
+| `F` | Fit to window |
+| `Shift` + `F` | Fill window |
+| `W` | Fit width |
+| `H` | Fit height |
+| `1` | Actual size (1:1) |
+| `+` / `=` | Zoom in |
+| `-` | Zoom out |
+| `S` | Toggle two-page spread |
+| `V` | Toggle continuous scroll |
+| `R` | Rotate right |
+| `Shift` + `R` | Rotate left |
+
+### Bookmarks
+
+| Key | Action |
+|-----|--------|
+| `B` | Toggle bookmark on current page |
 
 ## Supported formats
 

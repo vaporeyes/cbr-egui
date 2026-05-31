@@ -9,6 +9,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             cbr_egui::mac_activation::activate();
+            cbr_egui::app::ui::install_icon_fonts(&cc.egui_ctx);
             let app = cbr_egui::app::ui::EguiComicReaderApp::new();
             app.apply_config_to_context(&cc.egui_ctx);
             Ok(Box::new(app))
