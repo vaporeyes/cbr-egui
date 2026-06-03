@@ -1,9 +1,7 @@
 use std::fs::File;
 use std::io::Read;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use lru::LruCache;
 use zip::ZipArchive;
 
 use super::archive::{ArchiveError, ArchiveReader, build_pages};
@@ -12,7 +10,6 @@ use crate::library::models::ArchivePage;
 pub struct ZipArchiveReader {
     path: PathBuf,
     pages_cache: Option<Vec<ArchivePage>>,
-    bytes_cache: LruCache<String, Vec<u8>>,
 }
 
 impl ZipArchiveReader {
@@ -20,7 +17,6 @@ impl ZipArchiveReader {
         Self {
             path: path.as_ref().to_path_buf(),
             pages_cache: None,
-            bytes_cache: LruCache::new(NonZeroUsize::new(8).expect("non-zero")),
         }
     }
 
@@ -51,9 +47,9 @@ impl ArchiveReader for ZipArchiveReader {
     }
 
     fn read_entry(&mut self, path: &str) -> Result<Option<Vec<u8>>, ArchiveError> {
-        if let Some(bytes) = self.bytes_cache.get(path) {
-            return Ok(Some(bytes.clone()));
-        }
+        // No raw-bytes cache: decoded pages are already cached as textures, so the
+        // OS page cache is left to serve repeat reads. This keeps the VFS layer's
+        // baseline memory footprint minimal.
         let mut archive = self.open()?;
         let Ok(mut file) = archive.by_name(path) else {
             return Ok(None);
@@ -61,7 +57,6 @@ impl ArchiveReader for ZipArchiveReader {
         let mut bytes = Vec::with_capacity(file.size() as usize);
         file.read_to_end(&mut bytes)
             .map_err(|err| ArchiveError::Read(err.to_string()))?;
-        self.bytes_cache.push(path.to_owned(), bytes.clone());
         Ok(Some(bytes))
     }
 }

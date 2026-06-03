@@ -4,7 +4,10 @@ use lru::LruCache;
 use thiserror::Error;
 
 pub const DEFAULT_PAGE_CACHE_CAPACITY: usize = 5;
-pub const MAX_PAGE_CACHE_CAPACITY: usize = 10;
+/// Upper bound on cached page textures. Sized to cover the largest realistic
+/// continuous-scroll working set (visible pages + overdraw on a tall display)
+/// so on-screen pages are never evicted and re-decoded while still visible.
+pub const MAX_PAGE_CACHE_CAPACITY: usize = 16;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PageTextureCacheError {
@@ -51,6 +54,18 @@ impl<T> PageTextureCache<T> {
 
     pub fn with_default_capacity() -> Self {
         Self::new(DEFAULT_PAGE_CACHE_CAPACITY).expect("default cache capacity is valid")
+    }
+
+    /// Grows the cache so it can hold at least `min_capacity` entries (clamped to
+    /// `MAX_PAGE_CACHE_CAPACITY`). Used by continuous scroll to keep the entire
+    /// on-screen working set resident, preventing evict/re-decode flicker. Never
+    /// shrinks, so transient small windows do not discard still-useful textures.
+    pub fn ensure_capacity(&mut self, min_capacity: usize) {
+        let target = min_capacity.clamp(1, MAX_PAGE_CACHE_CAPACITY);
+        if target > self.entries.cap().get() {
+            self.entries
+                .resize(NonZeroUsize::new(target).expect("target clamped to >= 1"));
+        }
     }
 
     pub fn get(&mut self, page_index: usize) -> Option<&T> {

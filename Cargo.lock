@@ -809,6 +809,7 @@ dependencies = [
  "notify",
  "pdfium-render",
  "quick-xml 0.36.2",
+ "rayon",
  "rfd",
  "rusqlite",
  "serde",

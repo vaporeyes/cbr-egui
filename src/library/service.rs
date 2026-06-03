@@ -68,6 +68,9 @@ impl LibraryService {
         &self,
         scanned: &[ScannedComic],
     ) -> Result<Vec<Comic>, LibraryError> {
+        // Batch the entire reconciliation into one transaction so a large scan
+        // triggers a single commit/fsync rather than one per upsert.
+        let transaction = self.storage.transaction()?;
         for comic in scanned {
             let existing = self.storage.get_comic_by_path(&comic.path)?;
             let previous_metadata_id = existing.as_ref().and_then(|comic| comic.metadata_id);
@@ -101,6 +104,7 @@ impl LibraryService {
             }
         }
 
+        transaction.commit()?;
         self.list_comics()
     }
 

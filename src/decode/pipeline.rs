@@ -7,6 +7,7 @@ use std::sync::{
 
 use eframe::egui;
 use image::imageops::FilterType;
+use rayon::prelude::*;
 
 use super::error::DecodeError;
 
@@ -237,29 +238,34 @@ fn decode_bytes(
         let value_bands = adjustments
             .value_bands
             .clamp(VALUE_BANDS_MIN, VALUE_BANDS_MAX);
-        for pixel in rgba.pixels_mut() {
-            if let Some(table) = &table {
-                pixel[0] = table[pixel[0] as usize];
-                pixel[1] = table[pixel[1] as usize];
-                pixel[2] = table[pixel[2] as usize];
-            }
-            if value_study {
-                let luma = pixel_luma(pixel[0], pixel[1], pixel[2]);
-                let levels = value_bands as f32;
-                let quantized =
-                    ((luma * levels).floor() / (levels - 1.0)).clamp(0.0, 1.0);
-                let byte = (quantized * 255.0).round() as u8;
-                pixel[0] = byte;
-                pixel[1] = byte;
-                pixel[2] = byte;
-            } else if grayscale_mix > 0.0 {
-                let luma = pixel_luma(pixel[0], pixel[1], pixel[2]);
-                let gray = (luma * 255.0).round() as u8;
-                pixel[0] = mix_channel(pixel[0], gray, grayscale_mix);
-                pixel[1] = mix_channel(pixel[1], gray, grayscale_mix);
-                pixel[2] = mix_channel(pixel[2], gray, grayscale_mix);
-            }
-        }
+        // Multi-megapixel pages make this per-pixel pass the dominant decode cost,
+        // so spread the independent pixel math across the rayon thread pool.
+        let mut slice = rgba.as_flat_samples_mut();
+        slice
+            .as_mut_slice()
+            .par_chunks_exact_mut(4)
+            .for_each(|pixel| {
+                if let Some(table) = &table {
+                    pixel[0] = table[pixel[0] as usize];
+                    pixel[1] = table[pixel[1] as usize];
+                    pixel[2] = table[pixel[2] as usize];
+                }
+                if value_study {
+                    let luma = pixel_luma(pixel[0], pixel[1], pixel[2]);
+                    let levels = value_bands as f32;
+                    let quantized = ((luma * levels).floor() / (levels - 1.0)).clamp(0.0, 1.0);
+                    let byte = (quantized * 255.0).round() as u8;
+                    pixel[0] = byte;
+                    pixel[1] = byte;
+                    pixel[2] = byte;
+                } else if grayscale_mix > 0.0 {
+                    let luma = pixel_luma(pixel[0], pixel[1], pixel[2]);
+                    let gray = (luma * 255.0).round() as u8;
+                    pixel[0] = mix_channel(pixel[0], gray, grayscale_mix);
+                    pixel[1] = mix_channel(pixel[1], gray, grayscale_mix);
+                    pixel[2] = mix_channel(pixel[2], gray, grayscale_mix);
+                }
+            });
     }
 
     Ok(egui::ColorImage::from_rgba_unmultiplied(

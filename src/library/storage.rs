@@ -90,6 +90,15 @@ impl LibraryStorage {
         }
     }
 
+    /// Begins a transaction on the shared connection. All other storage methods
+    /// run their statements on the same `&self` connection, so they participate
+    /// in this transaction until it is committed (or rolled back on drop). This
+    /// collapses a multi-comic reconciliation into a single fsync instead of one
+    /// per INSERT/UPDATE.
+    pub fn transaction(&self) -> Result<rusqlite::Transaction<'_>, LibraryError> {
+        Ok(self.connection.unchecked_transaction()?)
+    }
+
     pub fn table_exists(&self, table: &str) -> Result<bool, LibraryError> {
         let exists = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",

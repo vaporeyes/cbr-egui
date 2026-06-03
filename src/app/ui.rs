@@ -307,6 +307,10 @@ fn dispatch_prefetch_if_ready(
     }
 }
 
+/// Extra texture-cache slots kept beyond the visible+overdraw window so the
+/// current page and a little scroll headroom stay resident without thrashing.
+const CONTINUOUS_CACHE_MARGIN: usize = 2;
+
 fn dispatch_continuous_if_ready(
     ctx: &egui::Context,
     app: &mut ComicReaderApp<egui::TextureHandle>,
@@ -322,12 +326,24 @@ fn dispatch_continuous_if_ready(
         return;
     };
     session.continuous_scroll.visible_window = Some(window.clone());
+    // Size the texture cache to the on-screen working set (+margin for the active
+    // page and scroll headroom) so visible pages are never evicted and re-decoded
+    // while still in view, which otherwise causes continuous page flicker.
+    session
+        .texture_cache
+        .ensure_capacity(window.all_pages().len() + CONTINUOUS_CACHE_MARGIN);
     if dispatch_continuous_prefetch_for_session(session, &item.path, window.all_pages()) > 0
         || session.prefetch.has_work()
     {
         ctx.request_repaint_after(Duration::from_millis(50));
     }
 }
+
+/// Maximum decoded pages turned into GPU textures per frame. Bounding the uploads
+/// keeps a burst of simultaneously-finished decodes (e.g. four workers completing
+/// after a rapid page jump) from blowing the frame budget; the rest stay queued in
+/// the channel and are drained on subsequent frames.
+const MAX_TEXTURE_UPLOADS_PER_FRAME: usize = 2;
 
 fn poll_decode_results(ctx: &egui::Context, app: &mut ComicReaderApp<egui::TextureHandle>) {
     let Some(session) = &app.reading else {
@@ -337,10 +353,15 @@ fn poll_decode_results(ctx: &egui::Context, app: &mut ComicReaderApp<egui::Textu
         return;
     };
 
-    let mut results = Vec::new();
-    while let Some(result) = worker_pool.try_recv() {
-        results.push(result);
+    // Pull at most a frame's worth of results; leave any remainder in the channel.
+    let mut results = Vec::with_capacity(MAX_TEXTURE_UPLOADS_PER_FRAME);
+    while results.len() < MAX_TEXTURE_UPLOADS_PER_FRAME {
+        match worker_pool.try_recv() {
+            Some(result) => results.push(result),
+            None => break,
+        }
     }
+    let hit_budget = results.len() == MAX_TEXTURE_UPLOADS_PER_FRAME;
 
     if results.is_empty() {
         if session.prefetch.has_work() {
@@ -357,7 +378,11 @@ fn poll_decode_results(ctx: &egui::Context, app: &mut ComicReaderApp<egui::Textu
         inserted |= reconcile_prefetch_result(ctx, session, result);
     }
 
-    if inserted || session.prefetch.has_work() {
+    if hit_budget {
+        // The channel may still hold decoded payloads; come back next frame to
+        // continue uploading without stalling this one.
+        ctx.request_repaint();
+    } else if inserted || session.prefetch.has_work() {
         ctx.request_repaint_after(Duration::from_millis(50));
     } else {
         ctx.request_repaint();

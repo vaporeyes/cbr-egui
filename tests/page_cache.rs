@@ -1,7 +1,9 @@
 use cbr_egui::cache::{
     DEFAULT_PAGE_CACHE_CAPACITY, MAX_PAGE_CACHE_CAPACITY, PageTextureCache, PageTextureCacheError,
 };
+use cbr_egui::viewer::{build_virtual_canvas, visible_page_window};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 #[test]
@@ -76,6 +78,62 @@ fn cache_never_exceeds_configured_capacity() {
         cache.insert(page, page);
         assert!(cache.len() <= cache.capacity());
     }
+}
+
+// Reproduces the continuous-scroll flicker: a tall viewport over short
+// (landscape) pages produces an on-screen working set larger than the default
+// texture cache, so visible pages get evicted and would be re-decoded each
+// frame. Sizing the cache to the working set keeps every visible page resident.
+#[test]
+fn continuous_working_set_exceeds_default_capacity() {
+    let canvas = build_virtual_canvas(20, 800.0, &HashMap::new(), 1.6, 18.0);
+    let window = visible_page_window(&canvas, 0.0, 3000.0);
+    let working_set = window.all_pages();
+
+    // Precondition: the visible+overdraw window is larger than the default cache.
+    assert!(working_set.len() > DEFAULT_PAGE_CACHE_CAPACITY);
+
+    // With the default capacity, decoding the whole working set evicts some pages
+    // that are still on screen (the flicker source).
+    let mut cache = PageTextureCache::<u8>::with_default_capacity();
+    for &page in &working_set {
+        cache.insert(page, 0);
+    }
+    let resident = working_set.iter().filter(|p| cache.contains(**p)).count();
+    assert!(resident < working_set.len());
+}
+
+#[test]
+fn ensure_capacity_keeps_continuous_working_set_resident() {
+    let canvas = build_virtual_canvas(20, 800.0, &HashMap::new(), 1.6, 18.0);
+    let window = visible_page_window(&canvas, 0.0, 3000.0);
+    let working_set = window.all_pages();
+
+    let mut cache = PageTextureCache::<u8>::with_default_capacity();
+    cache.ensure_capacity(working_set.len());
+    for &page in &working_set {
+        cache.insert(page, 0);
+    }
+
+    // Every visible page stays cached, so none flicker back to Loading.
+    assert!(working_set.iter().all(|p| cache.contains(*p)));
+}
+
+#[test]
+fn ensure_capacity_grows_but_never_shrinks_and_is_clamped() {
+    let mut cache = PageTextureCache::<u8>::with_default_capacity();
+    assert_eq!(cache.capacity(), DEFAULT_PAGE_CACHE_CAPACITY);
+
+    cache.ensure_capacity(8);
+    assert_eq!(cache.capacity(), 8);
+
+    // Smaller request does not shrink.
+    cache.ensure_capacity(3);
+    assert_eq!(cache.capacity(), 8);
+
+    // Clamped to the maximum.
+    cache.ensure_capacity(MAX_PAGE_CACHE_CAPACITY + 5);
+    assert_eq!(cache.capacity(), MAX_PAGE_CACHE_CAPACITY);
 }
 
 #[test]
