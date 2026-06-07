@@ -16,7 +16,7 @@ use crate::config::{
     AppConfig, default_config_path, default_library_db_path, default_library_store_root,
 };
 use crate::decode::{
-    CancellationToken, DecodePurpose, DecodeRequest, DecodeRequestId, DecodeResult,
+    CancellationToken, DecodePurpose, DecodeRequest, DecodeRequestId, DecodeResult, DecodeSource,
     ImageAdjustments, Rotation, decode_page,
 };
 use crate::library::{
@@ -24,7 +24,7 @@ use crate::library::{
     LibraryService, ThumbnailRequest, ThumbnailStatus, ThumbnailWorkerPool, cache_path_for_source,
     discover_supported_archives, import_paths,
 };
-use crate::vfs::{ArchiveReader, PdfArchiveReader, RarArchiveReader, ZipArchiveReader};
+use crate::vfs::{self, ArchiveReader};
 use crate::viewer::layout::{Size2, ViewMode};
 use crate::viewer::{
     self, ContinuousPage, ContinuousPageStatus, PageId, PageNavigationCommand, PageStatus,
@@ -132,28 +132,39 @@ pub fn render_library_grid<T>(
         return None;
     }
 
-    let columns = responsive_grid_columns(ui.available_width(), GRID_TILE_WIDTH, GRID_GAP);
+    let columns = responsive_grid_columns(ui.available_width(), GRID_TILE_WIDTH, GRID_GAP).max(1);
     let mut event = None;
+    let total_rows = (visible_indices.len() + columns - 1) / columns;
+    let estimated_row_height = 310.0;
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        egui::Grid::new("library_grid")
-            .spacing(egui::vec2(GRID_GAP, GRID_GAP))
-            .show(ui, |ui| {
-                for (index, item) in visible_indices
-                    .iter()
-                    .filter_map(|item_index| items.get(*item_index))
-                    .enumerate()
-                {
-                    let is_selected = selected_ids.contains(&item.comic_id);
-                    if let Some(e) = library_tile(ui, item, is_selected, thumbnail_textures) {
-                        event = Some(e);
-                    }
-                    if (index + 1) % columns == 0 {
+    egui::ScrollArea::vertical().show_rows(
+        ui,
+        estimated_row_height + GRID_GAP,
+        total_rows,
+        |ui, row_range| {
+            egui::Grid::new("library_grid")
+                .spacing(egui::vec2(GRID_GAP, GRID_GAP))
+                .min_col_width(GRID_TILE_WIDTH)
+                .show(ui, |ui| {
+                    for row_index in row_range {
+                        for col in 0..columns {
+                            let index = row_index * columns + col;
+                            if let Some(&item_index) = visible_indices.get(index) {
+                                if let Some(item) = items.get(item_index) {
+                                    let is_selected = selected_ids.contains(&item.comic_id);
+                                    if let Some(e) = library_tile(ui, item, is_selected, thumbnail_textures) {
+                                        event = Some(e);
+                                    }
+                                }
+                            } else {
+                                ui.label("");
+                            }
+                        }
                         ui.end_row();
                     }
-                }
-            });
-    });
+                });
+        },
+    );
 
     event
 }
@@ -171,18 +182,26 @@ pub fn render_library_list(
     }
 
     let mut event = None;
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        ui.spacing_mut().item_spacing.y = 6.0;
-        for item in visible_indices
-            .iter()
-            .filter_map(|item_index| items.get(*item_index))
-        {
-            let is_selected = selected_ids.contains(&item.comic_id);
-            if let Some(e) = library_list_row(ui, item, is_selected, thumbnail_textures) {
-                event = Some(e);
+    let row_height = LIST_THUMBNAIL_HEIGHT + 8.0;
+    
+    egui::ScrollArea::vertical().show_rows(
+        ui,
+        row_height + 6.0,
+        visible_indices.len(),
+        |ui, row_range| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            for index in row_range {
+                if let Some(&item_index) = visible_indices.get(index) {
+                    if let Some(item) = items.get(item_index) {
+                        let is_selected = selected_ids.contains(&item.comic_id);
+                        if let Some(e) = library_list_row(ui, item, is_selected, thumbnail_textures) {
+                            event = Some(e);
+                        }
+                    }
+                }
             }
-        }
-    });
+        },
+    );
 
     event
 }
@@ -220,34 +239,6 @@ fn active_library_item(app: &ComicReaderApp<egui::TextureHandle>) -> Option<Libr
         .iter()
         .find(|item| item.comic_id == comic_id)
         .cloned()
-}
-
-fn ensure_bookmarks_loaded(
-    app: &mut ComicReaderApp<egui::TextureHandle>,
-    library_service: Option<&LibraryService>,
-) {
-    let Some(service) = library_service else {
-        return;
-    };
-    let Some(session) = &mut app.reading else {
-        return;
-    };
-    if session.bookmarks_loaded {
-        return;
-    }
-    match service.list_bookmarks(session.comic_id) {
-        Ok(bookmarks) => {
-            session.bookmarks = bookmarks
-                .into_iter()
-                .map(|bookmark| bookmark.page_index as usize)
-                .collect();
-        }
-        Err(error) => {
-            session.viewer_state.chrome.status_text =
-                Some(format!("Bookmarks load failed: {error}"));
-        }
-    }
-    session.bookmarks_loaded = true;
 }
 
 fn toggle_active_bookmark(
@@ -755,12 +746,12 @@ fn schedule_page_sidebar_thumbnails(
             continue;
         }
 
-        let bytes = match read_session_page_bytes(
+        let page_path = match resolve_session_page_path(
             session,
             Path::new(&item.path),
             page_index,
         ) {
-            Ok(bytes) => bytes,
+            Ok(page_path) => page_path,
             Err(_) => {
                 session.failed_page_thumbnails.insert(page_index);
                 continue;
@@ -770,7 +761,10 @@ fn schedule_page_sidebar_thumbnails(
         let request = DecodeRequest {
             request_id: DecodeRequestId(page_index as u64),
             page_index,
-            bytes,
+            source: DecodeSource::ArchivePage {
+                archive_path: PathBuf::from(&item.path),
+                page_path,
+            },
             purpose: DecodePurpose::Thumbnail,
             target_size: Some(PAGE_SIDEBAR_THUMB_TARGET),
             rotation: session.rotation,
@@ -1022,7 +1016,7 @@ pub fn read_archive_page_color_image(
     let result = decode_page(DecodeRequest {
         request_id: DecodeRequestId(page_index as u64),
         page_index,
-        bytes,
+        source: DecodeSource::Bytes(bytes),
         purpose: DecodePurpose::Direct,
         target_size: None,
         rotation: Rotation::None,
@@ -1044,7 +1038,7 @@ fn read_session_page_color_image<T>(
         request_id: DecodeRequestId(page_index as u64),
         page_index,
         purpose: DecodePurpose::Direct,
-        bytes,
+        source: DecodeSource::Bytes(bytes),
         target_size: None,
         rotation: session.rotation,
         adjustments: session.adjustments,
@@ -1060,7 +1054,7 @@ fn submit_direct_decode_for_session<T>(
     archive_path: &str,
 ) -> Result<(), String> {
     let page_index = session.current_page_index;
-    let bytes = read_session_page_bytes(session, Path::new(archive_path), page_index)?;
+    let page_path = resolve_session_page_path(session, Path::new(archive_path), page_index)?;
     let worker_pool = session
         .decode_worker_pool
         .as_ref()
@@ -1070,7 +1064,10 @@ fn submit_direct_decode_for_session<T>(
     let request = DecodeRequest {
         request_id,
         page_index,
-        bytes,
+        source: DecodeSource::ArchivePage {
+            archive_path: PathBuf::from(archive_path),
+            page_path,
+        },
         purpose: DecodePurpose::Direct,
         target_size: None,
         rotation: session.rotation,
@@ -1100,7 +1097,7 @@ pub fn dispatch_prefetch_for_session<T>(
     let mut submitted = 0;
 
     for page_index in candidates {
-        let Ok(bytes) = read_session_page_bytes(session, Path::new(archive_path), page_index)
+        let Ok(page_path) = resolve_session_page_path(session, Path::new(archive_path), page_index)
         else {
             session
                 .prefetch
@@ -1116,7 +1113,10 @@ pub fn dispatch_prefetch_for_session<T>(
         let request = DecodeRequest {
             request_id,
             page_index,
-            bytes,
+            source: DecodeSource::ArchivePage {
+                archive_path: PathBuf::from(archive_path),
+                page_path,
+            },
             purpose: DecodePurpose::Prefetch,
             target_size: None,
             rotation: session.rotation,
@@ -1160,7 +1160,7 @@ pub fn dispatch_continuous_prefetch_for_session<T>(
         {
             continue;
         }
-        let Ok(bytes) = read_session_page_bytes(session, Path::new(archive_path), page_index)
+        let Ok(page_path) = resolve_session_page_path(session, Path::new(archive_path), page_index)
         else {
             session
                 .prefetch
@@ -1181,7 +1181,10 @@ pub fn dispatch_continuous_prefetch_for_session<T>(
         let request = DecodeRequest {
             request_id,
             page_index,
-            bytes,
+            source: DecodeSource::ArchivePage {
+                archive_path: PathBuf::from(archive_path),
+                page_path,
+            },
             purpose: DecodePurpose::Prefetch,
             target_size: None,
             rotation: session.rotation,
@@ -1387,18 +1390,22 @@ fn ensure_session_archive_cache<T>(
 }
 
 fn archive_reader_for_path(path: &Path) -> Result<Box<dyn ArchiveReader>, String> {
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
+    vfs::reader_for_path(path).map_err(|err| err.to_string())
+}
 
-    match extension.as_str() {
-        "cbz" | "zip" => Ok(Box::new(ZipArchiveReader::new(path))),
-        "cbr" | "rar" => Ok(Box::new(RarArchiveReader::new(path))),
-        "pdf" => Ok(Box::new(PdfArchiveReader::new(path))),
-        _ => Err(format!("Unsupported archive format: {}", path.display())),
-    }
+/// Resolves the archive entry path for a page index without reading its bytes.
+/// The cheap page-list lookup stays on the GUI thread; the actual decompression
+/// is deferred to the decode worker via `DecodeSource::ArchivePage`.
+fn resolve_session_page_path<T>(
+    session: &mut ReadingSession<T>,
+    archive_path: &Path,
+    page_index: usize,
+) -> Result<String, String> {
+    ensure_session_archive_cache(session, archive_path)?;
+    session
+        .archive_cache
+        .page_entry_path(page_index)
+        .ok_or_else(|| format!("Page {} is not available", page_index + 1))
 }
 
 fn default_thumbnail_cache_root() -> PathBuf {
@@ -1515,7 +1522,7 @@ pub fn route_app_update(
                 app.return_to_library();
                 return;
             }
-            ensure_bookmarks_loaded(app, library_service);
+
             if let Some(item) = active_library_item(app) {
                 ensure_reader_page_loaded(ctx, app, &item);
             }
@@ -2542,33 +2549,32 @@ fn render_library_filter_controls(
     ui: &mut egui::Ui,
     app: &mut ComicReaderApp<egui::TextureHandle>,
 ) {
-    let groups = app.library.groups().to_vec();
-    if groups.is_empty() {
+    if app.library.groups().is_empty() {
         app.library.active_filter = None;
         return;
     }
+    let mut next_filter = app.library.active_filter.clone();
+    let selected_label = app
+        .library
+        .active_filter
+        .as_ref()
+        .and_then(|active| {
+            app.library.groups()
+                .iter()
+                .find(|group| group.kind == active.kind && group.key == active.key)
+        })
+        .map(group_label)
+        .unwrap_or_else(|| "All comics".to_owned());
 
     ui.horizontal_wrapped(|ui| {
         ui.label(icon_text(icon::FUNNEL).color(EDITOR_GREEN))
             .on_hover_text("Filter by series or folder");
-        let mut next_filter = app.library.active_filter.clone();
-        let selected_label = app
-            .library
-            .active_filter
-            .as_ref()
-            .and_then(|active| {
-                groups
-                    .iter()
-                    .find(|group| group.kind == active.kind && group.key == active.key)
-            })
-            .map(group_label)
-            .unwrap_or_else(|| "All comics".to_owned());
 
         egui::ComboBox::from_id_salt("library_filter")
             .selected_text(selected_label)
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut next_filter, None, "All comics");
-                for group in groups
+                for group in app.library.groups()
                     .iter()
                     .filter(|group| group.kind == LibraryGroupKind::Series)
                 {
@@ -2581,7 +2587,7 @@ fn render_library_filter_controls(
                         group_label(group),
                     );
                 }
-                for group in groups
+                for group in app.library.groups()
                     .iter()
                     .filter(|group| group.kind == LibraryGroupKind::Folder)
                 {
@@ -2595,11 +2601,12 @@ fn render_library_filter_controls(
                     );
                 }
             });
-        if next_filter != app.library.active_filter {
-            app.library.active_filter = next_filter;
-            app.library.refresh_filter_cache();
-        }
     });
+
+    if next_filter != app.library.active_filter {
+        app.library.active_filter = next_filter;
+        app.library.refresh_filter_cache();
+    }
 }
 
 fn group_label(group: &crate::library::LibraryGroup) -> String {

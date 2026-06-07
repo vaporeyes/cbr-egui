@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use cbr_egui::decode::{
-    CancellationToken, DecodeError, DecodePurpose, DecodeRequest, DecodeRequestId,
+    CancellationToken, DecodeError, DecodePurpose, DecodeRequest, DecodeRequestId, DecodeSource,
     ImageAdjustments, Rotation, WorkerPool, decode_page,
 };
 use image::{ImageBuffer, ImageFormat, Rgba};
@@ -173,7 +173,7 @@ fn request(
     DecodeRequest {
         request_id: DecodeRequestId(request_id),
         page_index,
-        bytes,
+        source: DecodeSource::Bytes(bytes),
         purpose: DecodePurpose::Direct,
         target_size,
         rotation: Rotation::None,

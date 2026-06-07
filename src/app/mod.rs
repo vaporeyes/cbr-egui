@@ -113,6 +113,12 @@ impl ReadingArchiveCache {
     pub fn page_count(&self) -> usize {
         self.pages.len()
     }
+
+    /// Returns the archive entry path for a page index, used to build decode
+    /// requests that read the page bytes on a worker thread.
+    pub fn page_entry_path(&self, page_index: usize) -> Option<String> {
+        self.pages.get(page_index).map(|page| page.path.clone())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,6 +532,21 @@ impl<T> ComicReaderApp<T> {
             if let Some(reading) = &mut self.reading {
                 reading.set_current_page(target);
             }
+        }
+        if let Some(reading) = &mut self.reading {
+            match service.list_bookmarks(item.comic_id) {
+                Ok(bookmarks) => {
+                    reading.bookmarks = bookmarks
+                        .into_iter()
+                        .map(|bookmark| bookmark.page_index as usize)
+                        .collect();
+                }
+                Err(error) => {
+                    reading.viewer_state.chrome.status_text =
+                        Some(format!("Bookmarks load failed: {error}"));
+                }
+            }
+            reading.bookmarks_loaded = true;
         }
         true
     }

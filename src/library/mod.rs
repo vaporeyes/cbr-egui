@@ -6,7 +6,6 @@ pub mod scanner;
 pub mod service;
 pub mod storage;
 pub mod thumbnails;
-pub mod watcher;
 
 pub use errors::{LibraryError, MetadataError};
 pub use import::{ImportSummary, ImportedComic, import_comic_file, import_paths};
@@ -26,4 +25,3 @@ pub use thumbnails::{
     ThumbnailResult, ThumbnailWorkerPool, cache_key_for_source, cache_path_for_source,
     cover_request_for_pages, is_thumbnail_stale, thumbnail_target_size,
 };
-pub use watcher::{WatchEventBatch, WatchStatus, coalesce_watch_events};

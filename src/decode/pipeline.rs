@@ -1,5 +1,7 @@
 // ABOUTME: Decodes raw page image bytes into egui color images for display.
 // ABOUTME: Defines cancellation-aware decode request and result payloads.
+use std::borrow::Cow;
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -129,11 +131,24 @@ impl ImageAdjustments {
     }
 }
 
+/// Where a decode task obtains its compressed image bytes. `ArchivePage` defers
+/// the archive read into the worker thread so the GUI thread never blocks on
+/// decompression; `Bytes` carries pre-read bytes for the synchronous decode
+/// paths that already hold them.
+#[derive(Debug, Clone)]
+pub enum DecodeSource {
+    Bytes(Vec<u8>),
+    ArchivePage {
+        archive_path: PathBuf,
+        page_path: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct DecodeRequest {
     pub request_id: DecodeRequestId,
     pub page_index: usize,
-    pub bytes: Vec<u8>,
+    pub source: DecodeSource,
     pub purpose: DecodePurpose,
     pub target_size: Option<[u32; 2]>,
     pub rotation: Rotation,
@@ -180,18 +195,34 @@ pub fn decode_page(request: DecodeRequest) -> DecodeResult {
     {
         Err(DecodeError::Image("decode request cancelled".to_owned()))
     } else {
-        decode_bytes(
-            &request.bytes,
-            request.target_size,
-            request.rotation,
-            request.adjustments,
-        )
+        // Reading the archive happens here, on the worker thread, so page
+        // decompression never stalls the GUI frame loop.
+        resolve_source_bytes(&request.source).and_then(|bytes| {
+            decode_bytes(
+                bytes.as_ref(),
+                request.target_size,
+                request.rotation,
+                request.adjustments,
+            )
+        })
     };
     DecodeResult {
         request_id: request.request_id,
         page_index: request.page_index,
         purpose: request.purpose,
         outcome,
+    }
+}
+
+fn resolve_source_bytes(source: &DecodeSource) -> Result<Cow<'_, [u8]>, DecodeError> {
+    match source {
+        DecodeSource::Bytes(bytes) => Ok(Cow::Borrowed(bytes)),
+        DecodeSource::ArchivePage {
+            archive_path,
+            page_path,
+        } => crate::vfs::read_page_bytes(archive_path, page_path)
+            .map(Cow::Owned)
+            .map_err(|err| DecodeError::Image(err.to_string())),
     }
 }
 
