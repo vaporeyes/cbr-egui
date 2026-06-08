@@ -247,6 +247,33 @@ impl LibraryStorage {
             .map_err(Into::into)
     }
 
+    pub fn get_comic_row(&self, id: i64) -> Result<Option<LibraryComicRow>, LibraryError> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT
+                c.id,
+                c.path,
+                c.hash,
+                c.page_count,
+                c.metadata_id,
+                c.availability,
+                c.thumbnail_key,
+                m.series,
+                m.title,
+                m.number,
+                m.writer,
+                m.penciller
+            FROM comics c
+            LEFT JOIN metadata m ON m.id = c.metadata_id
+            WHERE c.id = ?1
+            ",
+        )?;
+        statement
+            .query_row([id], library_comic_row_from_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn get_comic_by_path(&self, path: &str) -> Result<Option<Comic>, LibraryError> {
         self.connection
             .query_row(

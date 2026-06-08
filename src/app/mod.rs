@@ -10,7 +10,7 @@ use crate::decode::{
 };
 use crate::library::{
     ActiveLibraryFilter, ArchivePage, ComicAvailability, LibraryError, LibraryGridItem,
-    LibraryGroup, LibraryGroupKind, LibraryService,
+    LibraryGroup, LibraryGroupKind, LibraryService, ComicMetadataDisplay,
 };
 use crate::vfs::ArchiveReader;
 use crate::viewer::{
@@ -343,6 +343,8 @@ pub struct ReadingSession<T> {
     pub pending_page_thumbnails: HashSet<usize>,
     pub failed_page_thumbnails: HashSet<usize>,
     pub page_thumbnail_pool: Option<WorkerPool>,
+    pub show_info_panel: bool,
+    pub metadata: Option<ComicMetadataDisplay>,
 }
 
 impl<T> ReadingSession<T> {
@@ -369,6 +371,8 @@ impl<T> ReadingSession<T> {
             pending_page_thumbnails: HashSet::new(),
             failed_page_thumbnails: HashSet::new(),
             page_thumbnail_pool: WorkerPool::start(1, 64).ok(),
+            show_info_panel: false,
+            metadata: None,
         }
     }
 
@@ -405,6 +409,8 @@ impl<T> ReadingSession<T> {
             pending_page_thumbnails: HashSet::new(),
             failed_page_thumbnails: HashSet::new(),
             page_thumbnail_pool: WorkerPool::start(1, 64).ok(),
+            show_info_panel: false,
+            metadata: None,
         })
     }
 
@@ -531,6 +537,11 @@ impl<T> ComicReaderApp<T> {
             let target = (progress.current_page as usize).min(last_index);
             if let Some(reading) = &mut self.reading {
                 reading.set_current_page(target);
+            }
+        }
+        if let Ok(Some(row)) = service.get_comic_row(item.comic_id) {
+            if let Some(reading) = &mut self.reading {
+                reading.metadata = Some(row.metadata);
             }
         }
         if let Some(reading) = &mut self.reading {

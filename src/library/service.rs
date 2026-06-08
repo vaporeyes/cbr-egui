@@ -4,7 +4,7 @@ use super::errors::LibraryError;
 use super::import::ImportedComic;
 use super::models::{
     Bookmark, Comic, ComicAvailability, ComicInput, ComicMetadata, ComicMetadataDisplay, Folder,
-    LibraryGridItem, Progress, ThumbnailStatus,
+    LibraryGridItem, Progress, ThumbnailStatus, LibraryComicRow,
 };
 use super::scanner::ScannedComic;
 use super::storage::LibraryStorage;
@@ -42,6 +42,14 @@ impl LibraryService {
 
     pub fn get_comic(&self, id: i64) -> Result<Option<Comic>, LibraryError> {
         self.storage.get_comic(id)
+    }
+
+    pub fn get_comic_row(&self, id: i64) -> Result<Option<LibraryComicRow>, LibraryError> {
+        self.storage.get_comic_row(id)
+    }
+
+    pub fn get_comic_by_path(&self, path: &str) -> Result<Option<Comic>, LibraryError> {
+        self.storage.get_comic_by_path(path)
     }
 
     pub fn list_comics(&self) -> Result<Vec<Comic>, LibraryError> {

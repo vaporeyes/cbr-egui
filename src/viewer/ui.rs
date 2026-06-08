@@ -156,6 +156,7 @@ fn apply_pending_view_command(
         // the viewer never consumes these.
         ViewCommand::RotateLeft => {}
         ViewCommand::RotateRight => {}
+        ViewCommand::ExtractPage => {}
     }
 }
 

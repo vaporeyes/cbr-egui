@@ -214,6 +214,7 @@ pub enum ViewCommand {
     ToggleContinuous,
     RotateLeft,
     RotateRight,
+    ExtractPage,
 }
 
 #[derive(Debug, Clone, PartialEq)]

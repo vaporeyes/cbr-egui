@@ -466,10 +466,39 @@ fn process_reader_view_command(
         ViewCommand::ToggleContinuous => toggle_reader_continuous(app),
         ViewCommand::RotateLeft => rotate_reader(ctx, app, item, false),
         ViewCommand::RotateRight => rotate_reader(ctx, app, item, true),
+        ViewCommand::ExtractPage => extract_reader_page(app),
         _ => {
             if let Some(session) = &mut app.reading {
                 session.viewer_state.pending_view_command = Some(command);
             }
+        }
+    }
+}
+
+fn extract_reader_page(app: &mut ComicReaderApp<egui::TextureHandle>) {
+    let Some(session) = &mut app.reading else { return; };
+    let current_page = session.current_page_index;
+    let bytes = match session.archive_cache.read_page(current_page) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            session.viewer_state.chrome.status_text = Some(format!("Extract failed: {}", err));
+            return;
+        }
+    };
+    
+    let file_name = session.archive_cache.page_entry_path(current_page)
+        .and_then(|p| std::path::Path::new(&p).file_name().map(|n| n.to_owned()))
+        .and_then(|n| n.to_str().map(|s| s.to_owned()))
+        .unwrap_or_else(|| format!("page_{}.jpg", current_page + 1));
+        
+    if let Some(target) = rfd::FileDialog::new()
+        .set_file_name(&file_name)
+        .save_file()
+    {
+        if let Err(err) = std::fs::write(&target, bytes) {
+            session.viewer_state.chrome.status_text = Some(format!("Extract save failed: {}", err));
+        } else {
+            session.viewer_state.chrome.status_text = Some(format!("Extracted to {}", target.display()));
         }
     }
 }
@@ -570,6 +599,54 @@ fn render_reader_adjustments(
         };
         load_reader_page(ctx, app, item, page);
     }
+}
+
+fn render_reader_info_panel(
+    ctx: &egui::Context,
+    session: &mut ReadingSession<egui::TextureHandle>,
+) {
+    let mut open = session.show_info_panel;
+    egui::Window::new("Comic Info")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            if let Some(metadata) = &session.metadata {
+                egui::Grid::new("comic_info_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        if let Some(series) = &metadata.series {
+                            ui.label(egui::RichText::new("Series:").strong());
+                            ui.label(series);
+                            ui.end_row();
+                        }
+                        if let Some(title) = &metadata.title {
+                            ui.label(egui::RichText::new("Title:").strong());
+                            ui.label(title);
+                            ui.end_row();
+                        }
+                        if let Some(number) = &metadata.number {
+                            ui.label(egui::RichText::new("Number:").strong());
+                            ui.label(number);
+                            ui.end_row();
+                        }
+                        if let Some(writer) = &metadata.writer {
+                            ui.label(egui::RichText::new("Writer:").strong());
+                            ui.label(writer);
+                            ui.end_row();
+                        }
+                        if let Some(penciller) = &metadata.penciller {
+                            ui.label(egui::RichText::new("Penciller:").strong());
+                            ui.label(penciller);
+                            ui.end_row();
+                        }
+                    });
+            } else {
+                ui.label(egui::RichText::new("No metadata available for this comic.").weak());
+            }
+        });
+    session.show_info_panel = open;
 }
 
 const PAGE_SIDEBAR_THUMB_W: f32 = 110.0;
@@ -1522,6 +1599,11 @@ pub fn route_app_update(
                 app.return_to_library();
                 return;
             }
+            if ctx.input(|input| input.key_pressed(egui::Key::I)) {
+                if let Some(session) = &mut app.reading {
+                    session.show_info_panel = !session.show_info_panel;
+                }
+            }
 
             if let Some(item) = active_library_item(app) {
                 ensure_reader_page_loaded(ctx, app, &item);
@@ -1543,6 +1625,11 @@ pub fn route_app_update(
                 poll_page_thumbnail_results(ctx, app);
                 render_reader_page_sidebar(ctx, app, &item);
                 process_reader_view_command(ctx, app, &item);
+            }
+            if let Some(session) = &mut app.reading {
+                if session.show_info_panel {
+                    render_reader_info_panel(ctx, session);
+                }
             }
             if let Some(session) = &mut app.reading {
                 viewer::ui::render_viewer_panel(ctx, &mut session.viewer_state);
@@ -1592,6 +1679,13 @@ fn render_reader_menu_bar(
                         ui.close_menu();
                         app.return_to_library();
                     }
+                    if ui.button("Extract current page…").clicked() {
+                        ui.close_menu();
+                        if let Some(session) = &mut app.reading {
+                            session.viewer_state.pending_view_command =
+                                Some(ViewCommand::ExtractPage);
+                        }
+                    }
                     ui.separator();
                     if ui.button("Settings…").clicked() {
                         ui.close_menu();
@@ -1620,6 +1714,9 @@ fn render_reader_menu_bar(
                             Some(ViewCommand::RotateRight);
                     }
                     ui.separator();
+                    ui.separator();
+                    ui.checkbox(&mut session.show_info_panel, "Comic info")
+                        .on_hover_text("View comic metadata (I)");
                     ui.checkbox(&mut session.show_adjustments, "Image adjustments")
                         .on_hover_text("Brightness / contrast / gamma");
                     ui.separator();
