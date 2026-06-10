@@ -1,6 +1,6 @@
 // ABOUTME: Renders the egui application shell, library controls, and reader toolbar.
 // ABOUTME: Connects UI events to the app state without owning archive or storage logic.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -33,6 +33,9 @@ use crate::viewer::{
 };
 
 pub const GRID_TILE_WIDTH: f32 = 190.0;
+/// Fixed tile height (cover + single-line title/subtitle/status rows) so the
+/// virtualized grid scrolls without row-height drift.
+pub const GRID_TILE_HEIGHT: f32 = 320.0;
 pub const GRID_GAP: f32 = 14.0;
 const LIST_THUMBNAIL_WIDTH: f32 = 56.0;
 const LIST_THUMBNAIL_HEIGHT: f32 = 74.0;
@@ -118,6 +121,7 @@ pub fn responsive_grid_columns(available_width: f32, tile_width: f32, gap: f32) 
 pub enum LibraryItemEvent {
     Open(LibraryGridItem),
     SetRead { comic_id: i64, is_read: bool },
+    Remove { comic_id: i64 },
 }
 
 pub fn render_library_grid<T>(
@@ -125,7 +129,7 @@ pub fn render_library_grid<T>(
     items: &[LibraryGridItem],
     visible_indices: &[usize],
     selected_ids: &HashSet<i64>,
-    thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
+    thumbnail_textures: &mut lru::LruCache<String, egui::TextureHandle>,
 ) -> Option<LibraryItemEvent> {
     if visible_indices.is_empty() {
         render_empty_library(ui);
@@ -135,11 +139,10 @@ pub fn render_library_grid<T>(
     let columns = responsive_grid_columns(ui.available_width(), GRID_TILE_WIDTH, GRID_GAP).max(1);
     let mut event = None;
     let total_rows = (visible_indices.len() + columns - 1) / columns;
-    let estimated_row_height = 310.0;
 
     egui::ScrollArea::vertical().show_rows(
         ui,
-        estimated_row_height + GRID_GAP,
+        GRID_TILE_HEIGHT + GRID_GAP,
         total_rows,
         |ui, row_range| {
             egui::Grid::new("library_grid")
@@ -174,7 +177,7 @@ pub fn render_library_list(
     items: &[LibraryGridItem],
     visible_indices: &[usize],
     selected_ids: &HashSet<i64>,
-    thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
+    thumbnail_textures: &mut lru::LruCache<String, egui::TextureHandle>,
 ) -> Option<LibraryItemEvent> {
     if visible_indices.is_empty() {
         render_empty_library(ui);
@@ -276,7 +279,7 @@ fn ensure_reader_page_loaded(
     if session.viewer_state.page_status.is_empty() {
         load_reader_page(ctx, app, item, session.current_page_index);
     }
-    ensure_spread_next_page_loaded(ctx, app, item);
+    ensure_spread_next_page_loaded(ctx, app);
 }
 
 fn dispatch_prefetch_if_ready(
@@ -317,6 +320,26 @@ fn dispatch_continuous_if_ready(
         return;
     };
     session.continuous_scroll.visible_window = Some(window.clone());
+    // Keep the session's current page in step with the scroll position so the
+    // page counter, progress checkpoints, bookmarks, and the sidebar highlight
+    // reflect what is actually on screen. The page under the viewport vertical
+    // midpoint wins; fall back to the first visible page in gaps.
+    let viewport_midpoint = (window.viewport_top + window.viewport_bottom) * 0.5;
+    let page_in_view = session
+        .viewer_state
+        .continuous_canvas
+        .as_ref()
+        .and_then(|canvas| {
+            canvas
+                .page_rects
+                .iter()
+                .find(|rect| rect.y <= viewport_midpoint && rect.bottom() > viewport_midpoint)
+                .map(|rect| rect.page_index)
+        })
+        .or_else(|| window.visible_pages.first().copied());
+    if let Some(page_index) = page_in_view {
+        session.sync_continuous_current_page(page_index);
+    }
     // Size the texture cache to the on-screen working set (+margin for the active
     // page and scroll headroom) so visible pages are never evicted and re-decoded
     // while still in view, which otherwise causes continuous page flicker.
@@ -415,8 +438,33 @@ fn process_reader_navigation(
     let Some(session) = &app.reading else {
         return;
     };
-    let next_page =
-        resolve_navigation_target(command, session.current_page_index, session.page_count);
+    // When a two-page spread is on screen, next/previous step over the whole
+    // pair so the reader never re-shows a page it just displayed. Landscape
+    // singles and pending pairs still step by one.
+    let spread_pair_active = session.spread_mode_enabled
+        && session.viewer_state.layout_mode == ReadingLayoutMode::Paged
+        && matches!(
+            session.viewer_state.spread_decision,
+            Some(viewer::SpreadDecision::Pair { .. })
+        );
+    let last_page = session.page_count.saturating_sub(1);
+    let next_page = if spread_pair_active {
+        match command {
+            PageNavigationCommand::NextPage | PageNavigationCommand::ScrollDown => {
+                session.current_page_index.saturating_add(2).min(last_page)
+            }
+            PageNavigationCommand::PreviousPage | PageNavigationCommand::ScrollUp => {
+                session.current_page_index.saturating_sub(2)
+            }
+            _ => resolve_navigation_target(
+                command,
+                session.current_page_index,
+                session.page_count,
+            ),
+        }
+    } else {
+        resolve_navigation_target(command, session.current_page_index, session.page_count)
+    };
     let is_jump = matches!(
         command,
         PageNavigationCommand::FirstPage
@@ -462,14 +510,19 @@ fn process_reader_view_command(
     };
 
     match command {
-        ViewCommand::ToggleSpread => toggle_reader_spread(ctx, app, item),
+        ViewCommand::ToggleSpread => toggle_reader_spread(ctx, app),
         ViewCommand::ToggleContinuous => toggle_reader_continuous(app),
         ViewCommand::RotateLeft => rotate_reader(ctx, app, item, false),
         ViewCommand::RotateRight => rotate_reader(ctx, app, item, true),
         ViewCommand::ExtractPage => extract_reader_page(app),
         _ => {
             if let Some(session) = &mut app.reading {
-                session.viewer_state.pending_view_command = Some(command);
+                // Zoom and fit commands only apply in the paged renderer.
+                // Continuous mode has no consumer, so drop them rather than
+                // letting a stale command apply when the layout switches back.
+                if session.viewer_state.layout_mode != ReadingLayoutMode::ContinuousVertical {
+                    session.viewer_state.pending_view_command = Some(command);
+                }
             }
         }
     }
@@ -660,11 +713,21 @@ fn render_reader_page_sidebar(
     app: &mut ComicReaderApp<egui::TextureHandle>,
     item: &LibraryGridItem,
 ) {
-    let (show, page_count) = {
-        let Some(session) = &app.reading else {
+    let (show, page_count, current_page, follow_current) = {
+        let Some(session) = &mut app.reading else {
             return;
         };
-        (session.show_page_sidebar, session.page_count)
+        let current = session.current_page_index;
+        // Follow navigation: scroll the sidebar when the current page moved
+        // since the last frame, but leave free scrolling alone otherwise.
+        let follow = session.sidebar_tracked_page != Some(current);
+        session.sidebar_tracked_page = Some(current);
+        (
+            session.show_page_sidebar,
+            session.page_count,
+            current,
+            follow,
+        )
     };
     if !show || page_count == 0 {
         return;
@@ -690,14 +753,15 @@ fn render_reader_page_sidebar(
             });
             ui.separator();
 
-            let current_page = app
-                .reading
-                .as_ref()
-                .map(|session| session.current_page_index)
-                .unwrap_or(0);
-
-            egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
+            let mut scroll_area = egui::ScrollArea::vertical().auto_shrink([false; 2]);
+            if follow_current {
+                let panel_height = ui.available_height();
+                let row_step = PAGE_SIDEBAR_ROW_HEIGHT + ui.spacing().item_spacing.y;
+                let centered = current_page as f32 * row_step
+                    - (panel_height - PAGE_SIDEBAR_ROW_HEIGHT) / 2.0;
+                scroll_area = scroll_area.vertical_scroll_offset(centered.max(0.0));
+            }
+            scroll_area
                 .show_rows(ui, PAGE_SIDEBAR_ROW_HEIGHT, page_count, |ui, row_range| {
                     for page_index in row_range.clone() {
                         visible_pages.push(page_index);
@@ -933,11 +997,11 @@ fn toggle_reader_continuous(app: &mut ComicReaderApp<egui::TextureHandle>) {
         return;
     };
     if session.viewer_state.layout_mode == ReadingLayoutMode::ContinuousVertical {
-        if let Some(window) = &session.viewer_state.continuous_visible_window
-            && let Some(page_index) = window.visible_pages.first().copied()
-        {
-            session.set_current_page(page_index);
-        }
+        // current_page_index is kept in sync with the scroll position, so
+        // re-applying it routes through set_current_page to refresh paged
+        // viewer state (page id, zoom/pan reset) for the page on screen.
+        let page_index = session.current_page_index;
+        session.set_current_page(page_index);
         session
             .viewer_state
             .set_layout_mode(ReadingLayoutMode::Paged);
@@ -950,11 +1014,7 @@ fn toggle_reader_continuous(app: &mut ComicReaderApp<egui::TextureHandle>) {
     }
 }
 
-fn toggle_reader_spread(
-    ctx: &egui::Context,
-    app: &mut ComicReaderApp<egui::TextureHandle>,
-    item: &LibraryGridItem,
-) {
+fn toggle_reader_spread(ctx: &egui::Context, app: &mut ComicReaderApp<egui::TextureHandle>) {
     let Some(session) = &mut app.reading else {
         return;
     };
@@ -964,7 +1024,7 @@ fn toggle_reader_spread(
     let enabled = !session.spread_mode_enabled;
     session.set_spread_mode_enabled(enabled);
     if enabled {
-        ensure_spread_next_page_loaded(ctx, app, item);
+        ensure_spread_next_page_loaded(ctx, app);
     } else if let Some(session) = &mut app.reading {
         session.viewer_state.next_page_status = PageStatus::Empty;
     }
@@ -1047,7 +1107,6 @@ pub fn load_reader_page(
 fn ensure_spread_next_page_loaded(
     ctx: &egui::Context,
     app: &mut ComicReaderApp<egui::TextureHandle>,
-    item: &LibraryGridItem,
 ) {
     let Some(session) = &mut app.reading else {
         return;
@@ -1062,27 +1121,34 @@ fn ensure_spread_next_page_loaded(
     }
     let next_page_id = PageId(next_page_index as u64);
     if session.viewer_state.next_page_status.page_id() == Some(next_page_id)
-        && !session.viewer_state.next_page_status.is_failed()
+        && session.viewer_state.next_page_status.is_ready()
     {
         return;
     }
 
-    session.viewer_state.set_next_loading(next_page_id);
-    match read_session_page_color_image(session, &item.path, next_page_index) {
-        Ok((color_image, pixel_size)) => {
-            let texture = ctx.load_texture(
-                format!("comic:{}:page:{next_page_index}", item.comic_id),
-                color_image,
-                egui::TextureOptions::LINEAR,
-            );
-            session
-                .viewer_state
-                .set_next_ready(next_page_id, texture, pixel_size);
-        }
-        Err(message) => {
-            session.viewer_state.set_next_failed(next_page_id, message);
-        }
+    // The prefetcher decodes current+1 off-thread into the texture cache;
+    // adopt that texture as soon as it lands instead of blocking the GUI
+    // thread on a synchronous decode every page turn.
+    if let Some((texture, pixel_size)) = session
+        .texture_cache
+        .get(next_page_index)
+        .map(|cached| (cached.texture.clone(), cached.pixel_size))
+    {
+        session
+            .viewer_state
+            .set_next_ready(next_page_id, texture, pixel_size);
+        return;
     }
+
+    if let Some(message) = session.prefetch.failed_pages.get(&next_page_index) {
+        let message = message.clone();
+        session.viewer_state.set_next_failed(next_page_id, message);
+        return;
+    }
+
+    session.viewer_state.set_next_loading(next_page_id);
+    // Come back soon to adopt the prefetch result once the decode completes.
+    ctx.request_repaint_after(Duration::from_millis(50));
 }
 
 pub fn read_archive_page_color_image(
@@ -1359,6 +1425,20 @@ pub fn refresh_continuous_viewer_state_with_restore(
         return;
     }
     let viewport_width = session.viewer_state.viewport_size.width.max(1.0);
+    // Rebuilding the canvas and page list every frame allocates per page;
+    // skip it entirely while the inputs are unchanged.
+    let layout_stamp = (
+        session.continuous_scroll.measurements_version,
+        session.texture_cache.version(),
+        viewport_width.to_bits(),
+        session.page_count,
+    );
+    if session.viewer_state.continuous_canvas.is_some()
+        && session.continuous_layout_stamp == Some(layout_stamp)
+    {
+        return;
+    }
+    session.continuous_layout_stamp = Some(layout_stamp);
     let canvas = build_virtual_canvas(
         session.page_count,
         viewport_width,
@@ -1377,6 +1457,11 @@ pub fn refresh_continuous_viewer_state_with_restore(
         let restored_top = scroll_top_for_anchor(&canvas, anchor);
         if (restored_top - window.viewport_top).abs() > 0.5 {
             session.viewer_state.continuous_pending_scroll_top = Some(restored_top);
+        }
+    } else if session.viewer_state.continuous_canvas.is_none() && session.current_page_index > 0 {
+        // First build: jump to the resumed page. Page 0 needs no scroll.
+        if let Some(rect) = canvas.page_rects.get(session.current_page_index) {
+            session.viewer_state.continuous_pending_scroll_top = Some(rect.y);
         }
     }
     let mut pages = Vec::with_capacity(canvas.page_rects.len());
@@ -1506,7 +1591,7 @@ fn color_image_from_file(path: &str) -> Result<egui::ColorImage, String> {
 fn load_thumbnail_texture(
     ui: &mut egui::Ui,
     cache_path: &str,
-    thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
+    thumbnail_textures: &mut lru::LruCache<String, egui::TextureHandle>,
 ) -> Option<egui::TextureHandle> {
     if let Some(texture) = thumbnail_textures.get(cache_path) {
         return Some(texture.clone());
@@ -1518,13 +1603,43 @@ fn load_thumbnail_texture(
         color_image,
         egui::TextureOptions::LINEAR,
     );
-    thumbnail_textures.insert(cache_path.to_owned(), texture.clone());
+    thumbnail_textures.push(cache_path.to_owned(), texture.clone());
     Some(texture)
+}
+
+const STATUS_MESSAGE_LIFETIME_S: f64 = 6.0;
+
+/// Clears a status message a few seconds after its text last changed. The
+/// (text, set-time) pair lives in egui temp memory so the many call sites
+/// that assign status text stay untouched.
+fn expire_status_text(ctx: &egui::Context, id_salt: &str, status: &mut Option<String>) {
+    let Some(text) = status.as_ref() else {
+        return;
+    };
+    let id = egui::Id::new(("status_expiry", id_salt));
+    let now = ctx.input(|input| input.time);
+    let set_at = ctx.data_mut(|data| {
+        match data.get_temp::<(String, f64)>(id) {
+            Some((stored, at)) if stored == *text => at,
+            _ => {
+                data.insert_temp(id, (text.clone(), now));
+                now
+            }
+        }
+    });
+    let age = now - set_at;
+    if age >= STATUS_MESSAGE_LIFETIME_S {
+        *status = None;
+        ctx.data_mut(|data| data.remove::<(String, f64)>(id));
+    } else {
+        ctx.request_repaint_after(Duration::from_secs_f64(STATUS_MESSAGE_LIFETIME_S - age));
+    }
 }
 
 fn handle_library_item_event(
     ctx: &egui::Context,
     app: &mut ComicReaderApp<egui::TextureHandle>,
+    controls: &mut LibraryRootControls,
     library_service: Option<&LibraryService>,
     event: Option<LibraryItemEvent>,
 ) {
@@ -1543,6 +1658,9 @@ fn handle_library_item_event(
                 }
             }
         }
+        Some(LibraryItemEvent::Remove { comic_id }) => {
+            controls.remove_comics(app, library_service, &[comic_id]);
+        }
         None => {}
     }
 }
@@ -1552,8 +1670,21 @@ pub fn route_app_update(
     app: &mut ComicReaderApp<egui::TextureHandle>,
     library_controls: &mut LibraryRootControls,
     settings: &mut SettingsWindowState,
+    config: &mut AppConfig,
     library_service: Option<&LibraryService>,
 ) {
+    if !ctx.wants_keyboard_input() && ctx.input(|input| input.key_pressed(egui::Key::F11)) {
+        let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+    }
+    expire_status_text(ctx, "library", &mut app.library.status_text);
+    if let Some(session) = &mut app.reading {
+        // Loading text self-clears when the page is ready; only persistent
+        // messages (errors, confirmations) expire on the timer.
+        if !session.viewer_state.page_status.is_loading() {
+            expire_status_text(ctx, "reader", &mut session.viewer_state.chrome.status_text);
+        }
+    }
     poll_decode_results(ctx, app);
     library_controls.poll_import(app, library_service);
     library_controls.poll_thumbnails(ctx, app);
@@ -1564,10 +1695,11 @@ pub fn route_app_update(
 
     match app.state {
         AppState::Library => {
-            render_library_menu_bar(ctx, app, library_controls, settings, library_service);
-            render_library_toolbar(ctx, app, library_controls);
+            handle_dropped_imports(ctx, app, library_controls);
+            render_library_menu_bar(ctx, app, library_controls, settings, config, library_service);
+            render_library_toolbar(ctx, app, library_controls, config);
             let shelf_event = render_library_shelf(ctx, app, library_controls);
-            handle_library_item_event(ctx, app, library_service, shelf_event);
+            handle_library_item_event(ctx, app, library_controls, library_service, shelf_event);
             render_about_window(ctx, &mut library_controls.about_open);
             render_shortcuts_window(ctx, &mut library_controls.shortcuts_open);
             egui::CentralPanel::default()
@@ -1591,19 +1723,46 @@ pub fn route_app_update(
                             &mut library_controls.thumbnail_textures,
                         ),
                     };
-                    handle_library_item_event(ctx, app, library_service, selected);
+                    handle_library_item_event(
+                        ctx,
+                        app,
+                        library_controls,
+                        library_service,
+                        selected,
+                    );
                 });
         }
         AppState::Reading(_) => {
-            if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-                app.return_to_library();
-                return;
-            }
-            if ctx.input(|input| input.key_pressed(egui::Key::I)) {
-                if let Some(session) = &mut app.reading {
-                    session.show_info_panel = !session.show_info_panel;
+            // While a text field (go-to-page) is focused, the keyboard belongs
+            // to it; Escape then unfocuses the field instead of acting here.
+            let text_input_active = ctx.wants_keyboard_input();
+            if !text_input_active && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                // Escape closes the topmost open window first; only with no
+                // window open does it leave the reader.
+                if !close_topmost_reader_window(app, library_controls, settings) {
+                    app.return_to_library();
+                    return;
                 }
             }
+            if !text_input_active
+                && ctx.input(|input| input.key_pressed(egui::Key::I))
+                && let Some(session) = &mut app.reading
+            {
+                session.show_info_panel = !session.show_info_panel;
+            }
+            // Tab toggles an immersive mode that hides the toolbars and
+            // sidebar, leaving only the page.
+            if !text_input_active
+                && ctx.input(|input| input.key_pressed(egui::Key::Tab))
+                && let Some(session) = &mut app.reading
+            {
+                session.viewer_state.chrome.visible = !session.viewer_state.chrome.visible;
+            }
+            let chrome_visible = app
+                .reading
+                .as_ref()
+                .map(|session| session.viewer_state.chrome.visible)
+                .unwrap_or(true);
 
             if let Some(item) = active_library_item(app) {
                 ensure_reader_page_loaded(ctx, app, &item);
@@ -1617,13 +1776,17 @@ pub fn route_app_update(
                     !is_scrolling_continuous_view,
                 );
             }
-            render_reader_menu_bar(ctx, app, library_controls, settings);
-            render_reader_nav_bar(ctx, app);
+            if chrome_visible {
+                render_reader_menu_bar(ctx, app, library_controls, settings);
+                render_reader_nav_bar(ctx, app);
+            }
             render_about_window(ctx, &mut library_controls.about_open);
             render_shortcuts_window(ctx, &mut library_controls.shortcuts_open);
             if let Some(item) = active_library_item(app) {
                 poll_page_thumbnail_results(ctx, app);
-                render_reader_page_sidebar(ctx, app, &item);
+                if chrome_visible {
+                    render_reader_page_sidebar(ctx, app, &item);
+                }
                 process_reader_view_command(ctx, app, &item);
             }
             if let Some(session) = &mut app.reading {
@@ -1651,6 +1814,78 @@ pub fn route_app_update(
             }
         }
     }
+}
+
+/// Starts an import for files or folders dropped onto the library view, and
+/// shows a hint overlay while a drag hovers the window.
+fn handle_dropped_imports(
+    ctx: &egui::Context,
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+    controls: &mut LibraryRootControls,
+) {
+    let hovering = ctx.input(|input| !input.raw.hovered_files.is_empty());
+    if hovering {
+        let painter =
+            ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, "drop_hint".into()));
+        let rect = ctx.screen_rect();
+        painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(120));
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Drop comics or folders to import",
+            egui::FontId::proportional(22.0),
+            EDITOR_GREEN,
+        );
+    }
+
+    let dropped = ctx.input(|input| {
+        input
+            .raw
+            .dropped_files
+            .iter()
+            .filter_map(|file| file.path.clone())
+            .collect::<Vec<_>>()
+    });
+    if dropped.is_empty() {
+        return;
+    }
+    if controls.is_importing() {
+        app.library.status_text = Some("Import already in progress".to_owned());
+        return;
+    }
+    controls.start_import_dropped(dropped);
+}
+
+/// Closes the topmost open reader window (settings, adjustments, info,
+/// shortcuts, about) and reports whether one was closed.
+fn close_topmost_reader_window(
+    app: &mut ComicReaderApp<egui::TextureHandle>,
+    controls: &mut LibraryRootControls,
+    settings: &mut SettingsWindowState,
+) -> bool {
+    if settings.open {
+        settings.open = false;
+        return true;
+    }
+    if controls.shortcuts_open {
+        controls.shortcuts_open = false;
+        return true;
+    }
+    if controls.about_open {
+        controls.about_open = false;
+        return true;
+    }
+    if let Some(session) = &mut app.reading {
+        if session.show_adjustments {
+            session.show_adjustments = false;
+            return true;
+        }
+        if session.show_info_panel {
+            session.show_info_panel = false;
+            return true;
+        }
+    }
+    false
 }
 
 /// Parses a 1-based page number from user input into a clamped 0-based index.
@@ -1861,18 +2096,29 @@ fn render_reader_nav_controls(
     let is_first = session.current_page_index == 0;
     let is_last = session.current_page_index + 1 >= session.page_count;
 
-    // Page navigation.
-    if icon_button_enabled(ui, !is_first, icon::CARET_DOUBLE_LEFT, "First page (Home)").clicked() {
-        session.viewer_state.pending_navigation = Some(PageNavigationCommand::FirstPage);
-    }
-    if icon_button_enabled(ui, !is_first, icon::CARET_LEFT, "Previous page (Left)").clicked() {
-        session.viewer_state.pending_navigation = Some(PageNavigationCommand::PreviousPage);
-    }
-    if icon_button_enabled(ui, !is_last, icon::CARET_RIGHT, "Next page (Right)").clicked() {
-        session.viewer_state.pending_navigation = Some(PageNavigationCommand::NextPage);
-    }
-    if icon_button_enabled(ui, !is_last, icon::CARET_DOUBLE_RIGHT, "Last page (End)").clicked() {
-        session.viewer_state.pending_navigation = Some(PageNavigationCommand::LastPage);
+    // Page navigation. The buttons keep their screen positions, but in RTL
+    // the left-pointing arrows advance through the comic, matching how the
+    // pages flow.
+    let rtl = session.viewer_state.reading_direction == ReadingDirection::RightToLeft;
+    let buttons: [(&str, bool, &str, PageNavigationCommand); 4] = if rtl {
+        [
+            (icon::CARET_DOUBLE_LEFT, !is_last, "Last page (End)", PageNavigationCommand::LastPage),
+            (icon::CARET_LEFT, !is_last, "Next page (Left)", PageNavigationCommand::NextPage),
+            (icon::CARET_RIGHT, !is_first, "Previous page (Right)", PageNavigationCommand::PreviousPage),
+            (icon::CARET_DOUBLE_RIGHT, !is_first, "First page (Home)", PageNavigationCommand::FirstPage),
+        ]
+    } else {
+        [
+            (icon::CARET_DOUBLE_LEFT, !is_first, "First page (Home)", PageNavigationCommand::FirstPage),
+            (icon::CARET_LEFT, !is_first, "Previous page (Left)", PageNavigationCommand::PreviousPage),
+            (icon::CARET_RIGHT, !is_last, "Next page (Right)", PageNavigationCommand::NextPage),
+            (icon::CARET_DOUBLE_RIGHT, !is_last, "Last page (End)", PageNavigationCommand::LastPage),
+        ]
+    };
+    for (glyph, enabled, tooltip, command) in buttons {
+        if icon_button_enabled(ui, enabled, glyph, tooltip).clicked() {
+            session.viewer_state.pending_navigation = Some(command);
+        }
     }
 
     // Page counter and go-to field.
@@ -1972,12 +2218,16 @@ fn render_reader_nav_controls(
     }
 }
 
+/// Upper bound on resident cover textures; covers scroll in and out of view,
+/// so an unbounded map would otherwise hold every cover ever shown.
+const THUMBNAIL_TEXTURE_CACHE_CAPACITY: usize = 256;
+
 pub struct LibraryRootControls {
     import_result_receiver: Option<Receiver<Result<ImportSummary, String>>>,
     store_root: PathBuf,
     thumbnail_pool: Option<ThumbnailWorkerPool>,
     pending_thumbnails: HashSet<String>,
-    thumbnail_textures: HashMap<String, egui::TextureHandle>,
+    thumbnail_textures: lru::LruCache<String, egui::TextureHandle>,
     thumbnail_cache_root: PathBuf,
     pub shelf_open: bool,
     pub about_open: bool,
@@ -1997,7 +2247,9 @@ impl LibraryRootControls {
             store_root: default_library_store_root(),
             thumbnail_pool: ThumbnailWorkerPool::start(2, 16).ok(),
             pending_thumbnails: HashSet::new(),
-            thumbnail_textures: HashMap::new(),
+            thumbnail_textures: lru::LruCache::new(
+                std::num::NonZeroUsize::new(THUMBNAIL_TEXTURE_CACHE_CAPACITY).expect("non-zero"),
+            ),
             thumbnail_cache_root: default_thumbnail_cache_root(),
             shelf_open: false,
             about_open: false,
@@ -2040,6 +2292,36 @@ impl LibraryRootControls {
         });
     }
 
+    /// Imports a mixed batch of dropped paths: folders are expanded to their
+    /// supported archives on the worker thread, files are imported directly.
+    fn start_import_dropped(&mut self, paths: Vec<PathBuf>) {
+        if self.is_importing() || paths.is_empty() {
+            return;
+        }
+        let store_root = self.store_root.clone();
+        let (sender, receiver) = bounded(1);
+        self.import_result_receiver = Some(receiver);
+        thread::spawn(move || {
+            let mut files = Vec::new();
+            let mut discover_error = None;
+            for path in paths {
+                if path.is_dir() {
+                    match discover_supported_archives(&path) {
+                        Ok(found) => files.extend(found),
+                        Err(error) => discover_error = Some(error.to_string()),
+                    }
+                } else {
+                    files.push(path);
+                }
+            }
+            let result = match discover_error {
+                Some(message) if files.is_empty() => Err(message),
+                _ => Ok(import_paths(&files, &store_root)),
+            };
+            let _ = sender.send(result);
+        });
+    }
+
     fn poll_import(
         &mut self,
         app: &mut ComicReaderApp<egui::TextureHandle>,
@@ -2060,10 +2342,17 @@ impl LibraryRootControls {
                     return;
                 };
                 let mut added = 0usize;
+                let mut already_present = 0usize;
                 let mut error_text = None;
                 for imported in &summary.imported {
                     match service.persist_imported_comic(imported) {
-                        Ok(_) => added += 1,
+                        Ok(_) => {
+                            if imported.already_present {
+                                already_present += 1;
+                            } else {
+                                added += 1;
+                            }
+                        }
                         Err(error) => error_text = Some(error.to_string()),
                     }
                 }
@@ -2074,8 +2363,12 @@ impl LibraryRootControls {
                     }
                     Err(error) => error_text = Some(error.to_string()),
                 }
-                app.library.status_text =
-                    Some(import_status_text(added, summary.failures.len(), error_text));
+                app.library.status_text = Some(import_status_text(
+                    added,
+                    already_present,
+                    summary.failures.len(),
+                    error_text,
+                ));
             }
             Err(message) => {
                 app.library.status_text = Some(message);
@@ -2120,19 +2413,34 @@ impl LibraryRootControls {
         app: &mut ComicReaderApp<egui::TextureHandle>,
         library_service: Option<&LibraryService>,
     ) {
+        let comic_ids = app.library.selected_ids.iter().copied().collect::<Vec<_>>();
+        self.remove_comics(app, library_service, &comic_ids);
+        app.library.selected_ids.clear();
+    }
+
+    /// Removes comics from the library along with their managed copies and
+    /// cached thumbnails. Used by both multi-select removal and the per-item
+    /// context menu.
+    fn remove_comics(
+        &mut self,
+        app: &mut ComicReaderApp<egui::TextureHandle>,
+        library_service: Option<&LibraryService>,
+        comic_ids: &[i64],
+    ) {
         let Some(service) = library_service else {
             app.library.status_text = Some("Library database unavailable".to_owned());
             return;
         };
-        if app.library.selected_ids.is_empty() {
+        if comic_ids.is_empty() {
             return;
         }
+        let id_set = comic_ids.iter().copied().collect::<HashSet<_>>();
 
         let targets = app
             .library
             .items
             .iter()
-            .filter(|item| app.library.selected_ids.contains(&item.comic_id))
+            .filter(|item| id_set.contains(&item.comic_id))
             .map(|item| {
                 (
                     item.comic_id,
@@ -2153,7 +2461,7 @@ impl LibraryRootControls {
                         cache_path_for_source(&self.thumbnail_cache_root, path, fingerprint);
                     let _ = std::fs::remove_file(&thumbnail);
                     self.thumbnail_textures
-                        .remove(&thumbnail.to_string_lossy().into_owned());
+                        .pop(thumbnail.to_string_lossy().as_ref());
                     self.pending_thumbnails.remove(path);
                 }
                 Ok(None) => {}
@@ -2165,7 +2473,6 @@ impl LibraryRootControls {
             Ok(items) => app.library.items = items,
             Err(error) => error_text = Some(error.to_string()),
         }
-        app.library.selected_ids.clear();
         app.library.refresh_filter_cache();
         app.library.status_text = Some(error_text.unwrap_or_else(|| {
             format!(
@@ -2252,15 +2559,26 @@ fn delete_store_file(path: &str, store_root: &Path) {
     }
 }
 
-fn import_status_text(added: usize, skipped: usize, error: Option<String>) -> String {
+fn import_status_text(
+    added: usize,
+    already_present: usize,
+    failed: usize,
+    error: Option<String>,
+) -> String {
     if let Some(error) = error {
         return error;
     }
-    let mut text = format!("Added {added} comic{}", if added == 1 { "" } else { "s" });
-    if skipped > 0 {
-        text.push_str(&format!(" ({skipped} skipped)"));
+    let mut parts = vec![format!(
+        "Added {added} comic{}",
+        if added == 1 { "" } else { "s" }
+    )];
+    if already_present > 0 {
+        parts.push(format!("{already_present} already present"));
     }
-    text
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    parts.join(", ")
 }
 
 pub fn scanned_comics_to_grid_items(
@@ -2292,7 +2610,10 @@ pub fn scanned_comics_to_grid_items(
             folder_key: std::path::Path::new(&comic.path)
                 .parent()
                 .map(|parent| parent.to_string_lossy().into_owned()),
+            writer: None,
+            number: None,
             is_read: false,
+            current_page: 0,
         })
         .collect()
 }
@@ -2309,11 +2630,30 @@ pub fn persist_scanned_comics_to_grid_items(
         .map_err(|error| format!("Library load failed: {error}"))
 }
 
+/// Directory the import dialogs should open in: the last used one, else cwd.
+fn import_pick_directory(config: &AppConfig) -> PathBuf {
+    config
+        .last_import_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Remembers the directory containing the picked file or folder so the next
+/// import dialog opens there.
+fn remember_import_dir(config: &mut AppConfig, picked: &Path) {
+    let dir = picked
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(picked);
+    config.last_import_dir = Some(dir.to_path_buf());
+}
+
 fn render_library_menu_bar(
     ctx: &egui::Context,
     app: &mut ComicReaderApp<egui::TextureHandle>,
     controls: &mut LibraryRootControls,
     settings: &mut SettingsWindowState,
+    config: &mut AppConfig,
     library_service: Option<&LibraryService>,
 ) {
     egui::TopBottomPanel::top("library_menu_bar")
@@ -2331,9 +2671,12 @@ fn render_library_menu_bar(
                         ui.close_menu();
                         if let Some(files) = rfd::FileDialog::new()
                             .add_filter("Comics", &["cbz", "cbr", "pdf"])
-                            .set_directory(".")
+                            .set_directory(import_pick_directory(config))
                             .pick_files()
                         {
+                            if let Some(first) = files.first() {
+                                remember_import_dir(config, first);
+                            }
                             controls.start_import_files(files);
                         }
                     }
@@ -2345,9 +2688,11 @@ fn render_library_menu_bar(
                         .clicked();
                     if add_folder {
                         ui.close_menu();
-                        if let Some(folder) =
-                            rfd::FileDialog::new().set_directory(".").pick_folder()
+                        if let Some(folder) = rfd::FileDialog::new()
+                            .set_directory(import_pick_directory(config))
+                            .pick_folder()
                         {
+                            remember_import_dir(config, &folder);
                             controls.start_import_folder(folder);
                         }
                     }
@@ -2421,12 +2766,67 @@ fn render_library_menu_bar(
         });
 }
 
+#[derive(Default)]
+struct FolderNode<'a> {
+    group: Option<&'a crate::library::LibraryGroup>,
+    children: std::collections::BTreeMap<&'a str, FolderNode<'a>>,
+}
+
+fn render_folder_tree_node(
+    ui: &mut egui::Ui,
+    name: &str,
+    node: &FolderNode,
+    next_filter: &mut Option<ActiveLibraryFilter>,
+) {
+    if node.children.is_empty() {
+        if let Some(group) = node.group {
+            ui.selectable_value(
+                next_filter,
+                Some(ActiveLibraryFilter { kind: group.kind, key: group.key.clone() }),
+                name,
+            );
+        }
+    } else {
+        egui::CollapsingHeader::new(name).default_open(false).show(ui, |ui| {
+            if let Some(group) = node.group {
+                ui.selectable_value(
+                    next_filter,
+                    Some(ActiveLibraryFilter { kind: group.kind, key: group.key.clone() }),
+                    "All in folder",
+                );
+            }
+            for (child_name, child_node) in &node.children {
+                render_folder_tree_node(ui, child_name, child_node, next_filter);
+            }
+        });
+    }
+}
+
+fn render_folder_tree(
+    ui: &mut egui::Ui,
+    folders: &[&crate::library::LibraryGroup],
+    next_filter: &mut Option<ActiveLibraryFilter>,
+) {
+    let mut root = FolderNode::default();
+    for folder in folders {
+        let parts: Vec<&str> = folder.key.split('/').filter(|s| !s.is_empty()).collect();
+        let mut current = &mut root;
+        for part in parts {
+            current = current.children.entry(part).or_default();
+        }
+        current.group = Some(folder);
+    }
+    for (name, node) in &root.children {
+        render_folder_tree_node(ui, name, node, next_filter);
+    }
+}
+
 fn render_library_shelf(
     ctx: &egui::Context,
     app: &mut ComicReaderApp<egui::TextureHandle>,
     controls: &mut LibraryRootControls,
 ) -> Option<LibraryItemEvent> {
-    let mut event = None;
+    let event = None;
     let mut shelf_open = controls.shelf_open;
     egui::SidePanel::left("library_shelf")
         .resizable(true)
@@ -2442,41 +2842,49 @@ fn render_library_shelf(
                 });
             });
             ui.separator();
-            let visible: Vec<LibraryGridItem> =
-                app.library.visible_items().cloned().collect();
-            if visible.is_empty() {
-                ui.label(egui::RichText::new("Library is empty").color(EDITOR_TEXT_MUTED));
-                return;
-            }
+            let mut next_filter = app.library.active_filter.clone();
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for item in &visible {
-                    let is_selected = app.library.selected_ids.contains(&item.comic_id)
-                        || app.library.selected_comic_id == Some(item.comic_id);
-                    let label = if item.is_read {
-                        egui::RichText::new(format!("✓ {}", item.title)).color(EDITOR_GREEN)
-                    } else {
-                        egui::RichText::new(&item.title)
-                    };
-                    let response = ui.selectable_label(is_selected, label);
-                    response.context_menu(|ui| {
-                        let menu_label = if item.is_read { "Mark as unread" } else { "Mark as read" };
-                        if ui.button(menu_label).clicked() {
-                            ui.close_menu();
-                            event = Some(LibraryItemEvent::SetRead {
-                                comic_id: item.comic_id,
-                                is_read: !item.is_read,
-                            });
-                        }
-                        if ui.button("Open file location").clicked() {
-                            ui.close_menu();
-                            open_file_location(&item.path);
+                if ui.selectable_value(&mut next_filter, None, "All comics").clicked() {
+                }
+
+                let groups = app.library.groups().to_vec();
+                let builtins = groups.iter().filter(|g| g.kind == LibraryGroupKind::Builtin);
+                for group in builtins {
+                    ui.selectable_value(
+                        &mut next_filter,
+                        Some(ActiveLibraryFilter { kind: group.kind, key: group.key.clone() }),
+                        group_label(group)
+                    );
+                }
+
+                let series = groups.iter().filter(|g| g.kind == LibraryGroupKind::Series).collect::<Vec<_>>();
+                if !series.is_empty() {
+                    ui.separator();
+                    egui::CollapsingHeader::new("Series").default_open(true).show(ui, |ui| {
+                        for group in series {
+                            ui.selectable_value(
+                                &mut next_filter,
+                                Some(ActiveLibraryFilter { kind: group.kind, key: group.key.clone() }),
+                                group_label(group)
+                            );
                         }
                     });
-                    if response.clicked() {
-                        event = Some(LibraryItemEvent::Open(item.clone()));
-                    }
+                }
+
+                let folders = groups.iter().filter(|g| g.kind == LibraryGroupKind::Folder).collect::<Vec<_>>();
+                if !folders.is_empty() {
+                    ui.separator();
+                    egui::CollapsingHeader::new("Folders").default_open(true).show(ui, |ui| {
+                        // Render folder tree
+                        render_folder_tree(ui, &folders, &mut next_filter);
+                    });
                 }
             });
+
+            if next_filter != app.library.active_filter {
+                app.library.active_filter = next_filter;
+                app.library.refresh_filter_cache();
+            }
         });
     controls.shelf_open = shelf_open;
     event
@@ -2515,13 +2923,13 @@ const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
     (
         "Navigation",
         &[
-            ("\u{2192}  /  Page Down", "Next page"),
-            ("\u{2190}  /  Page Up", "Previous page"),
+            ("\u{2192}  /  Page Down", "Next page (RTL: previous)"),
+            ("\u{2190}  /  Page Up", "Previous page (RTL: next)"),
             ("Space  /  \u{2193}", "Scroll down"),
             ("\u{2191}", "Scroll up"),
             ("Home", "First page"),
             ("End", "Last page"),
-            ("Esc", "Back to library"),
+            ("Esc", "Close window / back to library"),
         ],
     ),
     (
@@ -2538,6 +2946,24 @@ const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("V", "Toggle continuous scroll"),
             ("R", "Rotate right"),
             ("Shift + R", "Rotate left"),
+        ],
+    ),
+    (
+        "Panels and window",
+        &[
+            ("I", "Comic info panel"),
+            ("Tab", "Hide / show toolbars and sidebar"),
+            ("F11", "Toggle fullscreen"),
+        ],
+    ),
+    (
+        "Mouse",
+        &[
+            ("Click left / right side", "Previous / next page (direction-aware)"),
+            ("Scroll wheel", "Turn pages at fit zoom, pan when zoomed"),
+            ("Pinch  /  Ctrl + scroll", "Zoom at pointer"),
+            ("Drag", "Pan a zoomed page"),
+            ("Double-click center", "Reset zoom"),
         ],
     ),
     ("Bookmarks", &[("B", "Toggle bookmark on current page")]),
@@ -2578,6 +3004,7 @@ fn render_library_toolbar(
     ctx: &egui::Context,
     app: &mut ComicReaderApp<egui::TextureHandle>,
     controls: &mut LibraryRootControls,
+    config: &mut AppConfig,
 ) {
     egui::TopBottomPanel::top("library_toolbar")
         .frame(editor_toolbar_frame())
@@ -2592,15 +3019,21 @@ fn render_library_toolbar(
                     .clicked()
                     && let Some(files) = rfd::FileDialog::new()
                         .add_filter("Comics", &["cbz", "cbr", "pdf"])
-                        .set_directory(".")
+                        .set_directory(import_pick_directory(config))
                         .pick_files()
                 {
+                    if let Some(first) = files.first() {
+                        remember_import_dir(config, first);
+                    }
                     controls.start_import_files(files);
                 }
                 if icon_button_enabled(ui, !importing, icon::FOLDER_PLUS, "Add a folder\u{2026}")
                     .clicked()
-                    && let Some(folder) = rfd::FileDialog::new().set_directory(".").pick_folder()
+                    && let Some(folder) = rfd::FileDialog::new()
+                        .set_directory(import_pick_directory(config))
+                        .pick_folder()
                 {
+                    remember_import_dir(config, &folder);
                     controls.start_import_folder(folder);
                 }
 
@@ -2673,6 +3106,19 @@ fn render_library_filter_controls(
                 ui.selectable_value(&mut next_filter, None, "All comics");
                 for group in app.library.groups()
                     .iter()
+                    .filter(|group| group.kind == LibraryGroupKind::Builtin)
+                {
+                    ui.selectable_value(
+                        &mut next_filter,
+                        Some(ActiveLibraryFilter {
+                            kind: group.kind,
+                            key: group.key.clone(),
+                        }),
+                        group_label(group),
+                    );
+                }
+                for group in app.library.groups()
+                    .iter()
                     .filter(|group| group.kind == LibraryGroupKind::Series)
                 {
                     ui.selectable_value(
@@ -2698,6 +3144,36 @@ fn render_library_filter_controls(
                     );
                 }
             });
+
+        ui.add_space(16.0);
+        ui.label(icon_text(icon::MAGNIFYING_GLASS).color(EDITOR_GREEN));
+        let mut query = app.library.search_query.clone();
+        let search_response = ui.text_edit_singleline(&mut query);
+        if search_response.changed() {
+            app.library.search_query = query;
+            app.library.refresh_filter_cache();
+        }
+
+        ui.add_space(16.0);
+        ui.label("Sort by:");
+        let mut sort_option = app.library.sort_option;
+        egui::ComboBox::from_id_salt("library_sort")
+            .selected_text(match sort_option {
+                crate::app::LibrarySortOption::Title => "Title",
+                crate::app::LibrarySortOption::DateAdded => "Date Added",
+                crate::app::LibrarySortOption::Series => "Series",
+                crate::app::LibrarySortOption::Number => "Number",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut sort_option, crate::app::LibrarySortOption::Title, "Title");
+                ui.selectable_value(&mut sort_option, crate::app::LibrarySortOption::DateAdded, "Date Added");
+                ui.selectable_value(&mut sort_option, crate::app::LibrarySortOption::Series, "Series");
+                ui.selectable_value(&mut sort_option, crate::app::LibrarySortOption::Number, "Number");
+            });
+        if sort_option != app.library.sort_option {
+            app.library.sort_option = sort_option;
+            app.library.refresh_filter_cache();
+        }
     });
 
     if next_filter != app.library.active_filter {
@@ -2708,6 +3184,7 @@ fn render_library_filter_controls(
 
 fn group_label(group: &crate::library::LibraryGroup) -> String {
     let prefix = match group.kind {
+        LibraryGroupKind::Builtin => "Shelf",
         LibraryGroupKind::Series => "Series",
         LibraryGroupKind::Folder => "Folder",
     };
@@ -2728,7 +3205,7 @@ fn library_tile(
     ui: &mut egui::Ui,
     item: &LibraryGridItem,
     is_selected: bool,
-    thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
+    thumbnail_textures: &mut lru::LruCache<String, egui::TextureHandle>,
 ) -> Option<LibraryItemEvent> {
     let status = match &item.thumbnail_status {
         ThumbnailStatus::Missing => "No cover",
@@ -2740,6 +3217,9 @@ fn library_tile(
 
     ui.vertical(|ui| {
         ui.set_width(GRID_TILE_WIDTH);
+        // Constant tile height keeps every grid row uniform, which the
+        // virtualized scroll area's row estimate depends on.
+        ui.set_height(GRID_TILE_HEIGHT);
         let thumbnail_size = egui::vec2(GRID_TILE_WIDTH, 240.0);
         let response = match &item.thumbnail_status {
             ThumbnailStatus::Ready { cache_path } => {
@@ -2768,6 +3248,23 @@ fn library_tile(
             }
             _ => placeholder_cover_button(ui, thumbnail_size, status),
         };
+        // Truncated text is unreadable without a tooltip carrying the rest.
+        // The tile fits roughly 22 monospace characters per line.
+        let truncated = item.title.chars().count() > 22
+            || item
+                .subtitle
+                .as_ref()
+                .is_some_and(|subtitle| subtitle.chars().count() > 22);
+        let response = if truncated {
+            let mut hover = item.title.clone();
+            if let Some(subtitle) = &item.subtitle {
+                hover.push('\n');
+                hover.push_str(subtitle);
+            }
+            response.on_hover_text(hover)
+        } else {
+            response
+        };
         if is_selected {
             ui.painter().rect_stroke(
                 response.rect,
@@ -2777,13 +3274,23 @@ fn library_tile(
             );
         }
         let title_color = if is_selected { EDITOR_GREEN } else { EDITOR_TEXT };
-        ui.label(egui::RichText::new(ellipsize_text(&item.title, 42)).color(title_color));
+        // Single-line truncated labels keep the tile height constant.
+        ui.add(egui::Label::new(egui::RichText::new(&item.title).color(title_color)).truncate());
         if let Some(subtitle) = &item.subtitle {
-            ui.label(
-                egui::RichText::new(ellipsize_text(subtitle, 42))
-                    .color(EDITOR_TEXT_MUTED)
-                    .small(),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(subtitle).color(EDITOR_TEXT_MUTED).small(),
+                )
+                .truncate(),
             );
+        }
+        if item.is_read {
+            ui.label(egui::RichText::new("✓ Read").color(EDITOR_GREEN).small());
+        } else if item.current_page > 0 && item.page_count > 0 {
+            let progress = item.current_page as f32 / item.page_count as f32;
+            ui.add(egui::ProgressBar::new(progress).desired_width(GRID_TILE_WIDTH));
+        } else {
+            ui.label(egui::RichText::new("Unread").color(EDITOR_TEXT_MUTED).small());
         }
         if item.is_read {
             paint_read_badge(ui, response.rect);
@@ -2801,6 +3308,13 @@ fn library_tile(
             if ui.button("Open file location").clicked() {
                 ui.close_menu();
                 open_file_location(&item.path);
+            }
+            ui.separator();
+            if ui.button("Remove from library").clicked() {
+                ui.close_menu();
+                event = Some(LibraryItemEvent::Remove {
+                    comic_id: item.comic_id,
+                });
             }
         });
         if response.clicked() {
@@ -2842,7 +3356,7 @@ fn library_list_row(
     ui: &mut egui::Ui,
     item: &LibraryGridItem,
     is_selected: bool,
-    thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
+    thumbnail_textures: &mut lru::LruCache<String, egui::TextureHandle>,
 ) -> Option<LibraryItemEvent> {
     let row_height = LIST_THUMBNAIL_HEIGHT + 8.0;
     let available_width = ui.available_width();
@@ -2900,14 +3414,23 @@ fn library_list_row(
             EDITOR_PURPLE,
         );
     }
+    let mut meta = format!(
+        "{} page{}",
+        item.page_count,
+        if item.page_count == 1 { "" } else { "s" }
+    );
+    if let Some(series) = &item.series {
+        meta.push_str("  |  ");
+        meta.push_str(series);
+    }
+    if let Some(writer) = &item.writer {
+        meta.push_str("  |  ");
+        meta.push_str(writer);
+    }
     painter.text(
         meta_pos,
         egui::Align2::LEFT_TOP,
-        format!(
-            "{} page{}",
-            item.page_count,
-            if item.page_count == 1 { "" } else { "s" }
-        ),
+        ellipsize_text(&meta, 100),
         egui::FontId::monospace(12.0),
         EDITOR_CYAN,
     );
@@ -2920,7 +3443,22 @@ fn library_list_row(
             egui::FontId::proportional(12.0),
             EDITOR_GREEN,
         );
+    } else if item.current_page > 0 && item.page_count > 0 {
+        let percent = (item.current_page as f32 / item.page_count as f32 * 100.0).round();
+        painter.text(
+            egui::pos2(rect.right() - 12.0, rect.top() + 12.0),
+            egui::Align2::RIGHT_TOP,
+            format!("{percent:.0}%"),
+            egui::FontId::proportional(12.0),
+            EDITOR_ORANGE,
+        );
     }
+
+    let response = if item.title.chars().count() > 80 {
+        response.on_hover_text(item.title.clone())
+    } else {
+        response
+    };
 
     let mut event: Option<LibraryItemEvent> = None;
     response.context_menu(|ui| {
@@ -2936,6 +3474,13 @@ fn library_list_row(
             ui.close_menu();
             open_file_location(&item.path);
         }
+        ui.separator();
+        if ui.button("Remove from library").clicked() {
+            ui.close_menu();
+            event = Some(LibraryItemEvent::Remove {
+                comic_id: item.comic_id,
+            });
+        }
     });
     if response.clicked() {
         event = Some(LibraryItemEvent::Open(item.clone()));
@@ -2946,7 +3491,7 @@ fn library_list_row(
 fn paint_list_thumbnail(
     ui: &mut egui::Ui,
     item: &LibraryGridItem,
-    thumbnail_textures: &mut HashMap<String, egui::TextureHandle>,
+    thumbnail_textures: &mut lru::LruCache<String, egui::TextureHandle>,
     rect: egui::Rect,
 ) {
     ui.painter().rect_filled(rect, 3.0, EDITOR_PANEL_DARK);
@@ -3097,6 +3642,7 @@ pub struct EguiComicReaderApp {
     pub library_service: Option<LibraryService>,
     pub settings: SettingsWindowState,
     last_checkpointed_progress: Option<ProgressSnapshot>,
+    last_window_title: Option<String>,
 }
 
 impl EguiComicReaderApp {
@@ -3123,6 +3669,7 @@ impl EguiComicReaderApp {
             library_service,
             settings: SettingsWindowState::default(),
             last_checkpointed_progress: None,
+            last_window_title: None,
         };
         app.hydrate_library_from_service();
         if app.config.resume_last_session {
@@ -3145,6 +3692,7 @@ impl EguiComicReaderApp {
             library_service: Some(library_service),
             settings: SettingsWindowState::default(),
             last_checkpointed_progress: None,
+            last_window_title: None,
         };
         app.hydrate_library_from_service();
         if app.config.resume_last_session {
@@ -3257,6 +3805,11 @@ impl EguiComicReaderApp {
 
         match service.save_progress(snapshot.comic_id, snapshot.current_page, snapshot.is_read) {
             Ok(_) => {
+                if let Some(item) = self.inner.library.items.iter_mut().find(|item| item.comic_id == snapshot.comic_id) {
+                    item.current_page = snapshot.current_page;
+                    item.is_read = snapshot.is_read;
+                }
+                self.inner.library.refresh_filter_cache();
                 // Persist the resume flag to disk on the first checkpoint so a hard exit
                 // (no save hook) still reopens this comic on next launch.
                 let needs_config_save = !self.config.resume_last_session;
@@ -3284,6 +3837,33 @@ impl EguiComicReaderApp {
             .apply_reading_direction(self.config.reading_direction);
         if let Some(reading) = &mut self.inner.reading {
             reading.viewer_state.zoom_sensitivity = self.config.zoom_sensitivity;
+        }
+    }
+
+    /// Shows the active comic and reading position in the window title.
+    fn sync_window_title(&mut self, ctx: &egui::Context) {
+        let title = match (&self.inner.state, &self.inner.reading) {
+            (AppState::Reading(comic_id), Some(session)) => {
+                let name = self
+                    .inner
+                    .library
+                    .items
+                    .iter()
+                    .find(|item| item.comic_id == *comic_id)
+                    .map(|item| item.title.as_str())
+                    .unwrap_or("Reading");
+                format!(
+                    "{} - {}/{} - cbr-egui",
+                    name,
+                    session.current_page_index + 1,
+                    session.page_count
+                )
+            }
+            _ => "cbr-egui".to_owned(),
+        };
+        if self.last_window_title.as_deref() != Some(title.as_str()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_window_title = Some(title);
         }
     }
 
@@ -3367,10 +3947,12 @@ impl eframe::App for EguiComicReaderApp {
             &mut self.inner,
             &mut self.library_controls,
             &mut self.settings,
+            &mut self.config,
             self.library_service.as_ref(),
         );
         self.reconcile_resume_state_after_route(was_reading);
         let _ = self.checkpoint_active_progress();
+        self.sync_window_title(ctx);
         self.render_settings_window(ctx);
     }
 
@@ -3389,6 +3971,7 @@ impl EguiComicReaderApp {
             library_service: None,
             settings: SettingsWindowState::default(),
             last_checkpointed_progress: None,
+            last_window_title: None,
         }
     }
 }

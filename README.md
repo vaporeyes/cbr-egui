@@ -36,13 +36,13 @@ Help > Keyboard Shortcuts.
 
 | Key | Action |
 |-----|--------|
-| `Right` / `Page Down` | Next page |
-| `Left` / `Page Up` | Previous page |
+| `Right` / `Page Down` | Next page (RTL: previous) |
+| `Left` / `Page Up` | Previous page (RTL: next) |
 | `Space` / `Down` | Scroll down |
 | `Up` | Scroll up |
 | `Home` | First page |
 | `End` | Last page |
-| `Esc` | Back to library |
+| `Esc` | Close window / back to library |
 
 ### View and zoom
 
@@ -59,6 +59,24 @@ Help > Keyboard Shortcuts.
 | `V` | Toggle continuous scroll |
 | `R` | Rotate right |
 | `Shift` + `R` | Rotate left |
+
+### Panels and window
+
+| Key | Action |
+|-----|--------|
+| `I` | Comic info panel |
+| `Tab` | Hide / show toolbars and sidebar |
+| `F11` | Toggle fullscreen |
+
+### Mouse
+
+| Input | Action |
+|-------|--------|
+| Click left / right side | Previous / next page (direction-aware) |
+| Scroll wheel | Turn pages at fit zoom, pan when zoomed |
+| Pinch / `Ctrl` + scroll | Zoom at pointer |
+| Drag | Pan a zoomed page |
+| Double-click center | Reset zoom |
 
 ### Bookmarks
 

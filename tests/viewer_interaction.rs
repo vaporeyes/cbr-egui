@@ -1,6 +1,7 @@
 use cbr_egui::viewer::{
-    PageId, Point2, ReadingLayoutMode, Size2, ViewerState, ZoomAnchor, ZoomPanState,
-    anchor_for_viewport, build_virtual_canvas, clamp_pan, pan_bounds, scroll_top_for_anchor,
+    DEFAULT_FIT_ZOOM, PageId, Point2, ReadingLayoutMode, Size2, ViewerState, ZoomAnchor,
+    ZoomPanState, anchor_for_viewport, build_virtual_canvas, clamp_pan, pan_bounds,
+    scroll_top_for_anchor,
 };
 use std::collections::HashMap;
 
@@ -80,7 +81,7 @@ fn keyboard_zoom_uses_center_anchor_and_reset_clears_pan() {
     assert_point_close(zoom_pan.pan_offset, Point2::new(100.0, -25.0));
 
     zoom_pan.reset_zoom();
-    assert_eq!(zoom_pan.zoom, zoom_pan.min_zoom);
+    assert_eq!(zoom_pan.zoom, DEFAULT_FIT_ZOOM);
     assert_eq!(zoom_pan.pan_offset, Point2::ZERO);
 }
 
@@ -139,7 +140,7 @@ fn page_identity_change_resets_zoom_and_pan() {
     assert_ne!(zoom_pan.pan_offset, Point2::ZERO);
 
     zoom_pan.reset_for_page(PageId(1));
-    assert_eq!(zoom_pan.zoom, zoom_pan.min_zoom);
+    assert_eq!(zoom_pan.zoom, DEFAULT_FIT_ZOOM);
     assert_eq!(zoom_pan.pan_offset, Point2::ZERO);
     assert_eq!(zoom_pan.reset_generation, 1);
 }
@@ -176,7 +177,7 @@ fn viewer_current_page_reset_ignores_stale_input_state() {
     state.set_current_page(PageId(2));
 
     assert_eq!(state.current_page_id, Some(PageId(2)));
-    assert_eq!(state.zoom_pan.zoom, state.zoom_pan.min_zoom);
+    assert_eq!(state.zoom_pan.zoom, DEFAULT_FIT_ZOOM);
     assert_eq!(state.zoom_pan.pan_offset, Point2::ZERO);
     assert_eq!(state.zoom_pan.reset_generation, 2);
 
@@ -201,7 +202,7 @@ fn spread_composition_change_resets_zoom_and_pan() {
     state.set_next_ready(PageId(3), "right", Size2::new(800.0, 1200.0));
     state.recompute_spread_decision(Some(PageId(3)));
 
-    assert_eq!(state.zoom_pan.zoom, state.zoom_pan.min_zoom);
+    assert_eq!(state.zoom_pan.zoom, DEFAULT_FIT_ZOOM);
     assert_eq!(state.zoom_pan.pan_offset, Point2::ZERO);
 }
 

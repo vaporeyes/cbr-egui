@@ -29,6 +29,7 @@ fn config_round_trips_to_json_file() {
         dark_mode: false,
         reading_direction: ReadingDirection::RightToLeft,
         resume_last_session: true,
+        last_import_dir: None,
     };
 
     config.save(&path).expect("save");
@@ -85,6 +86,7 @@ fn app_lifecycle_save_writes_config_file() {
         dark_mode: false,
         reading_direction: ReadingDirection::RightToLeft,
         resume_last_session: true,
+        last_import_dir: None,
     };
     let mut storage = MemoryStorage::default();
 

@@ -34,12 +34,23 @@ pub enum LibraryViewMode {
     List,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LibrarySortOption {
+    #[default]
+    Title,
+    DateAdded,
+    Series,
+    Number,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LibraryViewState {
     pub items: Vec<LibraryGridItem>,
     pub selected_comic_id: Option<i64>,
     pub status_text: Option<String>,
     pub view_mode: LibraryViewMode,
+    pub sort_option: LibrarySortOption,
+    pub search_query: String,
     pub active_filter: Option<ActiveLibraryFilter>,
     pub select_mode: bool,
     pub selected_ids: HashSet<i64>,
@@ -331,6 +342,10 @@ pub struct ReadingSession<T> {
     pub texture_cache: PageTextureCache<CachedPage<T>>,
     pub decode_worker_pool: Option<WorkerPool>,
     pub continuous_scroll: ContinuousScrollState,
+    /// Inputs of the last continuous canvas build (measurements version,
+    /// texture cache version, viewport width bits, page count); rebuilds are
+    /// skipped while these are unchanged.
+    pub continuous_layout_stamp: Option<(u64, u64, u32, usize)>,
     pub archive_cache: ReadingArchiveCache,
     pub goto_input: String,
     pub bookmarks: BTreeSet<usize>,
@@ -339,6 +354,9 @@ pub struct ReadingSession<T> {
     pub adjustments: ImageAdjustments,
     pub show_adjustments: bool,
     pub show_page_sidebar: bool,
+    /// Last page the sidebar auto-scrolled to; the sidebar follows navigation
+    /// only when this falls behind the current page.
+    pub sidebar_tracked_page: Option<usize>,
     pub page_thumbnails: HashMap<usize, T>,
     pub pending_page_thumbnails: HashSet<usize>,
     pub failed_page_thumbnails: HashSet<usize>,
@@ -359,6 +377,7 @@ impl<T> ReadingSession<T> {
             texture_cache: PageTextureCache::with_default_capacity(),
             decode_worker_pool: WorkerPool::start(2, 16).ok(),
             continuous_scroll: ContinuousScrollState::new(),
+            continuous_layout_stamp: None,
             archive_cache: ReadingArchiveCache::default(),
             goto_input: String::new(),
             bookmarks: BTreeSet::new(),
@@ -367,6 +386,7 @@ impl<T> ReadingSession<T> {
             adjustments: ImageAdjustments::default(),
             show_adjustments: false,
             show_page_sidebar: true,
+            sidebar_tracked_page: None,
             page_thumbnails: HashMap::new(),
             pending_page_thumbnails: HashSet::new(),
             failed_page_thumbnails: HashSet::new(),
@@ -397,6 +417,7 @@ impl<T> ReadingSession<T> {
             texture_cache: PageTextureCache::new(cache_capacity)?,
             decode_worker_pool: WorkerPool::start(2, 16).ok(),
             continuous_scroll: ContinuousScrollState::new(),
+            continuous_layout_stamp: None,
             archive_cache: ReadingArchiveCache::default(),
             goto_input: String::new(),
             bookmarks: BTreeSet::new(),
@@ -405,6 +426,7 @@ impl<T> ReadingSession<T> {
             adjustments: ImageAdjustments::default(),
             show_adjustments: false,
             show_page_sidebar: true,
+            sidebar_tracked_page: None,
             page_thumbnails: HashMap::new(),
             pending_page_thumbnails: HashSet::new(),
             failed_page_thumbnails: HashSet::new(),
@@ -422,6 +444,14 @@ impl<T> ReadingSession<T> {
         self.current_page_index = next_page_index;
         self.viewer_state
             .set_current_page(PageId(self.current_page_index as u64));
+    }
+
+    /// Tracks the page the continuous-scroll viewport is on. Unlike
+    /// `set_current_page` this must not advance the prefetch generation
+    /// (which would drop in-flight decodes for the same scroll burst) and
+    /// must not reset paged-mode zoom/pan state.
+    pub fn sync_continuous_current_page(&mut self, page_index: usize) {
+        self.current_page_index = page_index.min(self.page_count.saturating_sub(1));
     }
 
     /// Changes the page rotation and invalidates everything derived from the
@@ -532,20 +562,39 @@ impl<T> ComicReaderApp<T> {
         if !self.open_grid_item(item) {
             return false;
         }
-        if let Ok(Some(progress)) = service.get_progress(item.comic_id) {
-            let last_index = item.page_count.saturating_sub(1) as usize;
-            let target = (progress.current_page as usize).min(last_index);
+        self.hydrate_session_from_service(service, item.comic_id, item.page_count);
+        true
+    }
+
+    /// Restores persisted session state (reading position, metadata,
+    /// bookmarks) for the active session. Shared by library opens and the
+    /// startup resume path so both show the same state.
+    fn hydrate_session_from_service(
+        &mut self,
+        service: &LibraryService,
+        comic_id: i64,
+        page_count: u32,
+    ) {
+        if let Ok(Some(progress)) = service.get_progress(comic_id) {
+            let last_index = page_count.saturating_sub(1) as usize;
+            // A finished comic restarts from the beginning instead of
+            // reopening on its last page.
+            let target = if progress.is_read {
+                0
+            } else {
+                (progress.current_page as usize).min(last_index)
+            };
             if let Some(reading) = &mut self.reading {
                 reading.set_current_page(target);
             }
         }
-        if let Ok(Some(row)) = service.get_comic_row(item.comic_id) {
+        if let Ok(Some(row)) = service.get_comic_row(comic_id) {
             if let Some(reading) = &mut self.reading {
                 reading.metadata = Some(row.metadata);
             }
         }
         if let Some(reading) = &mut self.reading {
-            match service.list_bookmarks(item.comic_id) {
+            match service.list_bookmarks(comic_id) {
                 Ok(bookmarks) => {
                     reading.bookmarks = bookmarks
                         .into_iter()
@@ -559,7 +608,6 @@ impl<T> ComicReaderApp<T> {
             }
             reading.bookmarks_loaded = true;
         }
-        true
     }
 
     pub fn set_comic_read(
@@ -581,6 +629,7 @@ impl<T> ComicReaderApp<T> {
         {
             item.is_read = is_read;
         }
+        self.library.refresh_filter_cache();
         Ok(())
     }
 
@@ -602,16 +651,14 @@ impl<T> ComicReaderApp<T> {
     }
 
     pub fn resume_last_session(&mut self, service: &LibraryService) -> Result<bool, LibraryError> {
-        let Some((comic, progress)) = service.last_read_comic()? else {
+        let Some((comic, _progress)) = service.last_read_comic()? else {
             return Ok(false);
         };
         if comic.availability != ComicAvailability::Available || comic.page_count == 0 {
             return Ok(false);
         }
         self.open_comic(comic.id, comic.page_count as usize);
-        if let Some(reading) = &mut self.reading {
-            reading.set_current_page(progress.current_page as usize);
-        }
+        self.hydrate_session_from_service(service, comic.id, comic.page_count);
         Ok(true)
     }
 
@@ -646,15 +693,30 @@ impl LibraryViewState {
         self.selected_ids.retain(|id| existing_ids.contains(id));
         self.groups = self.build_groups();
         self.reconcile_active_filter();
+        let query = self.search_query.to_lowercase();
         self.visible_indices = self
             .items
             .iter()
             .enumerate()
             .filter_map(|(index, item)| {
+                if !query.is_empty() {
+                    let title_match = item.title.to_lowercase().contains(&query);
+                    let series_match = item.series.as_deref().map_or(false, |s| s.to_lowercase().contains(&query));
+                    let writer_match = item.writer.as_deref().map_or(false, |w| w.to_lowercase().contains(&query));
+                    if !title_match && !series_match && !writer_match {
+                        return None;
+                    }
+                }
                 let Some(active_filter) = &self.active_filter else {
                     return Some(index);
                 };
                 let matches_filter = match active_filter.kind {
+                    LibraryGroupKind::Builtin => match active_filter.key.as_str() {
+                        "continue_reading" => !item.is_read && item.current_page > 0,
+                        "unread" => !item.is_read && item.current_page == 0,
+                        "read" => item.is_read,
+                        _ => false,
+                    },
                     LibraryGroupKind::Series => {
                         item.series_key.as_deref() == Some(active_filter.key.as_str())
                     }
@@ -665,6 +727,30 @@ impl LibraryViewState {
                 matches_filter.then_some(index)
             })
             .collect();
+        // Natural ordering so "Issue 2" sorts before "Issue 10".
+        match self.sort_option {
+            LibrarySortOption::Title => self
+                .visible_indices
+                .sort_by(|&a, &b| natord::compare(&self.items[a].title, &self.items[b].title)),
+            LibrarySortOption::DateAdded => self.visible_indices.sort_by(|&a, &b| self.items[b].comic_id.cmp(&self.items[a].comic_id)),
+            LibrarySortOption::Series => self.visible_indices.sort_by(|&a, &b| {
+                let s_a = self.items[a].series.as_deref().unwrap_or("");
+                let s_b = self.items[b].series.as_deref().unwrap_or("");
+                natord::compare(s_a, s_b)
+                    .then_with(|| natord::compare(&self.items[a].title, &self.items[b].title))
+            }),
+            LibrarySortOption::Number => self.visible_indices.sort_by(|&a, &b| {
+                let n_a = self.items[a].number.as_deref().unwrap_or("");
+                let n_b = self.items[b].number.as_deref().unwrap_or("");
+                // Comics without a number sort after numbered ones.
+                match (n_a.is_empty(), n_b.is_empty()) {
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    _ => natord::compare(n_a, n_b)
+                        .then_with(|| natord::compare(&self.items[a].title, &self.items[b].title)),
+                }
+            }),
+        }
     }
 
     pub fn groups(&self) -> &[LibraryGroup] {
@@ -713,6 +799,33 @@ impl LibraryViewState {
         }
 
         let mut groups = groups.into_values().collect::<Vec<_>>();
+        let continue_reading_count = self.items.iter().filter(|i| !i.is_read && i.current_page > 0).count();
+        if continue_reading_count > 0 {
+            groups.push(LibraryGroup {
+                kind: LibraryGroupKind::Builtin,
+                key: "continue_reading".to_owned(),
+                label: "Continue Reading".to_owned(),
+                item_count: continue_reading_count,
+            });
+        }
+        let unread_count = self.items.iter().filter(|i| !i.is_read && i.current_page == 0).count();
+        if unread_count > 0 {
+            groups.push(LibraryGroup {
+                kind: LibraryGroupKind::Builtin,
+                key: "unread".to_owned(),
+                label: "Unread".to_owned(),
+                item_count: unread_count,
+            });
+        }
+        let read_count = self.items.iter().filter(|i| i.is_read).count();
+        if read_count > 0 {
+            groups.push(LibraryGroup {
+                kind: LibraryGroupKind::Builtin,
+                key: "read".to_owned(),
+                label: "Read".to_owned(),
+                item_count: read_count,
+            });
+        }
         groups.sort_by(|a, b| {
             a.kind
                 .cmp(&b.kind)

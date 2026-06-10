@@ -12,6 +12,7 @@ pub struct AppConfig {
     pub dark_mode: bool,
     pub reading_direction: ReadingDirection,
     pub resume_last_session: bool,
+    pub last_import_dir: Option<PathBuf>,
 }
 
 impl Default for AppConfig {
@@ -21,6 +22,7 @@ impl Default for AppConfig {
             dark_mode: true,
             reading_direction: ReadingDirection::LeftToRight,
             resume_last_session: false,
+            last_import_dir: None,
         }
     }
 }

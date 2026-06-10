@@ -386,6 +386,19 @@ impl LibraryStorage {
         Ok(ids)
     }
 
+    pub fn list_progress(&self) -> Result<std::collections::HashMap<i64, Progress>, LibraryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT comic_id, current_page, is_read, updated_at FROM progress",
+        )?;
+        let progress_iter = statement.query_map([], progress_from_row)?;
+        let mut map = std::collections::HashMap::new();
+        for progress in progress_iter {
+            let progress = progress?;
+            map.insert(progress.comic_id, progress);
+        }
+        Ok(map)
+    }
+
     pub fn progress_count_for_comic(&self, comic_id: i64) -> Result<u32, LibraryError> {
         let count = self.connection.query_row(
             "SELECT COUNT(*) FROM progress WHERE comic_id = ?1",

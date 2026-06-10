@@ -145,11 +145,15 @@ pub struct LibraryGridItem {
     pub series_key: Option<String>,
     pub folder_label: Option<String>,
     pub folder_key: Option<String>,
+    pub writer: Option<String>,
+    pub number: Option<String>,
     pub is_read: bool,
+    pub current_page: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LibraryGroupKind {
+    Builtin,
     Series,
     Folder,
 }

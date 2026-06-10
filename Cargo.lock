@@ -804,6 +804,7 @@ dependencies = [
  "eframe",
  "egui-phosphor",
  "image",
+ "itertools",
  "lru",
  "natord",
  "pdfium-render",

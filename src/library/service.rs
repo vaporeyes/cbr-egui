@@ -148,7 +148,7 @@ impl LibraryService {
     }
 
     pub fn library_grid_items(&self) -> Result<Vec<LibraryGridItem>, LibraryError> {
-        let read_ids = self.storage.list_read_comic_ids()?;
+        let progress_map = self.storage.list_progress()?;
         Ok(self
             .storage
             .list_library_comic_rows()?
@@ -157,7 +157,9 @@ impl LibraryService {
                 let comic = row.comic;
                 let folder = folder_parts(&comic.path);
                 let series = clean_string(row.metadata.series.clone());
-                let is_read = read_ids.contains(&comic.id);
+                let progress = progress_map.get(&comic.id);
+                let is_read = progress.map_or(false, |p| p.is_read);
+                let current_page = progress.map_or(0, |p| p.current_page);
                 LibraryGridItem {
                     comic_id: comic.id,
                     title: std::path::Path::new(&comic.path)
@@ -178,7 +180,10 @@ impl LibraryService {
                     series,
                     folder_label: folder.clone().map(|(label, _)| label),
                     folder_key: folder.map(|(_, key)| key),
+                    writer: row.metadata.writer.clone(),
+                    number: row.metadata.number.clone(),
                     is_read,
+                    current_page,
                 }
             })
             .collect())

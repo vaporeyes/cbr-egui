@@ -3,13 +3,17 @@ use eframe::egui;
 use crate::viewer::layout::{
     Point2, Size2, ViewMode, page_display_size, spread_display_size, spread_page_sizes,
 };
-use crate::viewer::spread::{ReadingLayoutMode, SpreadDecision, ordered_spread_pages};
+use crate::viewer::spread::{
+    ReadingDirection, ReadingLayoutMode, SpreadDecision, ordered_spread_pages,
+};
 use crate::viewer::state::{
     ContinuousPageStatus, PageNavigationCommand, PageStatus, ViewCommand, ViewerState, ZoomAnchor,
     corrupted_page_color_image,
 };
 
 const KEYBOARD_ZOOM_STEP: f32 = 1.2;
+/// Accumulated plain-wheel scroll (points) required to turn a page at fit zoom.
+const WHEEL_PAGE_TURN_THRESHOLD: f32 = 60.0;
 
 pub fn render_viewer_panel(ctx: &egui::Context, state: &mut ViewerState<egui::TextureHandle>) {
     egui::CentralPanel::default()
@@ -57,10 +61,16 @@ fn render_ready_page(
 
     state.zoom_pan.clamp_pan(display_size, viewport);
 
-    let scroll_delta = ui.input(|input| input.smooth_scroll_delta.y);
+    // Pinch and ctrl/cmd+scroll zoom; the plain wheel turns pages at fit zoom
+    // and pans when zoomed in, like most comic readers.
+    let zoom_delta = ui.input(|input| input.zoom_delta());
+    let scroll_delta = ui.input(|input| input.smooth_scroll_delta);
     let mut drag_delta = egui::Vec2::ZERO;
     let mut pending_zoom: Option<(f32, ZoomAnchor)> = None;
     let mut reset_zoom = false;
+    let mut click_navigation: Option<PageNavigationCommand> = None;
+    let mut wheel_pan = egui::Vec2::ZERO;
+    let mut wheel_page_delta = 0.0_f32;
 
     egui::ScrollArea::both()
         .auto_shrink([false, false])
@@ -72,18 +82,42 @@ fn render_ready_page(
                 display_size.height.max(viewport.height),
             );
 
-            let (rect, response) = ui.allocate_exact_size(canvas_size, egui::Sense::drag());
+            let (rect, response) =
+                ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
             paint_current_page_or_spread(ui, state, texture, pixel_size, rect, image_size, offset);
 
-            if response.hovered() && scroll_delta != 0.0 {
-                let factor = scroll_zoom_factor(scroll_delta, state.zoom_sensitivity);
-                let anchor = ui
-                    .input(|input| input.pointer.hover_pos())
-                    .map(|pos| zoom_anchor_for_pointer(pos, rect))
-                    .unwrap_or(ZoomAnchor::CENTER);
-                pending_zoom = Some((factor, anchor));
+            // Click zones are relative to the visible viewport, not the
+            // virtual canvas, so they stay under the cursor while zoomed.
+            let visible = ui.clip_rect();
+            if response.hovered() {
+                if zoom_delta != 1.0 {
+                    let factor = sensitivity_scaled_zoom(zoom_delta, state.zoom_sensitivity);
+                    let anchor = ui
+                        .input(|input| input.pointer.hover_pos())
+                        .map(|pos| zoom_anchor_for_pointer(pos, rect))
+                        .unwrap_or(ZoomAnchor::CENTER);
+                    pending_zoom = Some((factor, anchor));
+                }
+                if scroll_delta != egui::Vec2::ZERO {
+                    if state.zoom_pan.zoom > crate::viewer::state::DEFAULT_FIT_ZOOM {
+                        wheel_pan = scroll_delta;
+                    } else {
+                        wheel_page_delta = scroll_delta.y;
+                    }
+                }
             }
-            if response.double_clicked() {
+            if response.clicked()
+                && let Some(pos) = response.interact_pointer_pos()
+            {
+                click_navigation =
+                    click_zone_navigation(pos, visible, state.reading_direction);
+            }
+            if response.double_clicked()
+                && let Some(pos) = response.interact_pointer_pos()
+                && click_zone_navigation(pos, visible, state.reading_direction).is_none()
+            {
+                // Only the middle dead zone resets zoom; the side zones are
+                // page-turn targets.
                 reset_zoom = true;
             }
             if response.dragged() {
@@ -103,8 +137,53 @@ fn render_ready_page(
             .zoom_pan
             .apply_drag_pan([drag_delta.x, drag_delta.y], display_size, viewport);
     }
+    if wheel_pan != egui::Vec2::ZERO {
+        state
+            .zoom_pan
+            .apply_drag_pan([wheel_pan.x, wheel_pan.y], display_size, viewport);
+    }
+
+    if let Some(command) = click_navigation {
+        state.pending_navigation = Some(command);
+    } else if wheel_page_delta != 0.0 {
+        state.wheel_page_accumulator += wheel_page_delta;
+        if state.wheel_page_accumulator <= -WHEEL_PAGE_TURN_THRESHOLD {
+            state.pending_navigation = Some(PageNavigationCommand::NextPage);
+            state.wheel_page_accumulator = 0.0;
+        } else if state.wheel_page_accumulator >= WHEEL_PAGE_TURN_THRESHOLD {
+            state.pending_navigation = Some(PageNavigationCommand::PreviousPage);
+            state.wheel_page_accumulator = 0.0;
+        }
+    }
 
     render_status_chrome(ui, state);
+}
+
+/// Maps a click inside the visible viewport to a page-turn command. The outer
+/// 40% bands navigate (direction-aware); the middle 20% is a dead zone.
+fn click_zone_navigation(
+    pos: egui::Pos2,
+    visible: egui::Rect,
+    direction: ReadingDirection,
+) -> Option<PageNavigationCommand> {
+    let fraction = ((pos.x - visible.left()) / visible.width().max(1.0)).clamp(0.0, 1.0);
+    let towards_right = if direction == ReadingDirection::LeftToRight {
+        PageNavigationCommand::NextPage
+    } else {
+        PageNavigationCommand::PreviousPage
+    };
+    let towards_left = if direction == ReadingDirection::LeftToRight {
+        PageNavigationCommand::PreviousPage
+    } else {
+        PageNavigationCommand::NextPage
+    };
+    if fraction < 0.4 {
+        Some(towards_left)
+    } else if fraction > 0.6 {
+        Some(towards_right)
+    } else {
+        None
+    }
 }
 
 fn apply_pending_view_command(
@@ -181,14 +260,15 @@ fn render_continuous_page_flow(ui: &mut egui::Ui, state: &mut ViewerState<egui::
         .show_viewport(ui, |ui, viewport| {
             let (canvas_rect, _response) =
                 ui.allocate_exact_size(canvas_size, egui::Sense::hover());
+            let mut viewport_top = viewport.top().max(0.0);
             if let Some(scroll_top) = state.continuous_pending_scroll_top.take() {
                 let restore_rect = egui::Rect::from_min_size(
                     egui::pos2(canvas_rect.left(), canvas_rect.top() + scroll_top.max(0.0)),
                     egui::vec2(1.0, 1.0),
                 );
                 ui.scroll_to_rect(restore_rect, Some(egui::Align::Min));
+                viewport_top = scroll_top.max(0.0);
             }
-            let viewport_top = viewport.top().max(0.0);
             let window =
                 crate::viewer::visible_page_window(&canvas, viewport_top, viewport.height());
             let pages_to_paint = window.all_pages();
@@ -246,13 +326,16 @@ fn one_to_one_zoom(base_display_size: Size2, pixel_size: Size2) -> f32 {
     (pixel_size.width / base_display_size.width).max(pixel_size.height / base_display_size.height)
 }
 
-fn scroll_zoom_factor(scroll_delta: f32, sensitivity: f32) -> f32 {
+/// Scales a multiplicative zoom factor (from pinch or ctrl+scroll) by the
+/// configured sensitivity. At the default sensitivity the factor is unchanged.
+fn sensitivity_scaled_zoom(zoom_delta: f32, sensitivity: f32) -> f32 {
     let sensitivity = if sensitivity.is_finite() && sensitivity > 0.0 {
         sensitivity
     } else {
         crate::viewer::state::DEFAULT_SCROLL_ZOOM_SENSITIVITY
     };
-    (scroll_delta * sensitivity).exp()
+    let exponent = sensitivity / crate::viewer::state::DEFAULT_SCROLL_ZOOM_SENSITIVITY;
+    zoom_delta.powf(exponent)
 }
 
 fn zoom_anchor_for_pointer(pointer: egui::Pos2, canvas: egui::Rect) -> ZoomAnchor {
@@ -344,10 +427,21 @@ fn paint_current_page_or_spread(
 }
 
 fn handle_keybindings(ui: &mut egui::Ui, state: &mut ViewerState<egui::TextureHandle>) {
+    // A focused text field (go-to-page, search) owns the keyboard; letting
+    // shortcuts fire while typing turns "12" into view commands.
+    if ui.ctx().wants_keyboard_input() {
+        return;
+    }
+    // Horizontal arrows follow the reading direction: in RTL (manga) the
+    // left arrow advances. PageUp/PageDown stay logical previous/next.
+    let (forward_key, backward_key) = match state.reading_direction {
+        ReadingDirection::LeftToRight => (egui::Key::ArrowRight, egui::Key::ArrowLeft),
+        ReadingDirection::RightToLeft => (egui::Key::ArrowLeft, egui::Key::ArrowRight),
+    };
     ui.input(|input| {
-        if input.key_pressed(egui::Key::ArrowRight) || input.key_pressed(egui::Key::PageDown) {
+        if input.key_pressed(forward_key) || input.key_pressed(egui::Key::PageDown) {
             state.pending_navigation = Some(PageNavigationCommand::NextPage);
-        } else if input.key_pressed(egui::Key::ArrowLeft) || input.key_pressed(egui::Key::PageUp) {
+        } else if input.key_pressed(backward_key) || input.key_pressed(egui::Key::PageUp) {
             state.pending_navigation = Some(PageNavigationCommand::PreviousPage);
         } else if input.key_pressed(egui::Key::Space) || input.key_pressed(egui::Key::ArrowDown) {
             state.pending_navigation = Some(PageNavigationCommand::ScrollDown);
@@ -405,11 +499,25 @@ fn render_center_message(ui: &mut egui::Ui, message: &str) {
 }
 
 fn render_corrupted_page(ui: &mut egui::Ui, message: &str) {
-    let texture = ui.ctx().load_texture(
-        "corrupted-page-fallback",
-        corrupted_page_color_image(message),
-        egui::TextureOptions::LINEAR,
-    );
+    // The fallback image is identical for every failure; cache the uploaded
+    // texture in egui memory instead of re-uploading it each frame.
+    let texture_id = egui::Id::new("corrupted-page-fallback");
+    let cached = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<egui::TextureHandle>(texture_id));
+    let texture = match cached {
+        Some(texture) => texture,
+        None => {
+            let texture = ui.ctx().load_texture(
+                "corrupted-page-fallback",
+                corrupted_page_color_image(message),
+                egui::TextureOptions::LINEAR,
+            );
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(texture_id, texture.clone()));
+            texture
+        }
+    };
     ui.centered_and_justified(|ui| {
         ui.vertical_centered(|ui| {
             ui.image((texture.id(), egui::vec2(180.0, 252.0)));

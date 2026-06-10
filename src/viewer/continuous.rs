@@ -119,6 +119,9 @@ pub struct ContinuousScrollState {
     pub scroll_anchor: ScrollAnchor,
     pub gap: f32,
     pub placeholder_ratio: f32,
+    /// Monotonic counter bumped whenever measurements change, so layout
+    /// consumers can skip rebuilding an unchanged virtual canvas.
+    pub measurements_version: u64,
 }
 
 impl Default for ContinuousScrollState {
@@ -135,11 +138,16 @@ impl ContinuousScrollState {
             scroll_anchor: ScrollAnchor::default(),
             gap: CONTINUOUS_PAGE_GAP,
             placeholder_ratio: DEFAULT_PLACEHOLDER_ASPECT_RATIO,
+            measurements_version: 0,
         }
     }
 
     pub fn reset(&mut self) {
+        // Keep the version monotonic across resets so cached layouts built
+        // before the reset can never be mistaken for current.
+        let version = self.measurements_version.saturating_add(1);
         *self = Self::new();
+        self.measurements_version = version;
     }
 
     pub fn record_actual(&mut self, page_index: usize, size: Size2) {
@@ -149,6 +157,7 @@ impl ContinuousScrollState {
         self.placeholder_ratio = size.width / size.height;
         self.page_measurements
             .insert(page_index, PageMeasurement::actual(page_index, size));
+        self.measurements_version = self.measurements_version.saturating_add(1);
     }
 
     pub fn record_failure(&mut self, page_index: usize, size: Size2, message: impl Into<String>) {
@@ -161,6 +170,7 @@ impl ContinuousScrollState {
             page_index,
             PageMeasurement::failed_placeholder(page_index, size, message),
         );
+        self.measurements_version = self.measurements_version.saturating_add(1);
     }
 
     pub fn measured_pages(&self) -> HashSet<usize> {

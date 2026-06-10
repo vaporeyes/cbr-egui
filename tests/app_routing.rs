@@ -50,7 +50,10 @@ fn grid_item(comic_id: i64, title: &str, path: &str) -> LibraryGridItem {
         folder_key: std::path::Path::new(path)
             .parent()
             .map(|parent| parent.to_string_lossy().into_owned()),
+        writer: None,
+        number: None,
         is_read: false,
+        current_page: 0,
     }
 }
 
@@ -550,11 +553,33 @@ fn reopening_grid_item_clamps_saved_page_to_last_page() {
     )
     .expect("persisted items");
     let item = items.first().expect("item").clone();
-    service.save_progress(item.comic_id, 99, true).expect("progress");
+    service.save_progress(item.comic_id, 99, false).expect("progress");
 
     let mut app: ComicReaderApp<&str> = ComicReaderApp::default();
     assert!(app.open_grid_item_resuming(&service, &item));
     assert_eq!(app.reading.expect("reading").current_page_index, 4);
+}
+
+#[test]
+fn reopening_finished_comic_restarts_from_first_page() {
+    let dir = tempfile::tempdir().expect("dir");
+    let service = LibraryService::initialize(&dir.path().join("library.sqlite")).expect("service");
+    let items = persist_scanned_comics_to_grid_items(
+        &service,
+        &[ScannedComic {
+            path: "/library/Finished.cbz".to_owned(),
+            fingerprint: "fingerprint".to_owned(),
+            page_count: 5,
+            metadata: None,
+        }],
+    )
+    .expect("persisted items");
+    let item = items.first().expect("item").clone();
+    service.save_progress(item.comic_id, 4, true).expect("progress");
+
+    let mut app: ComicReaderApp<&str> = ComicReaderApp::default();
+    assert!(app.open_grid_item_resuming(&service, &item));
+    assert_eq!(app.reading.expect("reading").current_page_index, 0);
 }
 
 #[test]

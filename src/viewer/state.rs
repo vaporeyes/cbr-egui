@@ -4,7 +4,10 @@ use crate::viewer::spread::{
     ReadingDirection, ReadingLayoutMode, SpreadDecision, SpreadSideStatus, decide_spread,
 };
 
-pub const DEFAULT_MIN_ZOOM: f32 = 1.0;
+pub const DEFAULT_MIN_ZOOM: f32 = 0.25;
+/// Zoom of 1.0 displays the page at its fitted size; resets return here
+/// rather than to the floor, which now sits below fit.
+pub const DEFAULT_FIT_ZOOM: f32 = 1.0;
 pub const DEFAULT_MAX_ZOOM: f32 = 6.0;
 pub const DEFAULT_SCROLL_ZOOM_SENSITIVITY: f32 = 0.0015;
 
@@ -24,7 +27,7 @@ pub struct ZoomPanState {
 impl Default for ZoomPanState {
     fn default() -> Self {
         Self {
-            zoom: DEFAULT_MIN_ZOOM,
+            zoom: DEFAULT_FIT_ZOOM,
             min_zoom: DEFAULT_MIN_ZOOM,
             max_zoom: DEFAULT_MAX_ZOOM,
             pan_offset: Point2::ZERO,
@@ -68,13 +71,13 @@ impl ZoomPanState {
             self.pan_offset.y * actual_factor + anchor.viewport_delta.y * (actual_factor - 1.0),
         );
 
-        if self.zoom <= self.min_zoom {
+        if self.zoom <= DEFAULT_FIT_ZOOM {
             self.pan_offset = Point2::ZERO;
         }
     }
 
     pub fn reset_zoom(&mut self) {
-        self.zoom = self.min_zoom;
+        self.zoom = DEFAULT_FIT_ZOOM;
         self.pan_offset = Point2::ZERO;
     }
 
@@ -95,7 +98,7 @@ impl ZoomPanState {
             return;
         }
 
-        self.zoom = self.min_zoom;
+        self.zoom = DEFAULT_FIT_ZOOM;
         self.pan_offset = Point2::ZERO;
         self.reset_generation = self.reset_generation.saturating_add(1);
         self.active_page_id = Some(page_id);
@@ -108,7 +111,7 @@ impl ZoomPanState {
             return;
         }
 
-        self.zoom = self.min_zoom;
+        self.zoom = DEFAULT_FIT_ZOOM;
         self.pan_offset = Point2::ZERO;
         self.reset_generation = self.reset_generation.saturating_add(1);
         self.active_page_id = Some(left_page_id);
@@ -297,6 +300,9 @@ pub struct ViewerState<T> {
     pub pending_navigation: Option<PageNavigationCommand>,
     pub pending_view_command: Option<ViewCommand>,
     pub pending_bookmark_toggle: bool,
+    /// Accumulated plain-wheel scroll at fit zoom; turns the page once it
+    /// crosses a threshold so trackpad micro-scrolls do not flip pages.
+    pub wheel_page_accumulator: f32,
 }
 
 impl<T> Default for ViewerState<T> {
@@ -321,6 +327,7 @@ impl<T> Default for ViewerState<T> {
             pending_navigation: None,
             pending_view_command: None,
             pending_bookmark_toggle: false,
+            wheel_page_accumulator: 0.0,
         }
     }
 }
@@ -336,6 +343,7 @@ impl<T> ViewerState<T> {
             self.zoom_pan.reset_for_page(page_id);
             self.spread_decision = None;
             self.next_page_status = PageStatus::Empty;
+            self.wheel_page_accumulator = 0.0;
         }
     }
 

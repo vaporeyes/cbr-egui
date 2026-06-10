@@ -23,6 +23,8 @@ pub enum PageTextureCacheError {
 pub struct PageTextureCache<T> {
     entries: LruCache<usize, T>,
     evictor: Option<Box<dyn FnMut(T)>>,
+    version: u64,
+    capacity_warning_emitted: bool,
 }
 
 impl<T> PageTextureCache<T> {
@@ -40,6 +42,8 @@ impl<T> PageTextureCache<T> {
         Ok(Self {
             entries: LruCache::new(NonZeroUsize::new(capacity).expect("capacity checked")),
             evictor: None,
+            version: 0,
+            capacity_warning_emitted: false,
         })
     }
 
@@ -61,6 +65,14 @@ impl<T> PageTextureCache<T> {
     /// on-screen working set resident, preventing evict/re-decode flicker. Never
     /// shrinks, so transient small windows do not discard still-useful textures.
     pub fn ensure_capacity(&mut self, min_capacity: usize) {
+        if min_capacity > MAX_PAGE_CACHE_CAPACITY && !self.capacity_warning_emitted {
+            // A working set beyond the cap reintroduces the evict/re-decode
+            // flicker this cache is sized to prevent; surface it once.
+            eprintln!(
+                "page texture cache: working set of {min_capacity} exceeds cap {MAX_PAGE_CACHE_CAPACITY}; expect re-decodes"
+            );
+            self.capacity_warning_emitted = true;
+        }
         let target = min_capacity.clamp(1, MAX_PAGE_CACHE_CAPACITY);
         if target > self.entries.cap().get() {
             self.entries
@@ -73,6 +85,7 @@ impl<T> PageTextureCache<T> {
     }
 
     pub fn insert(&mut self, page_index: usize, texture: T) -> Option<T> {
+        self.version = self.version.saturating_add(1);
         let evicted = self
             .entries
             .push(page_index, texture)
@@ -90,7 +103,14 @@ impl<T> PageTextureCache<T> {
         self.entries.contains(&page_index)
     }
 
+    /// Monotonic counter bumped on every insert or clear, so consumers can
+    /// detect content changes without comparing entries.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     pub fn clear(&mut self) {
+        self.version = self.version.saturating_add(1);
         if let Some(evictor) = &mut self.evictor {
             while let Some((_key, value)) = self.entries.pop_lru() {
                 evictor(value);
