@@ -1718,8 +1718,7 @@ pub fn route_app_update(
             handle_dropped_imports(ctx, app, library_controls);
             render_library_menu_bar(ctx, app, library_controls, settings, config, library_service);
             render_library_toolbar(ctx, app, library_controls, config);
-            let shelf_event = render_library_shelf(ctx, app, library_controls);
-            handle_library_item_event(ctx, app, library_controls, library_service, shelf_event);
+            render_library_shelf(ctx, app, library_controls);
             render_about_window(ctx, &mut library_controls.about_open);
             render_shortcuts_window(ctx, &mut library_controls.shortcuts_open);
             egui::CentralPanel::default()
@@ -2936,8 +2935,7 @@ fn render_library_shelf(
     ctx: &egui::Context,
     app: &mut ComicReaderApp<egui::TextureHandle>,
     controls: &mut LibraryRootControls,
-) -> Option<LibraryItemEvent> {
-    let event = None;
+) {
     let mut shelf_open = controls.shelf_open;
     egui::SidePanel::left("library_shelf")
         .resizable(true)
@@ -2955,8 +2953,7 @@ fn render_library_shelf(
             ui.separator();
             let mut next_filter = app.library.active_filter.clone();
             egui::ScrollArea::vertical().show(ui, |ui| {
-                if ui.selectable_value(&mut next_filter, None, "All comics").clicked() {
-                }
+                ui.selectable_value(&mut next_filter, None, "All comics");
 
                 let groups = app.library.groups().to_vec();
                 let builtins = groups.iter().filter(|g| g.kind == LibraryGroupKind::Builtin);
@@ -2998,7 +2995,6 @@ fn render_library_shelf(
             }
         });
     controls.shelf_open = shelf_open;
-    event
 }
 
 fn render_library_status(
