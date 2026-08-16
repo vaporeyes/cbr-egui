@@ -23,6 +23,23 @@ fn discovers_supported_archives_recursively() {
 }
 
 #[test]
+#[cfg(unix)]
+fn symlink_loop_does_not_recurse_forever() {
+    let dir = tempfile::tempdir().expect("dir");
+    std::fs::create_dir_all(dir.path().join("series")).expect("nested");
+    std::fs::write(dir.path().join("series").join("book.cbz"), b"not zip").expect("book");
+    // A link back to an ancestor. Path::is_dir follows it, so the walk used to
+    // recurse until the stack was exhausted, aborting the process.
+    std::os::unix::fs::symlink(dir.path(), dir.path().join("series").join("loop"))
+        .expect("symlink");
+
+    let archives = discover_supported_archives(dir.path()).expect("scan");
+
+    assert_eq!(archives.len(), 1);
+    assert!(archives[0].ends_with("book.cbz"));
+}
+
+#[test]
 fn filters_hidden_metadata_and_unsupported_files() {
     assert!(is_supported_archive_path("book.cbz"));
     assert!(is_supported_archive_path("book.cbr"));

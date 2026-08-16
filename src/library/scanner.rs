@@ -37,12 +37,23 @@ pub fn discover_supported_archives(root: impl AsRef<Path>) -> Result<Vec<PathBuf
     }
 
     let mut archives = Vec::new();
-    discover_into(root, &mut archives)?;
+    discover_into(root, &mut archives, 0)?;
     archives.sort();
     Ok(archives)
 }
 
-fn discover_into(dir: &Path, archives: &mut Vec<PathBuf>) -> Result<(), LibraryError> {
+/// Deepest directory nesting walked during discovery. Comic libraries are a
+/// few levels deep at most, so this only ever trips on pathological trees.
+const MAX_DISCOVERY_DEPTH: usize = 32;
+
+fn discover_into(
+    dir: &Path,
+    archives: &mut Vec<PathBuf>,
+    depth: usize,
+) -> Result<(), LibraryError> {
+    if depth >= MAX_DISCOVERY_DEPTH {
+        return Ok(());
+    }
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -53,8 +64,16 @@ fn discover_into(dir: &Path, archives: &mut Vec<PathBuf>) -> Result<(), LibraryE
         if file_name.starts_with('.') || file_name == "__MACOSX" {
             continue;
         }
-        if path.is_dir() {
-            discover_into(&path, archives)?;
+        // file_type does not follow symlinks, unlike Path::is_dir. A link
+        // pointing at one of its own ancestors would otherwise recurse until
+        // the stack is exhausted, which aborts the process rather than
+        // surfacing an error.
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            discover_into(&path, archives, depth + 1)?;
         } else if is_supported_archive_path(&path) {
             archives.push(path);
         }
