@@ -23,5 +23,5 @@ pub use service::LibraryService;
 pub use thumbnails::{
     MAX_THUMBNAIL_HEIGHT, ThumbnailCacheEntry, ThumbnailCacheError, ThumbnailRequest,
     ThumbnailResult, ThumbnailWorkerPool, cache_key_for_source, cache_path_for_source,
-    cover_request_for_pages, is_thumbnail_stale, thumbnail_target_size,
+    cover_request_for_pages, is_thumbnail_stale, thumbnail_target_size, write_thumbnail,
 };

@@ -122,6 +122,9 @@ pub enum LibraryItemEvent {
     Open(LibraryGridItem),
     SetRead { comic_id: i64, is_read: bool },
     Remove { comic_id: i64 },
+    /// The cached cover file could not be read back. Emitted from the render
+    /// path so the stale entry can be discarded and regenerated.
+    CoverUnreadable { comic_id: i64 },
 }
 
 pub fn render_library_grid<T>(
@@ -1661,6 +1664,9 @@ fn handle_library_item_event(
         Some(LibraryItemEvent::Remove { comic_id }) => {
             controls.remove_comics(app, library_service, &[comic_id]);
         }
+        Some(LibraryItemEvent::CoverUnreadable { comic_id }) => {
+            controls.discard_unreadable_cover(app, library_service, comic_id);
+        }
         None => {}
     }
 }
@@ -2532,6 +2538,38 @@ impl LibraryRootControls {
         }));
     }
 
+    /// Drops a cover that is recorded as ready but cannot be read back, so the
+    /// scheduler regenerates it. Without this the entry is terminal: the row
+    /// keeps reporting Ready across restarts and every render fails again.
+    fn discard_unreadable_cover(
+        &mut self,
+        app: &mut ComicReaderApp<egui::TextureHandle>,
+        library_service: Option<&LibraryService>,
+        comic_id: i64,
+    ) {
+        let Some(item) = app
+            .library
+            .items
+            .iter_mut()
+            .find(|item| item.comic_id == comic_id)
+        else {
+            return;
+        };
+
+        let cache_path = cache_path_for_source(
+            &self.thumbnail_cache_root,
+            &item.path,
+            &item.source_fingerprint,
+        );
+        let _ = std::fs::remove_file(&cache_path);
+        self.thumbnail_textures
+            .pop(cache_path.to_string_lossy().as_ref());
+        if let Some(service) = library_service {
+            let _ = service.set_thumbnail_key(&item.path, None);
+        }
+        item.thumbnail_status = ThumbnailStatus::Missing;
+    }
+
     fn schedule_missing_thumbnails(
         &mut self,
         app: &mut ComicReaderApp<egui::TextureHandle>,
@@ -3287,6 +3325,7 @@ fn library_tile(
         // Constant tile height keeps every grid row uniform, which the
         // virtualized scroll area's row estimate depends on.
         ui.set_height(GRID_TILE_HEIGHT);
+        let mut event: Option<LibraryItemEvent> = None;
         let thumbnail_size = egui::vec2(GRID_TILE_WIDTH, 240.0);
         let response = match &item.thumbnail_status {
             ThumbnailStatus::Ready { cache_path } => {
@@ -3310,6 +3349,11 @@ fn library_tile(
                     egui::Image::new((texture.id(), image_size)).paint_at(ui, image_rect);
                     response
                 } else {
+                    // The cache file is gone or corrupt. Discard the entry so
+                    // the cover is regenerated instead of failing forever.
+                    event = Some(LibraryItemEvent::CoverUnreadable {
+                        comic_id: item.comic_id,
+                    });
                     placeholder_cover_button(ui, thumbnail_size, "Cover failed")
                 }
             }
@@ -3362,7 +3406,6 @@ fn library_tile(
         if item.is_read {
             paint_read_badge(ui, response.rect);
         }
-        let mut event: Option<LibraryItemEvent> = None;
         response.context_menu(|ui| {
             let label = if item.is_read { "Mark as unread" } else { "Mark as read" };
             if ui.button(label).clicked() {
@@ -3454,7 +3497,12 @@ fn library_list_row(
         rect.min + egui::vec2(8.0, 5.0),
         egui::vec2(LIST_THUMBNAIL_WIDTH, LIST_THUMBNAIL_HEIGHT),
     );
-    paint_list_thumbnail(ui, item, thumbnail_textures, thumb_rect);
+    let mut event: Option<LibraryItemEvent> = None;
+    if paint_list_thumbnail(ui, item, thumbnail_textures, thumb_rect) {
+        event = Some(LibraryItemEvent::CoverUnreadable {
+            comic_id: item.comic_id,
+        });
+    }
 
     let text_x = thumb_rect.right() + 12.0;
     let title_pos = egui::pos2(text_x, rect.top() + 12.0);
@@ -3527,7 +3575,6 @@ fn library_list_row(
         response
     };
 
-    let mut event: Option<LibraryItemEvent> = None;
     response.context_menu(|ui| {
         let label = if item.is_read { "Mark as unread" } else { "Mark as read" };
         if ui.button(label).clicked() {
@@ -3555,12 +3602,14 @@ fn library_list_row(
     event
 }
 
+/// Paints the row's cover. Returns true when a cover recorded as Ready could
+/// not be read back, so the caller can discard and regenerate it.
 fn paint_list_thumbnail(
     ui: &mut egui::Ui,
     item: &LibraryGridItem,
     thumbnail_textures: &mut lru::LruCache<String, egui::TextureHandle>,
     rect: egui::Rect,
-) {
+) -> bool {
     ui.painter().rect_filled(rect, 3.0, EDITOR_PANEL_DARK);
     ui.painter().rect_stroke(
         rect,
@@ -3574,9 +3623,10 @@ fn paint_list_thumbnail(
                 let image_size = fit_image_size(texture.size_vec2(), rect.size());
                 let image_rect = egui::Rect::from_center_size(rect.center(), image_size);
                 egui::Image::new((texture.id(), image_size)).paint_at(ui, image_rect);
-                return;
+                return false;
             }
             paint_thumbnail_label(ui, rect, "Failed");
+            return true;
         }
         ThumbnailStatus::Loading => paint_thumbnail_label(ui, rect, "Loading"),
         ThumbnailStatus::Failed { .. } => paint_thumbnail_label(ui, rect, "Failed"),
@@ -3584,6 +3634,7 @@ fn paint_list_thumbnail(
             paint_thumbnail_label(ui, rect, "Cover")
         }
     }
+    false
 }
 
 fn paint_thumbnail_label(ui: &mut egui::Ui, rect: egui::Rect, label: &str) {

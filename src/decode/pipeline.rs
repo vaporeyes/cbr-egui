@@ -244,26 +244,11 @@ fn decode_bytes(
         return Err(DecodeError::EmptyBytes);
     }
 
-    // Check the header before decoding. Testing the pixel count after
-    // `load_from_memory` would mean the buffer this guard exists to prevent had
-    // already been allocated.
-    let (source_width, source_height) = limited_reader(bytes)?
-        .into_dimensions()
-        .map_err(|err| DecodeError::Image(err.to_string()))?;
-    if u64::from(source_width) * u64::from(source_height) > MAX_DECODED_PIXELS {
-        return Err(DecodeError::ImageTooLarge {
-            width: source_width,
-            height: source_height,
-        });
-    }
-
     // Each stage below is a full-page pass. Re-check between them so a page the
     // reader has already navigated away from stops costing work, instead of
     // running to completion and holding up whatever is on screen now.
     abort_if_cancelled(cancel)?;
-    let mut image = limited_reader(bytes)?
-        .decode()
-        .map_err(|err| DecodeError::Image(err.to_string()))?;
+    let mut image = load_within_limits(bytes)?;
 
     abort_if_cancelled(cancel)?;
     if let Some([target_width, target_height]) = target_size
@@ -341,6 +326,22 @@ fn decode_bytes(
         [width as usize, height as usize],
         rgba.as_raw(),
     ))
+}
+
+/// Decodes image bytes with dimension, area, and allocation guards applied.
+/// The area check runs against the header so an oversized image is rejected
+/// before its pixel buffer is allocated, not after.
+pub fn load_within_limits(bytes: &[u8]) -> Result<image::DynamicImage, DecodeError> {
+    let (width, height) = limited_reader(bytes)?
+        .into_dimensions()
+        .map_err(|err| DecodeError::Image(err.to_string()))?;
+    if u64::from(width) * u64::from(height) > MAX_DECODED_PIXELS {
+        return Err(DecodeError::ImageTooLarge { width, height });
+    }
+
+    limited_reader(bytes)?
+        .decode()
+        .map_err(|err| DecodeError::Image(err.to_string()))
 }
 
 fn abort_if_cancelled(cancel: Option<&CancellationToken>) -> Result<(), DecodeError> {

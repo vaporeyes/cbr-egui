@@ -7,6 +7,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use image::imageops::FilterType;
 use thiserror::Error;
 
+use crate::decode::{DecodeError, load_within_limits};
 use crate::vfs::{
     ArchiveError, ArchiveReader, PdfArchiveReader, RarArchiveReader, ZipArchiveReader,
 };
@@ -21,6 +22,8 @@ pub enum ThumbnailCacheError {
     Io(#[from] std::io::Error),
     #[error("image error: {0}")]
     Image(#[from] image::ImageError),
+    #[error("decode error: {0}")]
+    Decode(#[from] DecodeError),
     #[error("missing cover page")]
     MissingCover,
     #[error("invalid thumbnail worker pool configuration")]
@@ -143,17 +146,29 @@ pub fn write_thumbnail(
     bytes: &[u8],
     cache_path: impl AsRef<Path>,
 ) -> Result<[u32; 2], ThumbnailCacheError> {
-    let image = image::load_from_memory(bytes)?;
+    // Covers come from untrusted archives, so they get the same dimension and
+    // allocation guards as page decoding rather than the image crate defaults.
+    let image = load_within_limits(bytes)?;
     let [target_width, target_height] = thumbnail_target_size(image.width(), image.height());
     let image = if target_height > 0 && target_height < image.height() {
         image.resize(target_width, target_height, FilterType::Lanczos3)
     } else {
         image
     };
-    if let Some(parent) = cache_path.as_ref().parent() {
+
+    let cache_path = cache_path.as_ref();
+    if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    image.save(cache_path)?;
+    // Encode to a sibling temp file and rename into place. Saving straight to
+    // the cache path leaves a truncated PNG if the write is interrupted, and
+    // callers treat any existing file as a usable cover.
+    let staging_path = cache_path.with_extension("png.part");
+    image.save_with_format(&staging_path, image::ImageFormat::Png)?;
+    if let Err(error) = fs::rename(&staging_path, cache_path) {
+        let _ = fs::remove_file(&staging_path);
+        return Err(error.into());
+    }
     Ok([image.width(), image.height()])
 }
 
