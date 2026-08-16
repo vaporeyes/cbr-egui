@@ -3787,10 +3787,23 @@ impl EguiComicReaderApp {
             .parent()
             .map(std::fs::create_dir_all)
             .transpose()
+            .map_err(|error| error.to_string())
             .and_then(|_| {
-                LibraryService::initialize(&library_db_path).map_err(std::io::Error::other)
-            })
-            .ok();
+                LibraryService::initialize(&library_db_path).map_err(|error| error.to_string())
+            });
+        // Running without a database is a heavily degraded mode where every
+        // write silently does nothing, so keep the reason and show it instead
+        // of the generic "database unavailable" the write paths report.
+        let (library_service, open_error) = match library_service {
+            Ok(service) => (Some(service), None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "Library database unavailable ({}): {error}",
+                    library_db_path.display()
+                )),
+            ),
+        };
 
         let mut app = Self {
             inner: ComicReaderApp::default(),
@@ -3809,6 +3822,9 @@ impl EguiComicReaderApp {
             app.resume_last_session_from_service();
         }
         app.apply_config_to_active_session();
+        if let Some(error) = open_error {
+            app.record_lifecycle_error(error);
+        }
         app
     }
 

@@ -61,6 +61,25 @@ fn invalid_zoom_sensitivity_is_normalized() {
 }
 
 #[test]
+fn unparseable_config_is_preserved_rather_than_overwritten() {
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("config.json");
+    std::fs::write(&path, "{ this is not json").expect("write");
+
+    let loaded = AppConfig::load(&path);
+
+    assert_eq!(loaded, AppConfig::default());
+    // The next save would overwrite the file, so the original has to be moved
+    // aside for the settings to stay recoverable.
+    assert!(!path.exists());
+    let backup = path.with_extension("json.bak");
+    assert_eq!(
+        std::fs::read_to_string(backup).expect("backup"),
+        "{ this is not json"
+    );
+}
+
+#[test]
 fn missing_resume_flag_defaults_to_disabled() {
     let dir = tempfile::tempdir().expect("dir");
     let path = dir.path().join("config.json");

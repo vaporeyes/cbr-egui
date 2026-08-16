@@ -32,12 +32,23 @@ impl AppConfig {
     pub const MIN_ZOOM_SENSITIVITY: f32 = 0.0002;
     pub const MAX_ZOOM_SENSITIVITY: f32 = 0.01;
 
+    /// Loads the config, falling back to defaults. A file that cannot be parsed
+    /// is moved aside rather than left in place: the next save would otherwise
+    /// overwrite it, silently destroying settings that a small edit could have
+    /// recovered.
     pub fn load(path: impl AsRef<Path>) -> Self {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|content| serde_json::from_str(&content).ok())
-            .map(Self::normalized)
-            .unwrap_or_default()
+        let path = path.as_ref();
+        // No config yet is the normal first-run case, not a problem.
+        let Ok(content) = fs::read_to_string(path) else {
+            return Self::default();
+        };
+        match serde_json::from_str::<Self>(&content) {
+            Ok(config) => config.normalized(),
+            Err(_) => {
+                let _ = fs::rename(path, path.with_extension("json.bak"));
+                Self::default()
+            }
+        }
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
