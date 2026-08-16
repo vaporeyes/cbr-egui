@@ -1,6 +1,7 @@
 // ABOUTME: Decodes raw page image bytes into egui color images for display.
 // ABOUTME: Defines cancellation-aware decode request and result payloads.
 use std::borrow::Cow;
+use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -14,6 +15,16 @@ use rayon::prelude::*;
 use super::error::DecodeError;
 
 const MAX_DECODED_PIXELS: u64 = 100_000_000;
+/// Hard bound on either source dimension, enforced by the decoder itself.
+const MAX_SOURCE_DIMENSION: u32 = 65_536;
+/// Cap on decoder scratch allocation. The `image` default is 512 MiB, which
+/// several decode workers can hold simultaneously.
+const MAX_DECODE_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
+/// Longest edge handed to the GPU. OpenGL implementations commonly cap
+/// textures at 16384 px and `load_texture` has no error path, so a page above
+/// the driver limit uploads as garbage or fails outright. Pages beyond this
+/// are downscaled first.
+const MAX_TEXTURE_DIMENSION: u32 = 8_192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DecodeRequestId(pub u64);
@@ -236,8 +247,22 @@ fn decode_bytes(
         return Err(DecodeError::EmptyBytes);
     }
 
-    let mut image =
-        image::load_from_memory(bytes).map_err(|err| DecodeError::Image(err.to_string()))?;
+    // Check the header before decoding. Testing the pixel count after
+    // `load_from_memory` would mean the buffer this guard exists to prevent had
+    // already been allocated.
+    let (source_width, source_height) = limited_reader(bytes)?
+        .into_dimensions()
+        .map_err(|err| DecodeError::Image(err.to_string()))?;
+    if u64::from(source_width) * u64::from(source_height) > MAX_DECODED_PIXELS {
+        return Err(DecodeError::ImageTooLarge {
+            width: source_width,
+            height: source_height,
+        });
+    }
+
+    let mut image = limited_reader(bytes)?
+        .decode()
+        .map_err(|err| DecodeError::Image(err.to_string()))?;
     if let Some([target_width, target_height]) = target_size
         && target_width > 0
         && target_height > 0
@@ -253,12 +278,20 @@ fn decode_bytes(
         Rotation::Cw270 => image.rotate270(),
     };
 
+    // Downscale past the driver's texture limit before the RGBA buffer is
+    // materialised, so nothing unuploadable reaches `load_texture`.
+    let image = if image.width() > MAX_TEXTURE_DIMENSION || image.height() > MAX_TEXTURE_DIMENSION {
+        image.resize(
+            MAX_TEXTURE_DIMENSION,
+            MAX_TEXTURE_DIMENSION,
+            FilterType::Lanczos3,
+        )
+    } else {
+        image
+    };
+
     let mut rgba = image.to_rgba8();
     let (width, height) = rgba.dimensions();
-    let pixels = u64::from(width) * u64::from(height);
-    if pixels > MAX_DECODED_PIXELS {
-        return Err(DecodeError::ImageTooLarge { width, height });
-    }
 
     if !adjustments.is_identity() {
         let table = adjustments
@@ -303,6 +336,21 @@ fn decode_bytes(
         [width as usize, height as usize],
         rgba.as_raw(),
     ))
+}
+
+/// Builds an image reader with allocation and dimension limits applied. The
+/// `image` defaults leave dimensions unbounded and allow 512 MiB of decoder
+/// scratch per call, which several decode workers can hold at once.
+fn limited_reader(bytes: &[u8]) -> Result<image::ImageReader<Cursor<&[u8]>>, DecodeError> {
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|err| DecodeError::Image(err.to_string()))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_SOURCE_DIMENSION);
+    limits.max_image_height = Some(MAX_SOURCE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+    reader.limits(limits);
+    Ok(reader)
 }
 
 fn pixel_luma(r: u8, g: u8, b: u8) -> f32 {

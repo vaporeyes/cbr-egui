@@ -32,6 +32,36 @@ fn target_size_downsamples_before_color_image_conversion() {
 }
 
 #[test]
+fn oversized_image_is_rejected_from_its_header() {
+    // 40000 x 40000 is 1.6e9 pixels, 6.4 GB as RGBA, from a 33 byte file. The
+    // guard has to reject this from the header; checking after the decode would
+    // mean the allocation already happened.
+    let result = decode_page(request(9, 0, png_header_declaring(40_000, 40_000), None));
+
+    assert!(
+        matches!(
+            result.outcome,
+            Err(DecodeError::ImageTooLarge {
+                width: 40_000,
+                height: 40_000
+            })
+        ),
+        "expected ImageTooLarge, got {:?}",
+        result.outcome.map(|image| image.size)
+    );
+}
+
+#[test]
+fn pages_beyond_the_texture_limit_are_downscaled_for_upload() {
+    let result = decode_page(request(10, 0, png_bytes(9_000, 2), None));
+    let image = result.outcome.expect("decode succeeds");
+
+    // Drivers commonly cap textures at 16384 px and load_texture has no error
+    // path, so nothing wider than the clamp may reach it.
+    assert_eq!(image.size[0], 8_192);
+}
+
+#[test]
 fn worker_pool_processes_many_requests_without_blocking_submission() {
     let pool = WorkerPool::start(4, 64).expect("worker pool");
     let start = Instant::now();
@@ -198,6 +228,49 @@ fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         .write_to(&mut cursor, ImageFormat::Png)
         .expect("encode png");
     cursor.into_inner()
+}
+
+/// A PNG whose IHDR declares the given dimensions but which carries no pixel
+/// data. The size guard has to act on the header alone, so the payload stays
+/// empty however large the declared image is.
+fn png_header_declaring(width: u32, height: u32) -> Vec<u8> {
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    // 8-bit depth, truecolour, no compression/filter/interlacing.
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    bytes.extend_from_slice(&png_chunk(b"IHDR", &ihdr));
+    // The decoder reads chunks until IDAT before it will report dimensions.
+    bytes.extend_from_slice(&png_chunk(b"IDAT", &[]));
+    bytes.extend_from_slice(&png_chunk(b"IEND", &[]));
+    bytes
+}
+
+fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut chunk = Vec::from(*kind);
+    chunk.extend_from_slice(data);
+
+    let mut out = Vec::from((data.len() as u32).to_be_bytes());
+    out.extend_from_slice(&chunk);
+    out.extend_from_slice(&crc32(&chunk).to_be_bytes());
+    out
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFF_u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 fn wait_for_result(pool: &WorkerPool) -> cbr_egui::decode::DecodeResult {
