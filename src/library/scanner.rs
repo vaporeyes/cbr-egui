@@ -5,9 +5,7 @@ use std::time::UNIX_EPOCH;
 use crate::library::errors::LibraryError;
 use crate::library::metadata::read_archive_metadata;
 use crate::library::models::ComicMetadata;
-use crate::vfs::{
-    ArchiveError, ArchiveReader, PdfArchiveReader, RarArchiveReader, ZipArchiveReader,
-};
+use crate::vfs::ArchiveReader;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedComic {
@@ -103,23 +101,7 @@ pub fn archive_metadata(path: impl AsRef<Path>) -> Result<Option<ComicMetadata>,
 }
 
 fn archive_reader_for_path(path: &Path) -> Result<Box<dyn ArchiveReader>, LibraryError> {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-
-    let reader: Box<dyn ArchiveReader> = match extension.as_str() {
-        "cbz" | "zip" => Box::new(ZipArchiveReader::new(path)),
-        "cbr" | "rar" => Box::new(RarArchiveReader::new(path)),
-        "pdf" => Box::new(PdfArchiveReader::new(path)),
-        _ => {
-            return Err(LibraryError::Archive(ArchiveError::UnsupportedFormat(
-                path.display().to_string(),
-            )));
-        }
-    };
-    Ok(reader)
+    crate::vfs::reader_for_path(path).map_err(LibraryError::from)
 }
 
 fn archive_scan_details(path: &Path) -> (u32, Option<ComicMetadata>) {

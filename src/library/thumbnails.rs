@@ -7,9 +7,7 @@ use image::imageops::FilterType;
 use thiserror::Error;
 
 use crate::decode::{DecodeError, load_within_limits};
-use crate::vfs::{
-    ArchiveError, ArchiveReader, PdfArchiveReader, RarArchiveReader, ZipArchiveReader,
-};
+use crate::vfs::ArchiveError;
 
 use crate::library::models::ArchivePage;
 
@@ -201,24 +199,10 @@ fn spawn_thumbnail_worker(
 }
 
 fn read_cover_bytes(archive_path: &Path) -> Result<Vec<u8>, ArchiveError> {
-    let mut reader = archive_reader_for_path(archive_path)?;
+    let mut reader = crate::vfs::reader_for_path(archive_path)?;
     let pages = reader.list_pages()?;
     let page = cover_request_for_pages(&pages)
         .ok_or_else(|| ArchiveError::NotFound("cover page".to_owned()))?;
     reader.read_page(&page.path)
 }
 
-fn archive_reader_for_path(path: &Path) -> Result<Box<dyn ArchiveReader>, ArchiveError> {
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-
-    match extension.as_str() {
-        "cbz" | "zip" => Ok(Box::new(ZipArchiveReader::new(path))),
-        "cbr" | "rar" => Ok(Box::new(RarArchiveReader::new(path))),
-        "pdf" => Ok(Box::new(PdfArchiveReader::new(path))),
-        _ => Err(ArchiveError::UnsupportedFormat(path.display().to_string())),
-    }
-}
