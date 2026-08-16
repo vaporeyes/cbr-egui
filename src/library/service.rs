@@ -88,9 +88,18 @@ impl LibraryService {
                 .map(|metadata| self.storage.upsert_metadata(previous_metadata_id, metadata))
                 .transpose()?
                 .and_then(|metadata| metadata.id);
+            // Keep the hash a known comic was recorded with. The scanner
+            // reports a cheap size:mtime fingerprint, while imported comics
+            // carry a blake3 content hash that names their thumbnail cache
+            // entry and their location in the managed store. Overwriting it
+            // during a rescan would orphan both.
+            let hash = existing
+                .as_ref()
+                .map(|comic| comic.hash.clone())
+                .unwrap_or_else(|| comic.fingerprint.clone());
             self.upsert_comic(ComicInput {
                 path: comic.path.clone(),
-                hash: comic.fingerprint.clone(),
+                hash,
                 page_count: comic.page_count,
                 metadata_id,
             })?;

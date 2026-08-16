@@ -21,8 +21,9 @@ use crate::decode::{
 };
 use crate::library::{
     ActiveLibraryFilter, ComicAvailability, ImportSummary, LibraryGridItem, LibraryGroupKind,
-    LibraryService, ThumbnailCacheError, ThumbnailRequest, ThumbnailStatus, ThumbnailWorkerPool,
-    cache_path_for_source, discover_supported_archives, import_paths,
+    LibraryService, ScannedComic, ThumbnailCacheError, ThumbnailRequest, ThumbnailStatus,
+    ThumbnailWorkerPool, cache_path_for_source, discover_supported_archives, import_paths,
+    scan_library_root,
 };
 use crate::vfs::{self, ArchiveReader};
 use crate::viewer::layout::{Size2, ViewMode};
@@ -1712,9 +1713,13 @@ pub fn route_app_update(
         }
     }
     library_controls.poll_import(ctx, app, library_service);
+    library_controls.poll_rescan(app, library_service);
     library_controls.poll_thumbnails(ctx, app, library_service);
     library_controls.schedule_missing_thumbnails(app, library_service);
-    if library_controls.is_importing() || library_controls.has_pending_thumbnails() {
+    if library_controls.is_importing()
+        || library_controls.is_rescanning()
+        || library_controls.has_pending_thumbnails()
+    {
         ctx.request_repaint_after(Duration::from_millis(50));
     }
 
@@ -2253,6 +2258,7 @@ const MAX_THUMBNAIL_STATS_PER_FRAME: usize = 64;
 
 pub struct LibraryRootControls {
     import_result_receiver: Option<Receiver<Result<ImportSummary, String>>>,
+    rescan_result_receiver: Option<Receiver<Result<Vec<ScannedComic>, String>>>,
     open_first_after_import: bool,
     store_root: PathBuf,
     thumbnail_pool: Option<ThumbnailWorkerPool>,
@@ -2274,6 +2280,7 @@ impl LibraryRootControls {
     pub fn new() -> Self {
         Self {
             import_result_receiver: None,
+            rescan_result_receiver: None,
             open_first_after_import: false,
             store_root: default_library_store_root(),
             thumbnail_pool: ThumbnailWorkerPool::start(2, 16).ok(),
@@ -2292,8 +2299,77 @@ impl LibraryRootControls {
         self.import_result_receiver.is_some()
     }
 
+    fn is_rescanning(&self) -> bool {
+        self.rescan_result_receiver.is_some()
+    }
+
     fn has_pending_thumbnails(&self) -> bool {
         !self.pending_thumbnails.is_empty()
+    }
+
+    /// Walks the managed store and reconciles it against the database. Comics
+    /// whose stored copy has been removed behind the app's back become
+    /// unavailable, and page counts and metadata are refreshed from the files
+    /// that are still there.
+    fn start_rescan(&mut self) {
+        if self.is_rescanning() || self.is_importing() {
+            return;
+        }
+        let store_root = self.store_root.clone();
+        let (sender, receiver) = bounded(1);
+        self.rescan_result_receiver = Some(receiver);
+        thread::spawn(move || {
+            let result = scan_library_root(&store_root).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+    }
+
+    fn poll_rescan(
+        &mut self,
+        app: &mut ComicReaderApp<egui::TextureHandle>,
+        library_service: Option<&LibraryService>,
+    ) {
+        let Some(receiver) = &self.rescan_result_receiver else {
+            return;
+        };
+        let Ok(result) = receiver.try_recv() else {
+            return;
+        };
+        self.rescan_result_receiver = None;
+
+        let scanned = match result {
+            Ok(scanned) => scanned,
+            Err(message) => {
+                app.library.status_text = Some(format!("Rescan failed: {message}"));
+                return;
+            }
+        };
+        let Some(service) = library_service else {
+            app.library.status_text = Some("Library database unavailable".to_owned());
+            return;
+        };
+
+        match persist_scanned_comics_to_grid_items(service, &scanned) {
+            Ok(items) => {
+                app.library.items = items;
+                app.library.refresh_filter_cache();
+                let unavailable = app
+                    .library
+                    .items
+                    .iter()
+                    .filter(|item| item.availability == ComicAvailability::Unavailable)
+                    .count();
+                app.library.status_text = Some(if unavailable > 0 {
+                    format!(
+                        "Rescanned {} comic(s); {unavailable} no longer on disk",
+                        scanned.len()
+                    )
+                } else {
+                    format!("Rescanned {} comic(s)", scanned.len())
+                });
+            }
+            Err(message) => app.library.status_text = Some(message),
+        }
     }
 
     fn start_import_files(&mut self, files: Vec<PathBuf>) {
@@ -2836,6 +2912,18 @@ fn render_library_menu_bar(
                 ui.menu_button("Tools", |ui| {
                     // View, Shelf, and Select toggles live on the library toolbar;
                     // the menu keeps only actions that have no toolbar equivalent.
+                    if ui
+                        .add_enabled(
+                            !controls.is_rescanning() && !controls.is_importing(),
+                            egui::Button::new("Rescan library"),
+                        )
+                        .on_hover_text("Check the library store for comics that have been moved or deleted")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        controls.start_rescan();
+                    }
+                    ui.separator();
                     let has_unavailable = app
                         .library
                         .items

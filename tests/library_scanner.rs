@@ -136,3 +136,33 @@ fn zip_fixture_with_metadata(path: &std::path::Path) {
     zip.write_all(b"one").expect("page 1 bytes");
     zip.finish().expect("finish zip");
 }
+
+#[test]
+fn reconciliation_preserves_the_content_hash_of_known_comics() {
+    let dir = tempfile::tempdir().expect("db");
+    let service = LibraryService::initialize(&dir.path().join("library.sqlite")).expect("service");
+    let imported = service
+        .upsert_comic(ComicInput {
+            path: "/store/abc123/book.cbz".to_owned(),
+            hash: "blake3-content-hash".to_owned(),
+            page_count: 10,
+            metadata_id: None,
+        })
+        .expect("imported");
+
+    // A rescan reports the cheap size:mtime fingerprint. That must not replace
+    // the content hash, which names the thumbnail cache entry and the comic's
+    // location in the managed store.
+    service
+        .reconcile_scanned_comics(&[cbr_egui::library::ScannedComic {
+            path: "/store/abc123/book.cbz".to_owned(),
+            fingerprint: "4096:1700000000".to_owned(),
+            page_count: 10,
+            metadata: None,
+        }])
+        .expect("reconcile");
+
+    let reloaded = service.get_comic(imported.id).expect("lookup").expect("row");
+    assert_eq!(reloaded.hash, "blake3-content-hash");
+    assert_eq!(reloaded.availability, ComicAvailability::Available);
+}
