@@ -14,9 +14,14 @@ pub struct LibraryStorage {
 
 impl LibraryStorage {
     pub fn open(path: &std::path::Path) -> Result<Self, LibraryError> {
-        let storage = Self {
-            connection: Connection::open(path)?,
-        };
+        let connection = Connection::open(path)?;
+        // Reading position is checkpointed while the reader is in use, so
+        // writes want to be cheap and must not fail outright if another handle
+        // holds the database for a moment.
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "NORMAL")?;
+        let storage = Self { connection };
         storage.initialize_schema()?;
         Ok(storage)
     }
