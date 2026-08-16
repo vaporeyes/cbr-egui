@@ -3734,7 +3734,14 @@ fn editor_dark_visuals() -> egui::Visuals {
 }
 
 fn open_file_location(path: &str) {
-    let path = Path::new(path);
+    // Resolve first. The value comes from the database, and on Windows it is
+    // interpolated into a single /select, argument that CommandLineToArgvW
+    // re-parses, so a path containing quotes could change how the argument is
+    // split. Canonicalizing also drops the request if the file is gone.
+    let Ok(path) = Path::new(path).canonicalize() else {
+        return;
+    };
+    let path = path.as_path();
     #[cfg(target_os = "macos")]
     {
         let _ = std::process::Command::new("open")
@@ -3744,6 +3751,11 @@ fn open_file_location(path: &str) {
     }
     #[cfg(target_os = "windows")]
     {
+        // Reject anything that could break out of the single composed
+        // argument rather than passing it to the shell's parser.
+        if path.as_os_str().to_string_lossy().contains(['"', '\r', '\n']) {
+            return;
+        }
         let arg = format!("/select,{}", path.display());
         let _ = std::process::Command::new("explorer").arg(arg).spawn();
     }
