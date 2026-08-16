@@ -1686,7 +1686,15 @@ pub fn route_app_update(
         }
     }
     poll_decode_results(ctx, app);
-    library_controls.poll_import(app, library_service);
+    // Files opened from Finder or the command line wait here while another
+    // import runs; the repaint scheduled below retries them next frame.
+    if !library_controls.is_importing() {
+        let external_opens = crate::mac_open::take_pending();
+        if !external_opens.is_empty() {
+            library_controls.start_import_and_open(external_opens);
+        }
+    }
+    library_controls.poll_import(ctx, app, library_service);
     library_controls.poll_thumbnails(ctx, app);
     library_controls.schedule_missing_thumbnails(app);
     if library_controls.is_importing() || library_controls.has_pending_thumbnails() {
@@ -2224,6 +2232,7 @@ const THUMBNAIL_TEXTURE_CACHE_CAPACITY: usize = 256;
 
 pub struct LibraryRootControls {
     import_result_receiver: Option<Receiver<Result<ImportSummary, String>>>,
+    open_first_after_import: bool,
     store_root: PathBuf,
     thumbnail_pool: Option<ThumbnailWorkerPool>,
     pending_thumbnails: HashSet<String>,
@@ -2244,6 +2253,7 @@ impl LibraryRootControls {
     pub fn new() -> Self {
         Self {
             import_result_receiver: None,
+            open_first_after_import: false,
             store_root: default_library_store_root(),
             thumbnail_pool: ThumbnailWorkerPool::start(2, 16).ok(),
             pending_thumbnails: HashSet::new(),
@@ -2275,6 +2285,16 @@ impl LibraryRootControls {
         thread::spawn(move || {
             let _ = sender.send(Ok(import_paths(&files, &store_root)));
         });
+    }
+
+    /// Imports files requested from outside the UI (Finder open events, CLI
+    /// arguments) and opens the first one in the reader once persisted.
+    fn start_import_and_open(&mut self, files: Vec<PathBuf>) {
+        if self.is_importing() || files.is_empty() {
+            return;
+        }
+        self.open_first_after_import = true;
+        self.start_import_files(files);
     }
 
     fn start_import_folder(&mut self, folder: PathBuf) {
@@ -2324,6 +2344,7 @@ impl LibraryRootControls {
 
     fn poll_import(
         &mut self,
+        ctx: &egui::Context,
         app: &mut ComicReaderApp<egui::TextureHandle>,
         library_service: Option<&LibraryService>,
     ) {
@@ -2335,6 +2356,7 @@ impl LibraryRootControls {
         };
 
         self.import_result_receiver = None;
+        let open_after_import = std::mem::take(&mut self.open_first_after_import);
         match result {
             Ok(summary) => {
                 let Some(service) = library_service else {
@@ -2369,6 +2391,19 @@ impl LibraryRootControls {
                     summary.failures.len(),
                     error_text,
                 ));
+                if open_after_import {
+                    let target = summary.imported.first().and_then(|imported| {
+                        let stored = imported.stored_path.to_string_lossy();
+                        app.library
+                            .items
+                            .iter()
+                            .find(|item| item.path == stored)
+                            .cloned()
+                    });
+                    if let Some(item) = target {
+                        open_grid_item_in_reader(ctx, app, &item, library_service);
+                    }
+                }
             }
             Err(message) => {
                 app.library.status_text = Some(message);
