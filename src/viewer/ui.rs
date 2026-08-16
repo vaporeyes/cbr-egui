@@ -240,7 +240,10 @@ fn apply_pending_view_command(
 }
 
 fn render_continuous_page_flow(ui: &mut egui::Ui, state: &mut ViewerState<egui::TextureHandle>) {
-    let Some(canvas) = state.continuous_canvas.clone() else {
+    // Moved out rather than cloned: the canvas holds a rect per page, so
+    // cloning it to satisfy the borrow checker copied the whole page list every
+    // frame. It goes back below, before this function returns.
+    let Some(canvas) = state.continuous_canvas.take() else {
         render_center_message(ui, "Loading pages");
         return;
     };
@@ -271,12 +274,18 @@ fn render_continuous_page_flow(ui: &mut egui::Ui, state: &mut ViewerState<egui::
             }
             let window =
                 crate::viewer::visible_page_window(&canvas, viewport_top, viewport.height());
-            let pages_to_paint = window.all_pages();
 
-            for page in &state.continuous_pages {
-                if !pages_to_paint.contains(&page.page_index) {
+            // Walk the handful of visible pages and index straight into the
+            // page list, rather than walking every page in the comic and
+            // testing each against the visible set.
+            for page_index in window.all_pages() {
+                let Some(page) = state
+                    .continuous_pages
+                    .get(page_index)
+                    .filter(|page| page.page_index == page_index)
+                else {
                     continue;
-                }
+                };
                 let rect = egui::Rect::from_min_size(
                     egui::pos2(canvas_rect.left(), canvas_rect.top() + page.rect.y),
                     egui::vec2(page.rect.size.width, page.rect.size.height),
@@ -297,6 +306,7 @@ fn render_continuous_page_flow(ui: &mut egui::Ui, state: &mut ViewerState<egui::
             visible_window = Some(window);
         });
 
+    state.continuous_canvas = Some(canvas);
     state.continuous_visible_window = visible_window;
     render_status_chrome(ui, state);
 }
