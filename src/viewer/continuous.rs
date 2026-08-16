@@ -115,7 +115,6 @@ impl Default for ScrollAnchor {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContinuousScrollState {
     pub page_measurements: HashMap<usize, PageMeasurement>,
-    pub visible_window: Option<VisiblePageWindow>,
     pub scroll_anchor: ScrollAnchor,
     pub gap: f32,
     pub placeholder_ratio: f32,
@@ -134,7 +133,6 @@ impl ContinuousScrollState {
     pub fn new() -> Self {
         Self {
             page_measurements: HashMap::new(),
-            visible_window: None,
             scroll_anchor: ScrollAnchor::default(),
             gap: CONTINUOUS_PAGE_GAP,
             placeholder_ratio: DEFAULT_PLACEHOLDER_ASPECT_RATIO,

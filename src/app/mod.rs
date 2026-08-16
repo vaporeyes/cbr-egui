@@ -336,7 +336,6 @@ pub struct ReadingSession<T> {
     pub comic_id: i64,
     pub current_page_index: usize,
     pub page_count: usize,
-    pub spread_mode_enabled: bool,
     pub viewer_state: ViewerState<T>,
     pub prefetch: PrefetchRuntime,
     pub texture_cache: PageTextureCache<CachedPage<T>>,
@@ -375,7 +374,6 @@ impl<T> ReadingSession<T> {
             comic_id,
             current_page_index: 0,
             page_count,
-            spread_mode_enabled: false,
             viewer_state: ViewerState::new(),
             prefetch: PrefetchRuntime::default(),
             texture_cache: PageTextureCache::with_default_capacity(),
@@ -428,7 +426,6 @@ impl<T> ReadingSession<T> {
             comic_id,
             current_page_index: 0,
             page_count,
-            spread_mode_enabled: false,
             viewer_state: ViewerState::new(),
             prefetch: PrefetchRuntime::default(),
             texture_cache: PageTextureCache::new(cache_capacity)?,
@@ -454,6 +451,9 @@ impl<T> ReadingSession<T> {
         })
     }
 
+    /// Moves the reader to a page and points the paged renderer at it. This is
+    /// the deliberate navigation path; scroll-driven tracking goes through
+    /// `sync_continuous_current_page` instead.
     pub fn set_current_page(&mut self, page_index: usize) {
         let next_page_index = page_index.min(self.page_count.saturating_sub(1));
         if self.current_page_index != next_page_index {
@@ -461,13 +461,14 @@ impl<T> ReadingSession<T> {
         }
         self.current_page_index = next_page_index;
         self.viewer_state
-            .set_current_page(PageId(self.current_page_index as u64));
+            .set_composed_page(PageId(self.current_page_index as u64));
     }
 
     /// Tracks the page the continuous-scroll viewport is on. Unlike
     /// `set_current_page` this must not advance the prefetch generation
     /// (which would drop in-flight decodes for the same scroll burst) and
-    /// must not reset paged-mode zoom/pan state.
+    /// must not touch the viewer's composed page, which would reset paged-mode
+    /// zoom and pan on every scroll tick.
     pub fn sync_continuous_current_page(&mut self, page_index: usize) {
         self.current_page_index = page_index.min(self.page_count.saturating_sub(1));
     }
@@ -501,8 +502,15 @@ impl<T> ReadingSession<T> {
         self.viewer_state.next_page_status = PageStatus::Empty;
     }
 
+    /// Whether the two-page spread is on. The viewer owns this outright, so
+    /// the session reads through rather than mirroring it. When both held a
+    /// copy, `ViewerState::set_spread_mode_enabled` refusing the change in
+    /// continuous mode left the two disagreeing.
+    pub fn spread_mode_enabled(&self) -> bool {
+        self.viewer_state.spread_mode_enabled
+    }
+
     pub fn set_spread_mode_enabled(&mut self, enabled: bool) {
-        self.spread_mode_enabled = enabled;
         self.viewer_state.set_spread_mode_enabled(enabled);
     }
 

@@ -113,7 +113,7 @@ fn viewer_state_updates_page_statuses() {
     assert!(state.page_status.is_empty());
 
     state.set_loading(page);
-    assert_eq!(state.current_page_id, Some(page));
+    assert_eq!(state.composed_page_id, Some(page));
     assert!(state.page_status.is_loading());
     assert_eq!(state.page_status.page_id(), Some(page));
 

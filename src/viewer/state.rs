@@ -292,7 +292,13 @@ impl Default for ViewerChrome {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewerState<T> {
-    pub current_page_id: Option<PageId>,
+    /// Page the paged renderer is currently composing. This is the identity
+    /// zoom, pan, and the spread decision are keyed on, and it is deliberately
+    /// not the same thing as `ReadingSession::current_page_index`: in
+    /// continuous mode the session tracks the page under the viewport while
+    /// this stays put, because moving it would reset zoom and pan on every
+    /// scroll tick.
+    pub composed_page_id: Option<PageId>,
     pub view_mode: ViewMode,
     pub zoom_sensitivity: f32,
     pub zoom_pan: ZoomPanState,
@@ -320,7 +326,7 @@ pub struct ViewerState<T> {
 impl<T> Default for ViewerState<T> {
     fn default() -> Self {
         Self {
-            current_page_id: None,
+            composed_page_id: None,
             view_mode: ViewMode::Fit,
             zoom_sensitivity: DEFAULT_SCROLL_ZOOM_SENSITIVITY,
             zoom_pan: ZoomPanState::default(),
@@ -350,9 +356,9 @@ impl<T> ViewerState<T> {
         Self::default()
     }
 
-    pub fn set_current_page(&mut self, page_id: PageId) {
-        if self.current_page_id != Some(page_id) {
-            self.current_page_id = Some(page_id);
+    pub fn set_composed_page(&mut self, page_id: PageId) {
+        if self.composed_page_id != Some(page_id) {
+            self.composed_page_id = Some(page_id);
             self.zoom_pan.reset_for_page(page_id);
             self.spread_decision = None;
             self.next_page_status = PageStatus::Empty;
@@ -366,7 +372,7 @@ impl<T> ViewerState<T> {
         }
         if self.spread_mode_enabled != enabled {
             self.spread_mode_enabled = enabled;
-            if let Some(page_id) = self.current_page_id {
+            if let Some(page_id) = self.composed_page_id {
                 self.zoom_pan.reset_for_page(page_id);
             }
             self.spread_decision = None;
@@ -391,20 +397,20 @@ impl<T> ViewerState<T> {
                 self.next_page_status = PageStatus::Empty;
                 self.spread_decision = None;
             }
-            if let Some(page_id) = self.current_page_id {
+            if let Some(page_id) = self.composed_page_id {
                 self.zoom_pan.reset_for_page(page_id);
             }
         }
     }
 
     pub fn set_loading(&mut self, page_id: PageId) {
-        self.set_current_page(page_id);
+        self.set_composed_page(page_id);
         self.page_status = PageStatus::loading(page_id);
         self.chrome.status_text = Some("Loading page".to_owned());
     }
 
     pub fn set_ready(&mut self, page_id: PageId, texture: T, pixel_size: Size2) {
-        self.set_current_page(page_id);
+        self.set_composed_page(page_id);
         self.page_status = PageStatus::ready(page_id, texture, pixel_size);
         self.chrome.status_text = None;
     }
@@ -455,7 +461,7 @@ impl<T> ViewerState<T> {
 
     pub fn set_failed(&mut self, page_id: PageId, message: impl Into<String>) {
         let message = message.into();
-        self.set_current_page(page_id);
+        self.set_composed_page(page_id);
         self.page_status = PageStatus::failed(page_id, message.clone());
         self.chrome.status_text = Some(message);
     }

@@ -325,7 +325,6 @@ fn dispatch_continuous_if_ready(
     let Some(window) = session.viewer_state.continuous_visible_window.clone() else {
         return;
     };
-    session.continuous_scroll.visible_window = Some(window.clone());
     // Keep the session's current page in step with the scroll position so the
     // page counter, progress checkpoints, bookmarks, and the sidebar highlight
     // reflect what is actually on screen. The page under the viewport vertical
@@ -447,7 +446,7 @@ fn process_reader_navigation(
     // When a two-page spread is on screen, next/previous step over the whole
     // pair so the reader never re-shows a page it just displayed. Landscape
     // singles and pending pairs still step by one.
-    let spread_pair_active = session.spread_mode_enabled
+    let spread_pair_active = session.spread_mode_enabled()
         && session.viewer_state.layout_mode == ReadingLayoutMode::Paged
         && matches!(
             session.viewer_state.spread_decision,
@@ -1022,8 +1021,10 @@ fn toggle_reader_continuous(app: &mut ComicReaderApp<egui::TextureHandle>) {
             .viewer_state
             .set_layout_mode(ReadingLayoutMode::Paged);
     } else {
+        // Turn the spread off before switching, while the viewer will still
+        // accept the change: set_spread_mode_enabled refuses it once the
+        // layout is continuous.
         session.set_spread_mode_enabled(false);
-        session.spread_mode_enabled = false;
         session
             .viewer_state
             .set_layout_mode(ReadingLayoutMode::ContinuousVertical);
@@ -1037,7 +1038,7 @@ fn toggle_reader_spread(ctx: &egui::Context, app: &mut ComicReaderApp<egui::Text
     if session.viewer_state.layout_mode == ReadingLayoutMode::ContinuousVertical {
         return;
     }
-    let enabled = !session.spread_mode_enabled;
+    let enabled = !session.spread_mode_enabled();
     session.set_spread_mode_enabled(enabled);
     if enabled {
         ensure_spread_next_page_loaded(ctx, app);
@@ -1127,7 +1128,7 @@ fn ensure_spread_next_page_loaded(
     let Some(session) = &mut app.reading else {
         return;
     };
-    if !session.spread_mode_enabled {
+    if !session.spread_mode_enabled() {
         return;
     }
     let next_page_index = session.current_page_index.saturating_add(1);
@@ -2053,7 +2054,7 @@ fn render_reader_menu_bar(
                     if ui.checkbox(&mut continuous_enabled, "Continuous scroll").changed() {
                         session.viewer_state.pending_app_command = Some(AppCommand::ToggleContinuous);
                     }
-                    let mut spread_enabled = session.spread_mode_enabled;
+                    let mut spread_enabled = session.spread_mode_enabled();
                     let spread_allowed = session.viewer_state.layout_mode
                         != ReadingLayoutMode::ContinuousVertical;
                     if ui
@@ -2220,7 +2221,7 @@ fn render_reader_nav_controls(
         session.viewer_state.pending_app_command = Some(AppCommand::ToggleContinuous);
     }
     let spread_allowed = !continuous;
-    let spread_active = session.spread_mode_enabled && spread_allowed;
+    let spread_active = session.spread_mode_enabled() && spread_allowed;
     if ui
         .add_enabled(
             spread_allowed,

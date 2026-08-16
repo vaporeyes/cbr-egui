@@ -171,12 +171,12 @@ fn same_page_identity_preserves_zoom_and_pan() {
 fn viewer_current_page_reset_ignores_stale_input_state() {
     let mut state: ViewerState<&str> = ViewerState::new();
 
-    state.set_current_page(PageId(1));
+    state.set_composed_page(PageId(1));
     state.zoom_pan.apply_scroll_zoom(500.0);
     state.zoom_pan.pan_offset = Point2::new(250.0, -150.0);
-    state.set_current_page(PageId(2));
+    state.set_composed_page(PageId(2));
 
-    assert_eq!(state.current_page_id, Some(PageId(2)));
+    assert_eq!(state.composed_page_id, Some(PageId(2)));
     assert_eq!(state.zoom_pan.zoom, DEFAULT_FIT_ZOOM);
     assert_eq!(state.zoom_pan.pan_offset, Point2::ZERO);
     assert_eq!(state.zoom_pan.reset_generation, 2);
