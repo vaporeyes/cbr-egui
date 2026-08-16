@@ -1784,8 +1784,14 @@ pub fn route_app_update(
                 .map(|session| session.viewer_state.chrome.visible)
                 .unwrap_or(true);
 
-            if let Some(item) = active_library_item(app) {
-                ensure_reader_page_loaded(ctx, app, &item);
+            // Resolved once per frame. This searches the library and clones the
+            // item so the reader helpers can take `&mut app`; doing it at each
+            // call site meant several copies of a struct of owned strings every
+            // frame.
+            let active_item = active_library_item(app);
+
+            if let Some(item) = &active_item {
+                ensure_reader_page_loaded(ctx, app, item);
             }
             let is_scrolling_continuous_view = ctx.input(|input| {
                 input.raw_scroll_delta.y != 0.0 || input.smooth_scroll_delta.y != 0.0
@@ -1802,12 +1808,12 @@ pub fn route_app_update(
             }
             render_about_window(ctx, &mut library_controls.about_open);
             render_shortcuts_window(ctx, &mut library_controls.shortcuts_open);
-            if let Some(item) = active_library_item(app) {
+            if let Some(item) = &active_item {
                 poll_page_thumbnail_results(ctx, app);
                 if chrome_visible {
-                    render_reader_page_sidebar(ctx, app, &item);
+                    render_reader_page_sidebar(ctx, app, item);
                 }
-                process_reader_view_command(ctx, app, &item);
+                process_reader_view_command(ctx, app, item);
             }
             if let Some(session) = &mut app.reading
                 && session.show_info_panel {
@@ -1824,12 +1830,12 @@ pub fn route_app_update(
             {
                 toggle_active_bookmark(app, library_service);
             }
-            if let Some(item) = active_library_item(app) {
-                process_reader_view_command(ctx, app, &item);
-                process_reader_navigation(ctx, app, &item);
-                render_reader_adjustments(ctx, app, &item);
-                dispatch_continuous_if_ready(ctx, app, &item);
-                dispatch_prefetch_if_ready(ctx, app, &item);
+            if let Some(item) = &active_item {
+                process_reader_view_command(ctx, app, item);
+                process_reader_navigation(ctx, app, item);
+                render_reader_adjustments(ctx, app, item);
+                dispatch_continuous_if_ready(ctx, app, item);
+                dispatch_prefetch_if_ready(ctx, app, item);
             }
         }
     }
@@ -2965,7 +2971,7 @@ fn render_library_shelf(
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.selectable_value(&mut next_filter, None, "All comics");
 
-                let groups = app.library.groups().to_vec();
+                let groups = app.library.groups();
                 let builtins = groups.iter().filter(|g| g.kind == LibraryGroupKind::Builtin);
                 for group in builtins {
                     ui.selectable_value(
@@ -3790,6 +3796,9 @@ pub struct EguiComicReaderApp {
     /// Time (egui clock, seconds) at which `pending_progress` should be
     /// written. `None` means nothing is waiting.
     progress_flush_due_at: Option<f64>,
+    /// Theme the egui style was last built for, so it is only rebuilt on a
+    /// change rather than every frame.
+    last_applied_dark_mode: Option<bool>,
     last_window_title: Option<String>,
 }
 
@@ -3837,6 +3846,7 @@ impl EguiComicReaderApp {
             last_checkpointed_progress: None,
             pending_progress: None,
             progress_flush_due_at: None,
+            last_applied_dark_mode: None,
             last_window_title: None,
         };
         app.hydrate_library_from_service();
@@ -3865,6 +3875,7 @@ impl EguiComicReaderApp {
             last_checkpointed_progress: None,
             pending_progress: None,
             progress_flush_due_at: None,
+            last_applied_dark_mode: None,
             last_window_title: None,
         };
         app.hydrate_library_from_service();
@@ -4168,7 +4179,12 @@ impl Default for EguiComicReaderApp {
 
 impl eframe::App for EguiComicReaderApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.apply_config_to_context(ctx);
+        // Only dark_mode feeds the style, so rebuilding and re-uploading the
+        // whole egui Style every frame achieved nothing.
+        if self.last_applied_dark_mode != Some(self.config.dark_mode) {
+            self.apply_config_to_context(ctx);
+            self.last_applied_dark_mode = Some(self.config.dark_mode);
+        }
         let was_reading = matches!(self.inner.state, AppState::Reading(_));
         route_app_update(
             ctx,
@@ -4201,6 +4217,7 @@ impl EguiComicReaderApp {
             last_checkpointed_progress: None,
             pending_progress: None,
             progress_flush_due_at: None,
+            last_applied_dark_mode: None,
             last_window_title: None,
         }
     }
