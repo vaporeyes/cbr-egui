@@ -3682,8 +3682,19 @@ pub struct EguiComicReaderApp {
     pub library_service: Option<LibraryService>,
     pub settings: SettingsWindowState,
     last_checkpointed_progress: Option<ProgressSnapshot>,
+    /// Latest unsaved reading position. Held so the position can still be
+    /// written after the session is torn down (returning to the library).
+    pending_progress: Option<ProgressSnapshot>,
+    /// Time (egui clock, seconds) at which `pending_progress` should be
+    /// written. `None` means nothing is waiting.
+    progress_flush_due_at: Option<f64>,
     last_window_title: Option<String>,
 }
+
+/// How long a reading position is held in memory before being written. Each
+/// write is a synchronous SQLite commit, so persisting on every page change
+/// puts an fsync in the middle of continuous scrolling.
+const PROGRESS_FLUSH_INTERVAL_S: f64 = 2.0;
 
 impl EguiComicReaderApp {
     pub fn new() -> Self {
@@ -3709,6 +3720,8 @@ impl EguiComicReaderApp {
             library_service,
             settings: SettingsWindowState::default(),
             last_checkpointed_progress: None,
+            pending_progress: None,
+            progress_flush_due_at: None,
             last_window_title: None,
         };
         app.hydrate_library_from_service();
@@ -3732,6 +3745,8 @@ impl EguiComicReaderApp {
             library_service: Some(library_service),
             settings: SettingsWindowState::default(),
             last_checkpointed_progress: None,
+            pending_progress: None,
+            progress_flush_due_at: None,
             last_window_title: None,
         };
         app.hydrate_library_from_service();
@@ -3797,6 +3812,10 @@ impl EguiComicReaderApp {
 
     pub fn reconcile_resume_state_after_route(&mut self, was_reading: bool) {
         if was_reading && matches!(self.inner.state, AppState::Library) {
+            // The session is already gone, so the throttled checkpoint can no
+            // longer see its position. Write whatever it last observed before
+            // dropping the resume state.
+            self.flush_pending_progress();
             self.config.resume_last_session = false;
             self.last_checkpointed_progress = None;
             if let Err(error) = self.config.save(&self.config_path) {
@@ -3807,7 +3826,14 @@ impl EguiComicReaderApp {
 
     pub fn flush_lifecycle_state(&mut self) -> Result<(), String> {
         let mut errors = Vec::new();
-        let active_snapshot = self.inner.active_progress_snapshot();
+        // Prefer the live session; fall back to a position that was still
+        // waiting on the flush timer when the session ended.
+        let active_snapshot = self
+            .inner
+            .active_progress_snapshot()
+            .or(self.pending_progress);
+        self.pending_progress = None;
+        self.progress_flush_due_at = None;
         if active_snapshot.is_some() {
             self.config.resume_last_session = true;
         }
@@ -3832,10 +3858,54 @@ impl EguiComicReaderApp {
         }
     }
 
+    /// Writes the active reading position immediately, skipping the flush
+    /// timer. Used by callers that need the position durable right away.
     pub fn checkpoint_active_progress(&mut self) -> Result<(), String> {
         let Some(snapshot) = self.inner.active_progress_snapshot() else {
             return Ok(());
         };
+        self.pending_progress = None;
+        self.progress_flush_due_at = None;
+        self.write_progress_snapshot(snapshot)
+    }
+
+    /// Records the active reading position and writes it once it has been
+    /// stable for `PROGRESS_FLUSH_INTERVAL_S`. Continuous scrolling changes the
+    /// current page many times per second and each write is a synchronous
+    /// SQLite commit, so writing on every change stalls the frame loop.
+    fn checkpoint_active_progress_throttled(&mut self, ctx: &egui::Context) {
+        let Some(snapshot) = self.inner.active_progress_snapshot() else {
+            self.pending_progress = None;
+            self.progress_flush_due_at = None;
+            return;
+        };
+        if self.last_checkpointed_progress == Some(snapshot) {
+            self.pending_progress = None;
+            self.progress_flush_due_at = None;
+            return;
+        }
+
+        self.pending_progress = Some(snapshot);
+        let now = ctx.input(|input| input.time);
+        let due_at = *self
+            .progress_flush_due_at
+            .get_or_insert(now + PROGRESS_FLUSH_INTERVAL_S);
+        if now >= due_at {
+            self.flush_pending_progress();
+        } else {
+            ctx.request_repaint_after(Duration::from_secs_f64(due_at - now));
+        }
+    }
+
+    fn flush_pending_progress(&mut self) {
+        self.progress_flush_due_at = None;
+        let Some(snapshot) = self.pending_progress.take() else {
+            return;
+        };
+        let _ = self.write_progress_snapshot(snapshot);
+    }
+
+    fn write_progress_snapshot(&mut self, snapshot: ProgressSnapshot) -> Result<(), String> {
         if self.last_checkpointed_progress == Some(snapshot) {
             return Ok(());
         }
@@ -3849,7 +3919,7 @@ impl EguiComicReaderApp {
                     item.current_page = snapshot.current_page;
                     item.is_read = snapshot.is_read;
                 }
-                self.inner.library.refresh_filter_cache();
+                self.inner.library.refresh_progress_derived_state();
                 // Persist the resume flag to disk on the first checkpoint so a hard exit
                 // (no save hook) still reopens this comic on next launch.
                 let needs_config_save = !self.config.resume_last_session;
@@ -3991,7 +4061,7 @@ impl eframe::App for EguiComicReaderApp {
             self.library_service.as_ref(),
         );
         self.reconcile_resume_state_after_route(was_reading);
-        let _ = self.checkpoint_active_progress();
+        self.checkpoint_active_progress_throttled(ctx);
         self.sync_window_title(ctx);
         self.render_settings_window(ctx);
     }
@@ -4011,6 +4081,8 @@ impl EguiComicReaderApp {
             library_service: None,
             settings: SettingsWindowState::default(),
             last_checkpointed_progress: None,
+            pending_progress: None,
+            progress_flush_due_at: None,
             last_window_title: None,
         }
     }

@@ -799,40 +799,87 @@ impl LibraryViewState {
         }
 
         let mut groups = groups.into_values().collect::<Vec<_>>();
-        let continue_reading_count = self.items.iter().filter(|i| !i.is_read && i.current_page > 0).count();
-        if continue_reading_count > 0 {
-            groups.push(LibraryGroup {
-                kind: LibraryGroupKind::Builtin,
-                key: "continue_reading".to_owned(),
-                label: "Continue Reading".to_owned(),
-                item_count: continue_reading_count,
-            });
+        for (key, label, count) in self.builtin_group_counts() {
+            if count > 0 {
+                groups.push(LibraryGroup {
+                    kind: LibraryGroupKind::Builtin,
+                    key: key.to_owned(),
+                    label: label.to_owned(),
+                    item_count: count,
+                });
+            }
         }
-        let unread_count = self.items.iter().filter(|i| !i.is_read && i.current_page == 0).count();
-        if unread_count > 0 {
-            groups.push(LibraryGroup {
-                kind: LibraryGroupKind::Builtin,
-                key: "unread".to_owned(),
-                label: "Unread".to_owned(),
-                item_count: unread_count,
-            });
-        }
-        let read_count = self.items.iter().filter(|i| i.is_read).count();
-        if read_count > 0 {
-            groups.push(LibraryGroup {
-                kind: LibraryGroupKind::Builtin,
-                key: "read".to_owned(),
-                label: "Read".to_owned(),
-                item_count: read_count,
-            });
-        }
-        groups.sort_by(|a, b| {
-            a.kind
-                .cmp(&b.kind)
-                .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
-                .then_with(|| a.key.cmp(&b.key))
-        });
+        groups.sort_by(compare_groups);
         groups
+    }
+
+    /// Counts for the three progress-derived shelves, in group order.
+    fn builtin_group_counts(&self) -> [(&'static str, &'static str, usize); 3] {
+        let mut continue_reading = 0;
+        let mut unread = 0;
+        let mut read = 0;
+        for item in &self.items {
+            if item.is_read {
+                read += 1;
+            } else if item.current_page > 0 {
+                continue_reading += 1;
+            } else {
+                unread += 1;
+            }
+        }
+        [
+            ("continue_reading", "Continue Reading", continue_reading),
+            ("unread", "Unread", unread),
+            ("read", "Read", read),
+        ]
+    }
+
+    /// Refreshes only the parts of the cached view that reading progress can
+    /// change. Series and folder grouping, the search match set, and the sort
+    /// order are all independent of progress, so the full rebuild is needed
+    /// only when a progress-derived filter is active and the visible set can
+    /// actually change. This keeps a page turn off the O(n log n) path.
+    pub fn refresh_progress_derived_state(&mut self) {
+        let builtin_filter_active = self
+            .active_filter
+            .as_ref()
+            .is_some_and(|filter| filter.kind == LibraryGroupKind::Builtin);
+        if builtin_filter_active {
+            self.refresh_filter_cache();
+            return;
+        }
+        self.refresh_builtin_group_counts();
+    }
+
+    fn refresh_builtin_group_counts(&mut self) {
+        let mut membership_changed = false;
+        for (key, label, count) in self.builtin_group_counts() {
+            let existing = self
+                .groups
+                .iter()
+                .position(|group| group.kind == LibraryGroupKind::Builtin && group.key == key);
+            match (existing, count) {
+                (Some(index), 0) => {
+                    self.groups.remove(index);
+                    membership_changed = true;
+                }
+                (Some(index), count) => self.groups[index].item_count = count,
+                (None, 0) => {}
+                (None, count) => {
+                    self.groups.push(LibraryGroup {
+                        kind: LibraryGroupKind::Builtin,
+                        key: key.to_owned(),
+                        label: label.to_owned(),
+                        item_count: count,
+                    });
+                    membership_changed = true;
+                }
+            }
+        }
+        if membership_changed {
+            self.groups.sort_by(compare_groups);
+            self.reconcile_active_filter();
+        }
     }
 
     pub fn reconcile_active_filter(&mut self) {
@@ -847,4 +894,11 @@ impl LibraryViewState {
             self.active_filter = None;
         }
     }
+}
+
+fn compare_groups(a: &LibraryGroup, b: &LibraryGroup) -> std::cmp::Ordering {
+    a.kind
+        .cmp(&b.kind)
+        .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+        .then_with(|| a.key.cmp(&b.key))
 }
