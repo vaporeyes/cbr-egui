@@ -27,8 +27,8 @@ use crate::library::{
 use crate::vfs::{self, ArchiveReader};
 use crate::viewer::layout::{Size2, ViewMode};
 use crate::viewer::{
-    self, ContinuousPage, ContinuousPageStatus, PageId, PageNavigationCommand, PageStatus,
-    ReadingDirection, ReadingLayoutMode, ViewCommand, ZoomAnchor, anchor_for_viewport,
+    self, AppCommand, ContinuousPage, ContinuousPageStatus, PageId, PageNavigationCommand,
+    PageStatus, ReadingDirection, ReadingLayoutMode, ViewCommand, ZoomAnchor, anchor_for_viewport,
     build_virtual_canvas, prefetch_candidates, scroll_top_for_anchor,
 };
 
@@ -501,7 +501,10 @@ fn process_reader_navigation(
     }
 }
 
-fn process_reader_view_command(
+/// Carries out the commands the viewer cannot: they need archive access, cache
+/// invalidation, or a re-decode. Runs after the viewer has rendered, so a
+/// command raised by a keypress during rendering is picked up in the same frame.
+fn process_reader_app_command(
     ctx: &egui::Context,
     app: &mut ComicReaderApp<egui::TextureHandle>,
     item: &LibraryGridItem,
@@ -509,27 +512,28 @@ fn process_reader_view_command(
     let Some(command) = app
         .reading
         .as_mut()
-        .and_then(|session| session.viewer_state.pending_view_command.take())
+        .and_then(|session| session.viewer_state.pending_app_command.take())
     else {
         return;
     };
 
     match command {
-        ViewCommand::ToggleSpread => toggle_reader_spread(ctx, app),
-        ViewCommand::ToggleContinuous => toggle_reader_continuous(app),
-        ViewCommand::RotateLeft => rotate_reader(ctx, app, item, false),
-        ViewCommand::RotateRight => rotate_reader(ctx, app, item, true),
-        ViewCommand::ExtractPage => extract_reader_page(app),
-        _ => {
-            if let Some(session) = &mut app.reading {
-                // Zoom and fit commands only apply in the paged renderer.
-                // Continuous mode has no consumer, so drop them rather than
-                // letting a stale command apply when the layout switches back.
-                if session.viewer_state.layout_mode != ReadingLayoutMode::ContinuousVertical {
-                    session.viewer_state.pending_view_command = Some(command);
-                }
-            }
-        }
+        AppCommand::ToggleSpread => toggle_reader_spread(ctx, app),
+        AppCommand::ToggleContinuous => toggle_reader_continuous(app),
+        AppCommand::RotateLeft => rotate_reader(ctx, app, item, false),
+        AppCommand::RotateRight => rotate_reader(ctx, app, item, true),
+        AppCommand::ExtractPage => extract_reader_page(app),
+    }
+}
+
+/// Drops a queued zoom or fit command when the layout has switched to
+/// continuous, which has no consumer for them. Without this the command would
+/// sit in the slot and fire on returning to the paged renderer.
+fn discard_stale_view_command(app: &mut ComicReaderApp<egui::TextureHandle>) {
+    if let Some(session) = &mut app.reading
+        && session.viewer_state.layout_mode == ReadingLayoutMode::ContinuousVertical
+    {
+        session.viewer_state.pending_view_command = None;
     }
 }
 
@@ -1813,8 +1817,8 @@ pub fn route_app_update(
                 if chrome_visible {
                     render_reader_page_sidebar(ctx, app, item);
                 }
-                process_reader_view_command(ctx, app, item);
             }
+            discard_stale_view_command(app);
             if let Some(session) = &mut app.reading
                 && session.show_info_panel {
                     render_reader_info_panel(ctx, session);
@@ -1831,7 +1835,7 @@ pub fn route_app_update(
                 toggle_active_bookmark(app, library_service);
             }
             if let Some(item) = &active_item {
-                process_reader_view_command(ctx, app, item);
+                process_reader_app_command(ctx, app, item);
                 process_reader_navigation(ctx, app, item);
                 render_reader_adjustments(ctx, app, item);
                 dispatch_continuous_if_ready(ctx, app, item);
@@ -1942,8 +1946,7 @@ fn render_reader_menu_bar(
                     if ui.button("Extract current page…").clicked() {
                         ui.close_menu();
                         if let Some(session) = &mut app.reading {
-                            session.viewer_state.pending_view_command =
-                                Some(ViewCommand::ExtractPage);
+                            session.viewer_state.pending_app_command = Some(AppCommand::ExtractPage);
                         }
                     }
                     ui.separator();
@@ -1965,13 +1968,11 @@ fn render_reader_menu_bar(
                     };
                     if ui.button("Rotate left").clicked() {
                         ui.close_menu();
-                        session.viewer_state.pending_view_command =
-                            Some(ViewCommand::RotateLeft);
+                        session.viewer_state.pending_app_command = Some(AppCommand::RotateLeft);
                     }
                     if ui.button("Rotate right").clicked() {
                         ui.close_menu();
-                        session.viewer_state.pending_view_command =
-                            Some(ViewCommand::RotateRight);
+                        session.viewer_state.pending_app_command = Some(AppCommand::RotateRight);
                     }
                     ui.separator();
                     ui.separator();
@@ -2045,8 +2046,7 @@ fn render_reader_menu_bar(
                     let mut continuous_enabled = session.viewer_state.layout_mode
                         == ReadingLayoutMode::ContinuousVertical;
                     if ui.checkbox(&mut continuous_enabled, "Continuous scroll").changed() {
-                        session.viewer_state.pending_view_command =
-                            Some(ViewCommand::ToggleContinuous);
+                        session.viewer_state.pending_app_command = Some(AppCommand::ToggleContinuous);
                     }
                     let mut spread_enabled = session.spread_mode_enabled;
                     let spread_allowed = session.viewer_state.layout_mode
@@ -2058,8 +2058,7 @@ fn render_reader_menu_bar(
                         .inner
                         .changed()
                     {
-                        session.viewer_state.pending_view_command =
-                            Some(ViewCommand::ToggleSpread);
+                        session.viewer_state.pending_app_command = Some(AppCommand::ToggleSpread);
                     }
                     let mut fill_crop = session.viewer_state.view_mode == ViewMode::Fill;
                     if ui.checkbox(&mut fill_crop, "Crop fill").changed() {
@@ -2213,7 +2212,7 @@ fn render_reader_nav_controls(
     // Layout toggles.
     let continuous = session.viewer_state.layout_mode == ReadingLayoutMode::ContinuousVertical;
     if icon_toggle(ui, continuous, icon::SCROLL, "Continuous scroll (V)").clicked() {
-        session.viewer_state.pending_view_command = Some(ViewCommand::ToggleContinuous);
+        session.viewer_state.pending_app_command = Some(AppCommand::ToggleContinuous);
     }
     let spread_allowed = !continuous;
     let spread_active = session.spread_mode_enabled && spread_allowed;
@@ -2225,13 +2224,13 @@ fn render_reader_nav_controls(
         .on_hover_text("Two-page spread (S)")
         .clicked()
     {
-        session.viewer_state.pending_view_command = Some(ViewCommand::ToggleSpread);
+        session.viewer_state.pending_app_command = Some(AppCommand::ToggleSpread);
     }
     if icon_button(ui, icon::ARROW_COUNTER_CLOCKWISE, "Rotate left (Shift+R)").clicked() {
-        session.viewer_state.pending_view_command = Some(ViewCommand::RotateLeft);
+        session.viewer_state.pending_app_command = Some(AppCommand::RotateLeft);
     }
     if icon_button(ui, icon::ARROW_CLOCKWISE, "Rotate right (R)").clicked() {
-        session.viewer_state.pending_view_command = Some(ViewCommand::RotateRight);
+        session.viewer_state.pending_app_command = Some(AppCommand::RotateRight);
     }
     ui.separator();
 

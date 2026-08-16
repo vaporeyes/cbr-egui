@@ -24,7 +24,7 @@ pub use spread::{
     spread_result_matches_generation,
 };
 pub use state::{
-    ContinuousPage, ContinuousPageStatus, DEFAULT_FIT_ZOOM, DEFAULT_MAX_ZOOM, DEFAULT_MIN_ZOOM,
-    PageNavigationCommand, PageStatus, ViewCommand, ViewerChrome, ViewerState, ZoomAnchor,
-    ZoomPanState, corrupted_page_color_image,
+    AppCommand, ContinuousPage, ContinuousPageStatus, DEFAULT_FIT_ZOOM, DEFAULT_MAX_ZOOM,
+    DEFAULT_MIN_ZOOM, PageNavigationCommand, PageStatus, ViewCommand, ViewerChrome, ViewerState,
+    ZoomAnchor, ZoomPanState, corrupted_page_color_image,
 };

@@ -7,8 +7,8 @@ use crate::viewer::spread::{
     ReadingDirection, ReadingLayoutMode, SpreadDecision, ordered_spread_pages,
 };
 use crate::viewer::state::{
-    ContinuousPageStatus, PageNavigationCommand, PageStatus, ViewCommand, ViewerState, ZoomAnchor,
-    corrupted_page_color_image,
+    AppCommand, ContinuousPageStatus, PageNavigationCommand, PageStatus, ViewCommand, ViewerState,
+    ZoomAnchor, corrupted_page_color_image,
 };
 
 const KEYBOARD_ZOOM_STEP: f32 = 1.2;
@@ -229,13 +229,6 @@ fn apply_pending_view_command(
                 .zoom_pan
                 .apply_zoom_factor(1.0 / KEYBOARD_ZOOM_STEP, ZoomAnchor::CENTER);
         }
-        ViewCommand::ToggleSpread => {}
-        ViewCommand::ToggleContinuous => {}
-        // Rotation is handled at the app layer (re-decode + cache invalidation);
-        // the viewer never consumes these.
-        ViewCommand::RotateLeft => {}
-        ViewCommand::RotateRight => {}
-        ViewCommand::ExtractPage => {}
     }
 }
 
@@ -479,15 +472,18 @@ fn handle_keybindings(ui: &mut egui::Ui, state: &mut ViewerState<egui::TextureHa
             state.pending_view_command = Some(ViewCommand::ZoomIn);
         } else if input.key_pressed(egui::Key::Minus) {
             state.pending_view_command = Some(ViewCommand::ZoomOut);
-        } else if input.key_pressed(egui::Key::S) {
-            state.pending_view_command = Some(ViewCommand::ToggleSpread);
+        }
+
+        // These go to the app layer, which owns the archive and the caches.
+        if input.key_pressed(egui::Key::S) {
+            state.pending_app_command = Some(AppCommand::ToggleSpread);
         } else if input.key_pressed(egui::Key::V) {
-            state.pending_view_command = Some(ViewCommand::ToggleContinuous);
+            state.pending_app_command = Some(AppCommand::ToggleContinuous);
         } else if input.key_pressed(egui::Key::R) {
-            state.pending_view_command = Some(if input.modifiers.shift {
-                ViewCommand::RotateLeft
+            state.pending_app_command = Some(if input.modifiers.shift {
+                AppCommand::RotateLeft
             } else {
-                ViewCommand::RotateRight
+                AppCommand::RotateRight
             });
         }
 

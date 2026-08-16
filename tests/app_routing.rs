@@ -16,8 +16,8 @@ use cbr_egui::library::{
     LibraryGroupKind, LibraryService, ScannedComic, ThumbnailStatus,
 };
 use cbr_egui::viewer::{
-    ContinuousPageStatus, PageId, PageNavigationCommand, PageStatus, ReadingLayoutMode, Size2,
-    VisiblePageWindow,
+    AppCommand, ContinuousPageStatus, PageId, PageNavigationCommand, PageStatus,
+    ReadingLayoutMode, Size2, ViewCommand, ViewMode, ViewerState, VisiblePageWindow,
 };
 use eframe::egui;
 use image::{ImageBuffer, ImageFormat, Rgba};
@@ -1470,4 +1470,32 @@ fn tiny_color_image(size: [usize; 2]) -> egui::ColorImage {
 
 fn texture_for(ctx: &egui::Context, name: &str, size: [usize; 2]) -> egui::TextureHandle {
     ctx.load_texture(name, tiny_color_image(size), egui::TextureOptions::LINEAR)
+}
+
+#[test]
+fn paged_viewer_does_not_swallow_app_level_view_commands() {
+    let ctx = egui::Context::default();
+    let mut state: ViewerState<egui::TextureHandle> = ViewerState::new();
+    let texture = texture_for(&ctx, "page", [8, 12]);
+    // A ready page in paged mode is what puts apply_pending_view_command on
+    // the path; continuous mode returns before it.
+    state.set_ready(PageId(0), texture, Size2::new(8.0, 12.0));
+    state.pending_app_command = Some(AppCommand::RotateRight);
+    state.pending_view_command = Some(ViewCommand::FitWidth);
+
+    let _ = ctx.run(Default::default(), |ctx| {
+        cbr_egui::viewer::ui::render_viewer_panel(ctx, &mut state);
+    });
+
+    // Rotation, spread, continuous, and extract need archive access and cache
+    // invalidation, so the app layer handles them after the viewer renders.
+    // They live in their own slot precisely so the viewer cannot take them.
+    assert_eq!(
+        state.pending_app_command,
+        Some(AppCommand::RotateRight),
+        "viewer consumed a command it does not implement"
+    );
+    // Commands the viewer does implement are consumed and applied.
+    assert_eq!(state.pending_view_command, None);
+    assert_eq!(state.view_mode, ViewMode::FitWidth);
 }

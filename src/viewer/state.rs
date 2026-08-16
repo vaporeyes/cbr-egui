@@ -204,6 +204,8 @@ pub enum PageNavigationCommand {
     GoToPage(usize),
 }
 
+/// Commands the viewer itself carries out while rendering. Every variant is
+/// consumed by `apply_pending_view_command`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewCommand {
     Fit,
@@ -213,6 +215,15 @@ pub enum ViewCommand {
     OneToOne,
     ZoomIn,
     ZoomOut,
+}
+
+/// Commands the app layer carries out, because they need archive access, cache
+/// invalidation, or a re-decode. These are kept in a separate slot from
+/// `ViewCommand`: when they shared one, the viewer took them off the queue
+/// while rendering and discarded them, so triggering any of these from the
+/// keyboard did nothing in paged mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppCommand {
     ToggleSpread,
     ToggleContinuous,
     RotateLeft,
@@ -299,6 +310,7 @@ pub struct ViewerState<T> {
     pub continuous_pending_scroll_top: Option<f32>,
     pub pending_navigation: Option<PageNavigationCommand>,
     pub pending_view_command: Option<ViewCommand>,
+    pub pending_app_command: Option<AppCommand>,
     pub pending_bookmark_toggle: bool,
     /// Accumulated plain-wheel scroll at fit zoom; turns the page once it
     /// crosses a threshold so trackpad micro-scrolls do not flip pages.
@@ -326,6 +338,7 @@ impl<T> Default for ViewerState<T> {
             continuous_pending_scroll_top: None,
             pending_navigation: None,
             pending_view_command: None,
+            pending_app_command: None,
             pending_bookmark_toggle: false,
             wheel_page_accumulator: 0.0,
         }
