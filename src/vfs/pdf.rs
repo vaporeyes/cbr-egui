@@ -1,8 +1,9 @@
 // ABOUTME: Renders PDF pages to PNG bytes for the unified decode pipeline.
-// ABOUTME: Caches the PDFium binding and parsed document per thread to avoid rebinding/reparsing per page.
+// ABOUTME: Binds PDFium once per process and caches the parsed document per thread.
 use std::cell::RefCell;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use image::ImageFormat;
 use pdfium_render::prelude::{PdfDocument, PdfRenderConfig, Pdfium};
@@ -10,13 +11,18 @@ use pdfium_render::prelude::{PdfDocument, PdfRenderConfig, Pdfium};
 use super::archive::{ArchiveError, ArchiveReader};
 use crate::library::models::ArchivePage;
 
+// The PDFium binding is leaked once for the whole process so parsed documents
+// can borrow it for 'static. It was previously leaked per thread, which is not
+// bounded the way the old comment claimed: decode worker threads are created
+// per reading session, so opening comics repeatedly leaked a binding each time.
+// The underlying library bindings are a process-wide singleton inside
+// pdfium-render regardless, so the per-thread instances bought nothing.
+static PDFIUM: OnceLock<Result<&'static Pdfium, String>> = OnceLock::new();
+
 thread_local! {
-    // The PDFium binding is leaked once per thread so parsed documents can borrow
-    // it for 'static. The binding lives for the whole process regardless, so the
-    // leak is bounded to one per worker thread.
-    static PDFIUM: RefCell<Option<&'static Pdfium>> = const { RefCell::new(None) };
     // Caches the most recently opened document per thread, keyed by path, so
     // sequential page reads of the same comic skip re-parsing the PDF from disk.
+    // Documents stay per-thread; only the binding is shared.
     static DOCUMENT: RefCell<Option<CachedDocument>> = const { RefCell::new(None) };
 }
 
@@ -49,20 +55,19 @@ impl PdfArchiveReader {
     }
 }
 
-/// Returns the thread-local PDFium binding, binding to the system library on
+/// Returns the process-wide PDFium binding, binding to the system library on
 /// first use. The binding is leaked to obtain a 'static reference that cached
-/// documents can borrow.
-fn thread_pdfium() -> Result<&'static Pdfium, ArchiveError> {
-    PDFIUM.with(|cell| {
-        if let Some(pdfium) = *cell.borrow() {
-            return Ok(pdfium);
-        }
-        let bindings = Pdfium::bind_to_system_library()
-            .map_err(|err| ArchiveError::BackendUnavailable(err.to_string()))?;
-        let pdfium: &'static Pdfium = Box::leak(Box::new(Pdfium::new(bindings)));
-        *cell.borrow_mut() = Some(pdfium);
-        Ok(pdfium)
-    })
+/// documents can borrow; it would live for the whole process either way.
+fn global_pdfium() -> Result<&'static Pdfium, ArchiveError> {
+    PDFIUM
+        .get_or_init(|| {
+            Pdfium::bind_to_system_library()
+                .map(|bindings| &*Box::leak(Box::new(Pdfium::new(bindings))))
+                .map_err(|err| err.to_string())
+        })
+        .as_ref()
+        .copied()
+        .map_err(|err| ArchiveError::BackendUnavailable(err.clone()))
 }
 
 /// Runs a closure against the parsed document for `path`, opening and caching it
@@ -71,7 +76,7 @@ fn with_document<R>(
     path: &Path,
     f: impl FnOnce(&PdfDocument<'static>) -> Result<R, ArchiveError>,
 ) -> Result<R, ArchiveError> {
-    let pdfium = thread_pdfium()?;
+    let pdfium = global_pdfium()?;
     DOCUMENT.with(|cell| {
         let mut slot = cell.borrow_mut();
         let matches = slot.as_ref().is_some_and(|cached| cached.path == path);
