@@ -1,5 +1,5 @@
 use cbr_egui::library::{
-    ComicAvailability, ComicInput, ComicMetadata, LibraryService, ScannedComic,
+    ComicAvailability, ComicInput, ComicMetadata, LibraryService, ScannedComic, ThumbnailStatus,
 };
 
 fn service() -> (tempfile::TempDir, LibraryService) {
@@ -252,6 +252,45 @@ fn resumes_most_recently_updated_progress_not_highest_page() {
 
     assert_eq!(resumed.id, newer.id);
     assert_eq!(progress.current_page, 1);
+}
+
+#[test]
+fn recorded_cover_key_comes_back_as_a_ready_grid_item() {
+    let (_dir, service) = service();
+    let comic = service
+        .upsert_comic(ComicInput {
+            path: "/library/Saga 001.cbz".to_owned(),
+            hash: "hash".to_owned(),
+            page_count: 20,
+            metadata_id: None,
+        })
+        .expect("comic");
+
+    // Without a recorded key every launch reports the cover as Missing and
+    // rediscovers it through the per-frame scheduler.
+    let before = service.library_grid_items().expect("grid items");
+    assert_eq!(
+        before
+            .iter()
+            .find(|item| item.comic_id == comic.id)
+            .map(|item| item.thumbnail_status.clone()),
+        Some(ThumbnailStatus::Missing)
+    );
+
+    service
+        .set_thumbnail_key(&comic.path, Some("/cache/cover.png"))
+        .expect("record cover");
+
+    let after = service.library_grid_items().expect("grid items");
+    assert_eq!(
+        after
+            .iter()
+            .find(|item| item.comic_id == comic.id)
+            .map(|item| item.thumbnail_status.clone()),
+        Some(ThumbnailStatus::Ready {
+            cache_path: "/cache/cover.png".to_owned()
+        })
+    );
 }
 
 #[test]

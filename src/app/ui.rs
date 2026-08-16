@@ -1695,8 +1695,8 @@ pub fn route_app_update(
         }
     }
     library_controls.poll_import(ctx, app, library_service);
-    library_controls.poll_thumbnails(ctx, app);
-    library_controls.schedule_missing_thumbnails(app);
+    library_controls.poll_thumbnails(ctx, app, library_service);
+    library_controls.schedule_missing_thumbnails(app, library_service);
     if library_controls.is_importing() || library_controls.has_pending_thumbnails() {
         ctx.request_repaint_after(Duration::from_millis(50));
     }
@@ -2230,6 +2230,11 @@ fn render_reader_nav_controls(
 /// so an unbounded map would otherwise hold every cover ever shown.
 const THUMBNAIL_TEXTURE_CACHE_CAPACITY: usize = 256;
 
+/// Comics inspected per frame when looking for covers already sitting in the
+/// cache directory. Each check is one stat, so this bounds the syscalls a frame
+/// can spend without making a large library crawl.
+const MAX_THUMBNAIL_STATS_PER_FRAME: usize = 64;
+
 pub struct LibraryRootControls {
     import_result_receiver: Option<Receiver<Result<ImportSummary, String>>>,
     open_first_after_import: bool,
@@ -2415,6 +2420,7 @@ impl LibraryRootControls {
         &mut self,
         ctx: &egui::Context,
         app: &mut ComicReaderApp<egui::TextureHandle>,
+        library_service: Option<&LibraryService>,
     ) {
         let Some(pool) = &self.thumbnail_pool else {
             return;
@@ -2430,9 +2436,18 @@ impl LibraryRootControls {
             {
                 match result.outcome {
                     Ok(_) => {
-                        item.thumbnail_status = ThumbnailStatus::Ready {
-                            cache_path: result.cache_path.to_string_lossy().into_owned(),
-                        };
+                        let cache_path = result.cache_path.to_string_lossy().into_owned();
+                        // Record the cover in the database so the next launch
+                        // loads it straight from the row instead of rediscovering
+                        // every cover through the per-frame scheduler.
+                        if let Some(service) = library_service
+                            && let Err(error) =
+                                service.set_thumbnail_key(&item.path, Some(&cache_path))
+                        {
+                            app.library.status_text =
+                                Some(format!("Cover bookkeeping failed: {error}"));
+                        }
+                        item.thumbnail_status = ThumbnailStatus::Ready { cache_path };
                     }
                     Err(message) => {
                         item.thumbnail_status = ThumbnailStatus::Failed { message };
@@ -2517,14 +2532,23 @@ impl LibraryRootControls {
         }));
     }
 
-    fn schedule_missing_thumbnails(&mut self, app: &mut ComicReaderApp<egui::TextureHandle>) {
+    fn schedule_missing_thumbnails(
+        &mut self,
+        app: &mut ComicReaderApp<egui::TextureHandle>,
+        library_service: Option<&LibraryService>,
+    ) {
         let Some(pool) = &self.thumbnail_pool else {
             return;
         };
 
         let mut scheduled_this_frame = 0;
+        let mut examined_this_frame = 0;
         for item in &mut app.library.items {
-            if scheduled_this_frame >= 2 {
+            // Two separate budgets. Handing work to a worker is the expensive
+            // one and stays at two per frame; adopting a cover that is already
+            // on disk only costs a stat, so rationing it at the same rate made
+            // a large library take thousands of frames to show covers it had.
+            if scheduled_this_frame >= 2 || examined_this_frame >= MAX_THUMBNAIL_STATS_PER_FRAME {
                 break;
             }
             if !matches!(
@@ -2534,6 +2558,7 @@ impl LibraryRootControls {
             {
                 continue;
             }
+            examined_this_frame += 1;
 
             let cache_path = cache_path_for_source(
                 &self.thumbnail_cache_root,
@@ -2541,9 +2566,11 @@ impl LibraryRootControls {
                 &item.source_fingerprint,
             );
             if cache_path.exists() {
-                item.thumbnail_status = ThumbnailStatus::Ready {
-                    cache_path: cache_path.to_string_lossy().into_owned(),
-                };
+                let cache_path = cache_path.to_string_lossy().into_owned();
+                if let Some(service) = library_service {
+                    let _ = service.set_thumbnail_key(&item.path, Some(&cache_path));
+                }
+                item.thumbnail_status = ThumbnailStatus::Ready { cache_path };
                 continue;
             }
 
