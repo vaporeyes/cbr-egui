@@ -496,7 +496,9 @@ impl<T> ReadingSession<T> {
         ProgressSnapshot {
             comic_id: self.comic_id,
             current_page: self.current_page_index as u32,
-            is_read: self.current_page_index + 1 >= self.page_count,
+            // A pageless comic is not a finished one: without the page_count
+            // guard, `0 + 1 >= 0` reports it as read.
+            is_read: self.page_count > 0 && self.current_page_index + 1 >= self.page_count,
         }
     }
 
@@ -546,6 +548,12 @@ impl<T> ComicReaderApp<T> {
     pub fn open_grid_item(&mut self, item: &LibraryGridItem) -> bool {
         if item.availability != ComicAvailability::Available {
             self.library.status_text = Some("Comic is unavailable".to_owned());
+            return false;
+        }
+        // An archive with no decodable images has nothing to show, and opening
+        // it would immediately checkpoint it as finished.
+        if item.page_count == 0 {
+            self.library.status_text = Some("Comic contains no readable pages".to_owned());
             return false;
         }
 

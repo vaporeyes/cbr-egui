@@ -181,6 +181,22 @@ fn unavailable_comics_do_not_open_reader() {
 }
 
 #[test]
+fn pageless_comics_do_not_open_or_report_themselves_as_read() {
+    let mut app: ComicReaderApp<&str> = ComicReaderApp::default();
+    let mut item = grid_item(42, "Book", "/library/book.cbz");
+    item.page_count = 0;
+
+    assert!(!app.open_grid_item(&item));
+    assert_eq!(app.state, AppState::Library);
+
+    // Opened directly, a pageless session must still not checkpoint itself as
+    // finished: `current_page_index + 1 >= page_count` holds at 0 pages.
+    app.open_comic(item.comic_id, 0);
+    let snapshot = app.active_progress_snapshot().expect("snapshot");
+    assert!(!snapshot.is_read);
+}
+
+#[test]
 fn empty_library_has_visible_startup_message() {
     let (title, detail) = empty_library_text();
 
