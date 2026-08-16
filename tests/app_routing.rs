@@ -8,7 +8,7 @@ use cbr_egui::app::ui::{
 use cbr_egui::app::{AppState, CachedPage, ComicReaderApp, LibraryViewMode, ReadingSession};
 use cbr_egui::config::AppConfig;
 use cbr_egui::decode::{
-    CancellationToken, DecodeError, DecodePurpose, DecodeRequestId, DecodeResult,
+    CancellationToken, DecodeError, DecodePurpose, DecodeRequestId, DecodeResult, Rotation,
 };
 use cbr_egui::library::service::metadata_subtitle;
 use cbr_egui::library::{
@@ -955,6 +955,22 @@ fn reading_session_cache_preserves_pixel_size_with_texture() {
     let cached = session.texture_cache.get(3).expect("cached");
     assert_eq!(cached.texture, "texture");
     assert_eq!(cached.pixel_size, Size2::new(100.0, 200.0));
+}
+
+#[test]
+fn page_thumbnails_from_before_a_rotation_are_not_adopted() {
+    let mut session = ReadingSession::<&str>::new(7, 12);
+    let in_flight = session.page_thumbnail_request_id(4);
+
+    assert!(session.is_current_page_thumbnail(in_flight));
+
+    // Rotating clears the sidebar. Sidebar decodes carry no cancellation
+    // token, so the request already running still returns the old orientation
+    // and must be recognised as stale on arrival.
+    session.set_rotation(Rotation::Cw90);
+
+    assert!(!session.is_current_page_thumbnail(in_flight));
+    assert!(session.is_current_page_thumbnail(session.page_thumbnail_request_id(4)));
 }
 
 #[test]

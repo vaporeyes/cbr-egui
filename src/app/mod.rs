@@ -361,6 +361,10 @@ pub struct ReadingSession<T> {
     pub pending_page_thumbnails: HashSet<usize>,
     pub failed_page_thumbnails: HashSet<usize>,
     pub page_thumbnail_pool: Option<WorkerPool>,
+    /// Bumped whenever the sidebar thumbnails are invalidated. Sidebar decodes
+    /// carry no cancellation token, so this is what tells a result that was
+    /// already in flight apart from one for the current orientation.
+    page_thumbnail_generation: u64,
     pub show_info_panel: bool,
     pub metadata: Option<ComicMetadataDisplay>,
 }
@@ -391,6 +395,7 @@ impl<T> ReadingSession<T> {
             pending_page_thumbnails: HashSet::new(),
             failed_page_thumbnails: HashSet::new(),
             page_thumbnail_pool: WorkerPool::start(1, 64).ok(),
+            page_thumbnail_generation: 0,
             show_info_panel: false,
             metadata: None,
         }
@@ -400,6 +405,18 @@ impl<T> ReadingSession<T> {
         self.page_thumbnails.clear();
         self.pending_page_thumbnails.clear();
         self.failed_page_thumbnails.clear();
+        self.page_thumbnail_generation = self.page_thumbnail_generation.saturating_add(1);
+    }
+
+    /// Packs the current thumbnail generation into a request id. Sidebar
+    /// decodes cannot be cancelled, so results that were already in flight when
+    /// the orientation changed have to be recognised on arrival instead.
+    pub fn page_thumbnail_request_id(&self, page_index: usize) -> DecodeRequestId {
+        DecodeRequestId((self.page_thumbnail_generation << 32) | (page_index as u64 & 0xFFFF_FFFF))
+    }
+
+    pub fn is_current_page_thumbnail(&self, request_id: DecodeRequestId) -> bool {
+        request_id.0 >> 32 == self.page_thumbnail_generation
     }
 
     pub fn try_new(
@@ -431,6 +448,7 @@ impl<T> ReadingSession<T> {
             pending_page_thumbnails: HashSet::new(),
             failed_page_thumbnails: HashSet::new(),
             page_thumbnail_pool: WorkerPool::start(1, 64).ok(),
+            page_thumbnail_generation: 0,
             show_info_panel: false,
             metadata: None,
         })

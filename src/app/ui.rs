@@ -903,7 +903,7 @@ fn schedule_page_sidebar_thumbnails(
         };
 
         let request = DecodeRequest {
-            request_id: DecodeRequestId(page_index as u64),
+            request_id: session.page_thumbnail_request_id(page_index),
             page_index,
             source: DecodeSource::ArchivePage {
                 archive_path: PathBuf::from(&item.path),
@@ -950,6 +950,12 @@ fn poll_page_thumbnail_results(
 
     for result in results {
         if result.purpose != DecodePurpose::Thumbnail {
+            continue;
+        }
+        // A decode that started before a rotation renders the old orientation.
+        // Adopting it would leave the sidebar showing a mix, and because the
+        // page then has an entry it would never be requested again.
+        if !session.is_current_page_thumbnail(result.request_id) {
             continue;
         }
         session.pending_page_thumbnails.remove(&result.page_index);
