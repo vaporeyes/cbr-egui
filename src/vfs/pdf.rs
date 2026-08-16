@@ -36,16 +36,16 @@ impl PdfArchiveReader {
         }
     }
 
-    fn page_index(path: &str) -> Result<i32, ArchiveError> {
-        let index = path
-            .strip_prefix("page_")
+    /// Parses a synthetic `page_<n>.png` entry name into a zero-based index.
+    /// Returns None for any other name, which is an absence rather than a
+    /// failure: callers probe for entries like ComicInfo.xml that a PDF simply
+    /// does not have.
+    fn page_index(path: &str) -> Option<i32> {
+        path.strip_prefix("page_")
             .and_then(|value| value.strip_suffix(".png"))
-            .ok_or_else(|| ArchiveError::NotFound(path.to_owned()))?
-            .parse::<i32>()
-            .map_err(|_| ArchiveError::NotFound(path.to_owned()))?;
-        index
-            .checked_sub(1)
-            .ok_or_else(|| ArchiveError::NotFound(path.to_owned()))
+            .and_then(|value| value.parse::<i32>().ok())
+            .and_then(|index| index.checked_sub(1))
+            .filter(|index| *index >= 0)
     }
 }
 
@@ -109,7 +109,9 @@ impl ArchiveReader for PdfArchiveReader {
     }
 
     fn read_entry(&mut self, path: &str) -> Result<Option<Vec<u8>>, ArchiveError> {
-        let page_index = Self::page_index(path)?;
+        let Some(page_index) = Self::page_index(path) else {
+            return Ok(None);
+        };
         with_document(&self.path, |document| {
             let page = document
                 .pages()

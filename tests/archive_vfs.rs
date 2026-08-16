@@ -73,6 +73,17 @@ fn pdf_reader_reports_missing_runtime_recoverably() {
 }
 
 #[test]
+fn pdf_reports_non_page_entries_as_absent_not_failed() {
+    let mut reader = PdfArchiveReader::new("missing.pdf");
+
+    // Metadata discovery probes every archive for ComicInfo.xml. A PDF has no
+    // such entry, which is an absence rather than an error, and answering that
+    // must not require opening the document or the pdfium runtime.
+    assert!(reader.read_entry("ComicInfo.xml").expect("probe").is_none());
+    assert!(reader.read_entry("comicinfo.xml").expect("probe").is_none());
+}
+
+#[test]
 fn cached_reader_serves_repeated_and_alternating_archives() {
     // read_page_bytes keeps the last reader per thread so the zip central
     // directory is not reparsed per page and the rar cursor survives. The
