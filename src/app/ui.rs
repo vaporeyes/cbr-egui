@@ -9,9 +9,17 @@ use crossbeam_channel::{Receiver, bounded};
 use eframe::egui;
 use egui_phosphor::regular as icon;
 
+use crate::app::theme::{
+    EDITOR_BACKGROUND, EDITOR_CYAN, EDITOR_GREEN, EDITOR_ORANGE, EDITOR_PANEL, EDITOR_PANEL_ACTIVE,
+    EDITOR_PANEL_DARK, EDITOR_PURPLE, EDITOR_TEXT, EDITOR_TEXT_MUTED, EDITOR_WIDGET_HOVER,
+    apply_editor_text_styles, editor_dark_visuals, editor_panel_frame, editor_toolbar_frame,
+    icon_button, icon_button_enabled, icon_text, icon_toggle,
+};
 use crate::app::{
     AppState, CachedPage, ComicReaderApp, LibraryViewMode, ProgressSnapshot, ReadingSession,
 };
+
+pub use crate::app::theme::install_icon_fonts;
 use crate::config::{
     AppConfig, default_config_path, default_library_db_path, default_library_store_root,
 };
@@ -42,72 +50,6 @@ const LIST_THUMBNAIL_WIDTH: f32 = 56.0;
 const LIST_THUMBNAIL_HEIGHT: f32 = 74.0;
 const EMPTY_LIBRARY_TITLE: &str = "No library loaded";
 const EMPTY_LIBRARY_DETAIL: &str = "Add comics from a file or folder to build your library.";
-const EDITOR_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(44, 58, 60);
-const EDITOR_PANEL: egui::Color32 = egui::Color32::from_rgb(50, 68, 70);
-const EDITOR_PANEL_DARK: egui::Color32 = egui::Color32::from_rgb(39, 53, 55);
-const EDITOR_PANEL_ACTIVE: egui::Color32 = egui::Color32::from_rgb(63, 98, 104);
-const EDITOR_WIDGET: egui::Color32 = egui::Color32::from_rgb(57, 78, 80);
-const EDITOR_WIDGET_HOVER: egui::Color32 = egui::Color32::from_rgb(70, 102, 106);
-const EDITOR_TEXT: egui::Color32 = egui::Color32::from_rgb(221, 226, 220);
-const EDITOR_TEXT_MUTED: egui::Color32 = egui::Color32::from_rgb(154, 164, 160);
-const EDITOR_GREEN: egui::Color32 = egui::Color32::from_rgb(82, 190, 145);
-const EDITOR_CYAN: egui::Color32 = egui::Color32::from_rgb(117, 219, 210);
-const EDITOR_ORANGE: egui::Color32 = egui::Color32::from_rgb(222, 129, 70);
-const EDITOR_PURPLE: egui::Color32 = egui::Color32::from_rgb(176, 127, 218);
-
-fn editor_panel_frame() -> egui::Frame {
-    egui::Frame::new()
-        .inner_margin(egui::Margin::same(14))
-        .fill(EDITOR_BACKGROUND)
-}
-
-fn editor_toolbar_frame() -> egui::Frame {
-    egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(12, 8))
-        .fill(EDITOR_PANEL_DARK)
-}
-
-fn editor_card_stroke() -> egui::Stroke {
-    egui::Stroke::new(1.0, EDITOR_GREEN)
-}
-
-const TOOLBAR_ICON_SIZE: f32 = 17.0;
-
-/// Merges the Phosphor icon font into the egui context. Phosphor attaches to the
-/// Proportional family, so icon glyphs must be rendered with a proportional FontId
-/// (our default text style is monospace). Call once at startup.
-pub fn install_icon_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-    ctx.set_fonts(fonts);
-}
-
-fn icon_text(glyph: &str) -> egui::RichText {
-    egui::RichText::new(glyph).font(egui::FontId::proportional(TOOLBAR_ICON_SIZE))
-}
-
-/// A compact icon-only toolbar button with a hover tooltip.
-fn icon_button(ui: &mut egui::Ui, glyph: &str, tooltip: &str) -> egui::Response {
-    ui.add(egui::Button::new(icon_text(glyph)))
-        .on_hover_text(tooltip)
-}
-
-/// An icon button that is disabled when `enabled` is false.
-fn icon_button_enabled(
-    ui: &mut egui::Ui,
-    enabled: bool,
-    glyph: &str,
-    tooltip: &str,
-) -> egui::Response {
-    ui.add_enabled(enabled, egui::Button::new(icon_text(glyph)))
-        .on_hover_text(tooltip)
-}
-
-/// An icon button that renders in a pressed/active state when `active` is true.
-fn icon_toggle(ui: &mut egui::Ui, active: bool, glyph: &str, tooltip: &str) -> egui::Response {
-    ui.add(egui::Button::new(icon_text(glyph)).selected(active))
-        .on_hover_text(tooltip)
-}
 
 pub fn responsive_grid_columns(available_width: f32, tile_width: f32, gap: f32) -> usize {
     if !available_width.is_finite() || available_width <= 0.0 || tile_width <= 0.0 {
@@ -124,11 +66,18 @@ pub enum LibraryItemEvent {
     /// `Option<LibraryItemEvent>` each frame, and inlining the grid item made
     /// that a ~300 byte move per tile to carry a payload only a click uses.
     Open(Box<LibraryGridItem>),
-    SetRead { comic_id: i64, is_read: bool },
-    Remove { comic_id: i64 },
+    SetRead {
+        comic_id: i64,
+        is_read: bool,
+    },
+    Remove {
+        comic_id: i64,
+    },
     /// The cached cover file could not be read back. Emitted from the render
     /// path so the stale entry can be discarded and regenerated.
-    CoverUnreadable { comic_id: i64 },
+    CoverUnreadable {
+        comic_id: i64,
+    },
 }
 
 pub fn render_library_grid<T>(
@@ -162,7 +111,9 @@ pub fn render_library_grid<T>(
                             if let Some(&item_index) = visible_indices.get(index) {
                                 if let Some(item) = items.get(item_index) {
                                     let is_selected = selected_ids.contains(&item.comic_id);
-                                    if let Some(e) = library_tile(ui, item, is_selected, thumbnail_textures) {
+                                    if let Some(e) =
+                                        library_tile(ui, item, is_selected, thumbnail_textures)
+                                    {
                                         event = Some(e);
                                     }
                                 }
@@ -193,7 +144,7 @@ pub fn render_library_list(
 
     let mut event = None;
     let row_height = LIST_THUMBNAIL_HEIGHT + 8.0;
-    
+
     egui::ScrollArea::vertical().show_rows(
         ui,
         row_height + 6.0,
@@ -202,12 +153,13 @@ pub fn render_library_list(
             ui.spacing_mut().item_spacing.y = 6.0;
             for index in row_range {
                 if let Some(&item_index) = visible_indices.get(index)
-                    && let Some(item) = items.get(item_index) {
-                        let is_selected = selected_ids.contains(&item.comic_id);
-                        if let Some(e) = library_list_row(ui, item, is_selected, thumbnail_textures) {
-                            event = Some(e);
-                        }
+                    && let Some(item) = items.get(item_index)
+                {
+                    let is_selected = selected_ids.contains(&item.comic_id);
+                    if let Some(e) = library_list_row(ui, item, is_selected, thumbnail_textures) {
+                        event = Some(e);
                     }
+                }
             }
         },
     );
@@ -461,11 +413,7 @@ fn process_reader_navigation(
             PageNavigationCommand::PreviousPage | PageNavigationCommand::ScrollUp => {
                 session.current_page_index.saturating_sub(2)
             }
-            _ => resolve_navigation_target(
-                command,
-                session.current_page_index,
-                session.page_count,
-            ),
+            _ => resolve_navigation_target(command, session.current_page_index, session.page_count),
         }
     } else {
         resolve_navigation_target(command, session.current_page_index, session.page_count)
@@ -538,7 +486,9 @@ fn discard_stale_view_command(app: &mut ComicReaderApp<egui::TextureHandle>) {
 }
 
 fn extract_reader_page(app: &mut ComicReaderApp<egui::TextureHandle>) {
-    let Some(session) = &mut app.reading else { return; };
+    let Some(session) = &mut app.reading else {
+        return;
+    };
     let current_page = session.current_page_index;
     let bytes = match session.archive_cache.read_page(current_page) {
         Ok(bytes) => bytes,
@@ -547,20 +497,20 @@ fn extract_reader_page(app: &mut ComicReaderApp<egui::TextureHandle>) {
             return;
         }
     };
-    
-    let file_name = session.archive_cache.page_entry_path(current_page)
+
+    let file_name = session
+        .archive_cache
+        .page_entry_path(current_page)
         .and_then(|p| std::path::Path::new(&p).file_name().map(|n| n.to_owned()))
         .and_then(|n| n.to_str().map(|s| s.to_owned()))
         .unwrap_or_else(|| format!("page_{}.jpg", current_page + 1));
-        
-    if let Some(target) = rfd::FileDialog::new()
-        .set_file_name(&file_name)
-        .save_file()
-    {
+
+    if let Some(target) = rfd::FileDialog::new().set_file_name(&file_name).save_file() {
         if let Err(err) = std::fs::write(&target, bytes) {
             session.viewer_state.chrome.status_text = Some(format!("Extract save failed: {}", err));
         } else {
-            session.viewer_state.chrome.status_text = Some(format!("Extracted to {}", target.display()));
+            session.viewer_state.chrome.status_text =
+                Some(format!("Extracted to {}", target.display()));
         }
     }
 }
@@ -750,12 +700,20 @@ fn render_reader_page_sidebar(
         .resizable(true)
         .default_width(PAGE_SIDEBAR_THUMB_W + 36.0)
         .width_range(120.0..=260.0)
-        .frame(egui::Frame::new().inner_margin(egui::Margin::same(8)).fill(EDITOR_PANEL_DARK))
+        .frame(
+            egui::Frame::new()
+                .inner_margin(egui::Margin::same(8))
+                .fill(EDITOR_PANEL_DARK),
+        )
         .show_animated(ctx, show_flag, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Pages").color(EDITOR_GREEN));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("✕").on_hover_text("Hide page sidebar").clicked() {
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text("Hide page sidebar")
+                        .clicked()
+                    {
                         show_flag = false;
                     }
                 });
@@ -766,24 +724,18 @@ fn render_reader_page_sidebar(
             if follow_current {
                 let panel_height = ui.available_height();
                 let row_step = PAGE_SIDEBAR_ROW_HEIGHT + ui.spacing().item_spacing.y;
-                let centered = current_page as f32 * row_step
-                    - (panel_height - PAGE_SIDEBAR_ROW_HEIGHT) / 2.0;
+                let centered =
+                    current_page as f32 * row_step - (panel_height - PAGE_SIDEBAR_ROW_HEIGHT) / 2.0;
                 scroll_area = scroll_area.vertical_scroll_offset(centered.max(0.0));
             }
-            scroll_area
-                .show_rows(ui, PAGE_SIDEBAR_ROW_HEIGHT, page_count, |ui, row_range| {
-                    for page_index in row_range.clone() {
-                        visible_pages.push(page_index);
-                        if render_page_sidebar_row(
-                            ui,
-                            app,
-                            page_index,
-                            current_page,
-                        ) {
-                            jump_to = Some(page_index);
-                        }
+            scroll_area.show_rows(ui, PAGE_SIDEBAR_ROW_HEIGHT, page_count, |ui, row_range| {
+                for page_index in row_range.clone() {
+                    visible_pages.push(page_index);
+                    if render_page_sidebar_row(ui, app, page_index, current_page) {
+                        jump_to = Some(page_index);
                     }
-                });
+                }
+            });
         });
 
     if let Some(session) = &mut app.reading {
@@ -793,8 +745,7 @@ fn render_reader_page_sidebar(
     if let Some(page) = jump_to
         && let Some(session) = &mut app.reading
     {
-        session.viewer_state.pending_navigation =
-            Some(PageNavigationCommand::GoToPage(page));
+        session.viewer_state.pending_navigation = Some(PageNavigationCommand::GoToPage(page));
     }
 
     schedule_page_sidebar_thumbnails(app, item, &visible_pages);
@@ -834,7 +785,10 @@ fn render_page_sidebar_row(
     }
 
     let thumb_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.top() + 6.0 + PAGE_SIDEBAR_THUMB_H / 2.0),
+        egui::pos2(
+            rect.center().x,
+            rect.top() + 6.0 + PAGE_SIDEBAR_THUMB_H / 2.0,
+        ),
         egui::vec2(PAGE_SIDEBAR_THUMB_W, PAGE_SIDEBAR_THUMB_H),
     );
     ui.painter().rect_filled(thumb_rect, 3.0, EDITOR_BACKGROUND);
@@ -860,7 +814,11 @@ fn render_page_sidebar_row(
         );
     }
 
-    let label_color = if is_current { EDITOR_GREEN } else { EDITOR_TEXT };
+    let label_color = if is_current {
+        EDITOR_GREEN
+    } else {
+        EDITOR_TEXT
+    };
     ui.painter().text(
         egui::pos2(rect.center().x, thumb_rect.bottom() + 6.0),
         egui::Align2::CENTER_TOP,
@@ -896,11 +854,8 @@ fn schedule_page_sidebar_thumbnails(
             continue;
         }
 
-        let page_path = match resolve_session_page_path(
-            session,
-            Path::new(&item.path),
-            page_index,
-        ) {
+        let page_path = match resolve_session_page_path(session, Path::new(&item.path), page_index)
+        {
             Ok(page_path) => page_path,
             Err(_) => {
                 session.failed_page_thumbnails.insert(page_index);
@@ -935,10 +890,7 @@ fn schedule_page_sidebar_thumbnails(
     }
 }
 
-fn poll_page_thumbnail_results(
-    ctx: &egui::Context,
-    app: &mut ComicReaderApp<egui::TextureHandle>,
-) {
+fn poll_page_thumbnail_results(ctx: &egui::Context, app: &mut ComicReaderApp<egui::TextureHandle>) {
     let Some(session) = &mut app.reading else {
         return;
     };
@@ -1635,13 +1587,11 @@ fn expire_status_text(ctx: &egui::Context, id_salt: &str, status: &mut Option<St
     };
     let id = egui::Id::new(("status_expiry", id_salt));
     let now = ctx.input(|input| input.time);
-    let set_at = ctx.data_mut(|data| {
-        match data.get_temp::<(String, f64)>(id) {
-            Some((stored, at)) if stored == *text => at,
-            _ => {
-                data.insert_temp(id, (text.clone(), now));
-                now
-            }
+    let set_at = ctx.data_mut(|data| match data.get_temp::<(String, f64)>(id) {
+        Some((stored, at)) if stored == *text => at,
+        _ => {
+            data.insert_temp(id, (text.clone(), now));
+            now
         }
     });
     let age = now - set_at;
@@ -1670,9 +1620,10 @@ fn handle_library_item_event(
         }
         Some(LibraryItemEvent::SetRead { comic_id, is_read }) => {
             if let Some(service) = library_service
-                && let Err(err) = app.set_comic_read(service, comic_id, is_read) {
-                    app.library.status_text = Some(format!("Failed to update read state: {err}"));
-                }
+                && let Err(err) = app.set_comic_read(service, comic_id, is_read)
+            {
+                app.library.status_text = Some(format!("Failed to update read state: {err}"));
+            }
         }
         Some(LibraryItemEvent::Remove { comic_id }) => {
             controls.remove_comics(app, library_service, &[comic_id]);
@@ -1727,7 +1678,14 @@ pub fn route_app_update(
     match app.state {
         AppState::Library => {
             handle_dropped_imports(ctx, app, library_controls);
-            render_library_menu_bar(ctx, app, library_controls, settings, config, library_service);
+            render_library_menu_bar(
+                ctx,
+                app,
+                library_controls,
+                settings,
+                config,
+                library_service,
+            );
             render_library_toolbar(ctx, app, library_controls, config);
             render_library_shelf(ctx, app, library_controls);
             render_about_window(ctx, &mut library_controls.about_open);
@@ -1826,9 +1784,10 @@ pub fn route_app_update(
             }
             discard_stale_view_command(app);
             if let Some(session) = &mut app.reading
-                && session.show_info_panel {
-                    render_reader_info_panel(ctx, session);
-                }
+                && session.show_info_panel
+            {
+                render_reader_info_panel(ctx, session);
+            }
             if let Some(session) = &mut app.reading {
                 viewer::ui::render_viewer_panel(ctx, &mut session.viewer_state);
             }
@@ -1860,8 +1819,10 @@ fn handle_dropped_imports(
 ) {
     let hovering = ctx.input(|input| !input.raw.hovered_files.is_empty());
     if hovering {
-        let painter =
-            ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, "drop_hint".into()));
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            "drop_hint".into(),
+        ));
         let rect = ctx.screen_rect();
         painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(120));
         painter.text(
@@ -1952,7 +1913,8 @@ fn render_reader_menu_bar(
                     if ui.button("Extract current page…").clicked() {
                         ui.close_menu();
                         if let Some(session) = &mut app.reading {
-                            session.viewer_state.pending_app_command = Some(AppCommand::ExtractPage);
+                            session.viewer_state.pending_app_command =
+                                Some(AppCommand::ExtractPage);
                         }
                     }
                     ui.separator();
@@ -1999,20 +1961,16 @@ fn render_reader_menu_bar(
                         session.viewer_state.pending_bookmark_toggle = true;
                     }
                     if !session.bookmarks.is_empty() {
-                        ui.menu_button(
-                            format!("Bookmarks ({})", session.bookmarks.len()),
-                            |ui| {
-                                let pages: Vec<usize> =
-                                    session.bookmarks.iter().copied().collect();
-                                for page in pages {
-                                    if ui.button(format!("Page {}", page + 1)).clicked() {
-                                        ui.close_menu();
-                                        session.viewer_state.pending_navigation =
-                                            Some(PageNavigationCommand::GoToPage(page));
-                                    }
+                        ui.menu_button(format!("Bookmarks ({})", session.bookmarks.len()), |ui| {
+                            let pages: Vec<usize> = session.bookmarks.iter().copied().collect();
+                            for page in pages {
+                                if ui.button(format!("Page {}", page + 1)).clicked() {
+                                    ui.close_menu();
+                                    session.viewer_state.pending_navigation =
+                                        Some(PageNavigationCommand::GoToPage(page));
                                 }
-                            },
-                        );
+                            }
+                        });
                     }
                 });
 
@@ -2032,31 +1990,32 @@ fn render_reader_menu_bar(
                     }
                     if ui.button("Fit width").clicked() {
                         ui.close_menu();
-                        session.viewer_state.pending_view_command =
-                            Some(ViewCommand::FitWidth);
+                        session.viewer_state.pending_view_command = Some(ViewCommand::FitWidth);
                     }
                     if ui.button("Fit height").clicked() {
                         ui.close_menu();
-                        session.viewer_state.pending_view_command =
-                            Some(ViewCommand::FitHeight);
+                        session.viewer_state.pending_view_command = Some(ViewCommand::FitHeight);
                     }
                     if ui.button("Actual size (1:1)").clicked() {
                         ui.close_menu();
-                        session.viewer_state.pending_view_command =
-                            Some(ViewCommand::OneToOne);
+                        session.viewer_state.pending_view_command = Some(ViewCommand::OneToOne);
                     }
                     ui.separator();
                     ui.checkbox(&mut session.show_page_sidebar, "Page sidebar");
                     ui.separator();
                     ui.label(egui::RichText::new("Layout").color(EDITOR_TEXT_MUTED));
-                    let mut continuous_enabled = session.viewer_state.layout_mode
-                        == ReadingLayoutMode::ContinuousVertical;
-                    if ui.checkbox(&mut continuous_enabled, "Continuous scroll").changed() {
-                        session.viewer_state.pending_app_command = Some(AppCommand::ToggleContinuous);
+                    let mut continuous_enabled =
+                        session.viewer_state.layout_mode == ReadingLayoutMode::ContinuousVertical;
+                    if ui
+                        .checkbox(&mut continuous_enabled, "Continuous scroll")
+                        .changed()
+                    {
+                        session.viewer_state.pending_app_command =
+                            Some(AppCommand::ToggleContinuous);
                     }
                     let mut spread_enabled = session.spread_mode_enabled();
-                    let spread_allowed = session.viewer_state.layout_mode
-                        != ReadingLayoutMode::ContinuousVertical;
+                    let spread_allowed =
+                        session.viewer_state.layout_mode != ReadingLayoutMode::ContinuousVertical;
                     if ui
                         .add_enabled_ui(spread_allowed, |ui| {
                             ui.checkbox(&mut spread_enabled, "Two-page spread")
@@ -2090,10 +2049,7 @@ fn render_reader_menu_bar(
         });
 }
 
-fn render_reader_nav_bar(
-    ctx: &egui::Context,
-    app: &mut ComicReaderApp<egui::TextureHandle>,
-) {
+fn render_reader_nav_bar(ctx: &egui::Context, app: &mut ComicReaderApp<egui::TextureHandle>) {
     egui::TopBottomPanel::top("reader_nav_bar")
         .frame(editor_toolbar_frame())
         .resizable(false)
@@ -2104,10 +2060,7 @@ fn render_reader_nav_bar(
         });
 }
 
-fn render_reader_nav_controls(
-    ui: &mut egui::Ui,
-    app: &mut ComicReaderApp<egui::TextureHandle>,
-) {
+fn render_reader_nav_controls(ui: &mut egui::Ui, app: &mut ComicReaderApp<egui::TextureHandle>) {
     if app.reading.is_none() {
         return;
     }
@@ -2132,17 +2085,57 @@ fn render_reader_nav_controls(
     let rtl = session.viewer_state.reading_direction == ReadingDirection::RightToLeft;
     let buttons: [(&str, bool, &str, PageNavigationCommand); 4] = if rtl {
         [
-            (icon::CARET_DOUBLE_LEFT, !is_last, "Last page (End)", PageNavigationCommand::LastPage),
-            (icon::CARET_LEFT, !is_last, "Next page (Left)", PageNavigationCommand::NextPage),
-            (icon::CARET_RIGHT, !is_first, "Previous page (Right)", PageNavigationCommand::PreviousPage),
-            (icon::CARET_DOUBLE_RIGHT, !is_first, "First page (Home)", PageNavigationCommand::FirstPage),
+            (
+                icon::CARET_DOUBLE_LEFT,
+                !is_last,
+                "Last page (End)",
+                PageNavigationCommand::LastPage,
+            ),
+            (
+                icon::CARET_LEFT,
+                !is_last,
+                "Next page (Left)",
+                PageNavigationCommand::NextPage,
+            ),
+            (
+                icon::CARET_RIGHT,
+                !is_first,
+                "Previous page (Right)",
+                PageNavigationCommand::PreviousPage,
+            ),
+            (
+                icon::CARET_DOUBLE_RIGHT,
+                !is_first,
+                "First page (Home)",
+                PageNavigationCommand::FirstPage,
+            ),
         ]
     } else {
         [
-            (icon::CARET_DOUBLE_LEFT, !is_first, "First page (Home)", PageNavigationCommand::FirstPage),
-            (icon::CARET_LEFT, !is_first, "Previous page (Left)", PageNavigationCommand::PreviousPage),
-            (icon::CARET_RIGHT, !is_last, "Next page (Right)", PageNavigationCommand::NextPage),
-            (icon::CARET_DOUBLE_RIGHT, !is_last, "Last page (End)", PageNavigationCommand::LastPage),
+            (
+                icon::CARET_DOUBLE_LEFT,
+                !is_first,
+                "First page (Home)",
+                PageNavigationCommand::FirstPage,
+            ),
+            (
+                icon::CARET_LEFT,
+                !is_first,
+                "Previous page (Left)",
+                PageNavigationCommand::PreviousPage,
+            ),
+            (
+                icon::CARET_RIGHT,
+                !is_last,
+                "Next page (Right)",
+                PageNavigationCommand::NextPage,
+            ),
+            (
+                icon::CARET_DOUBLE_RIGHT,
+                !is_last,
+                "Last page (End)",
+                PageNavigationCommand::LastPage,
+            ),
         ]
     };
     for (glyph, enabled, tooltip, command) in buttons {
@@ -2162,8 +2155,8 @@ fn render_reader_nav_controls(
             .desired_width(40.0)
             .hint_text("#"),
     );
-    let go_submitted = goto_response.lost_focus()
-        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+    let go_submitted =
+        goto_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
     if go_submitted {
         if let Some(target) = parse_goto_target(&session.goto_input, session.page_count) {
             session.viewer_state.pending_navigation = Some(PageNavigationCommand::GoToPage(target));
@@ -2174,16 +2167,33 @@ fn render_reader_nav_controls(
 
     // Zoom presets and steppers.
     let view_mode = session.viewer_state.view_mode;
-    if icon_toggle(ui, view_mode == ViewMode::Fit, icon::ARROWS_OUT, "Fit to window (F)").clicked() {
+    if icon_toggle(
+        ui,
+        view_mode == ViewMode::Fit,
+        icon::ARROWS_OUT,
+        "Fit to window (F)",
+    )
+    .clicked()
+    {
         session.viewer_state.pending_view_command = Some(ViewCommand::Fit);
     }
-    if icon_toggle(ui, view_mode == ViewMode::FitWidth, icon::ARROWS_HORIZONTAL, "Fit width (W)")
-        .clicked()
+    if icon_toggle(
+        ui,
+        view_mode == ViewMode::FitWidth,
+        icon::ARROWS_HORIZONTAL,
+        "Fit width (W)",
+    )
+    .clicked()
     {
         session.viewer_state.pending_view_command = Some(ViewCommand::FitWidth);
     }
-    if icon_toggle(ui, view_mode == ViewMode::FitHeight, icon::ARROWS_VERTICAL, "Fit height (H)")
-        .clicked()
+    if icon_toggle(
+        ui,
+        view_mode == ViewMode::FitHeight,
+        icon::ARROWS_VERTICAL,
+        "Fit height (H)",
+    )
+    .clicked()
     {
         session.viewer_state.pending_view_command = Some(ViewCommand::FitHeight);
     }
@@ -2212,7 +2222,10 @@ fn render_reader_nav_controls(
     if icon_button(ui, icon::MAGNIFYING_GLASS_PLUS, "Zoom in (+)").clicked() {
         session.viewer_state.pending_view_command = Some(ViewCommand::ZoomIn);
     }
-    ui.label(format!("{:.0}%", session.viewer_state.zoom_pan.zoom * 100.0));
+    ui.label(format!(
+        "{:.0}%",
+        session.viewer_state.zoom_pan.zoom * 100.0
+    ));
     ui.separator();
 
     // Layout toggles.
@@ -2242,7 +2255,11 @@ fn render_reader_nav_controls(
 
     // Bookmark (highlighted when the current page is bookmarked).
     let bookmarked = session.bookmarks.contains(&session.current_page_index);
-    let bookmark_glyph = if bookmarked { icon::BOOKMARK } else { icon::BOOKMARK_SIMPLE };
+    let bookmark_glyph = if bookmarked {
+        icon::BOOKMARK
+    } else {
+        icon::BOOKMARK_SIMPLE
+    };
     if icon_toggle(ui, bookmarked, bookmark_glyph, "Toggle bookmark (B)").clicked() {
         session.viewer_state.pending_bookmark_toggle = true;
     }
@@ -2864,10 +2881,7 @@ fn render_library_menu_bar(
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     let add_files = ui
-                        .add_enabled(
-                            !controls.is_importing(),
-                            egui::Button::new("Add Files…"),
-                        )
+                        .add_enabled(!controls.is_importing(), egui::Button::new("Add Files…"))
                         .clicked();
                     if add_files {
                         ui.close_menu();
@@ -2918,7 +2932,9 @@ fn render_library_menu_bar(
                             !controls.is_rescanning() && !controls.is_importing(),
                             egui::Button::new("Rescan library"),
                         )
-                        .on_hover_text("Check the library store for comics that have been moved or deleted")
+                        .on_hover_text(
+                            "Check the library store for comics that have been moved or deleted",
+                        )
                         .clicked()
                     {
                         ui.close_menu();
@@ -2931,10 +2947,7 @@ fn render_library_menu_bar(
                         .iter()
                         .any(|item| item.availability == ComicAvailability::Unavailable);
                     if ui
-                        .add_enabled(
-                            has_unavailable,
-                            egui::Button::new("Purge unavailable"),
-                        )
+                        .add_enabled(has_unavailable, egui::Button::new("Purge unavailable"))
                         .clicked()
                     {
                         ui.close_menu();
@@ -2958,9 +2971,7 @@ fn render_library_menu_bar(
                 if controls.is_importing() {
                     ui.separator();
                     ui.spinner();
-                    ui.label(
-                        egui::RichText::new("Importing…").color(EDITOR_TEXT_MUTED),
-                    );
+                    ui.label(egui::RichText::new("Importing…").color(EDITOR_TEXT_MUTED));
                 }
 
                 if app.library.select_mode {
@@ -2996,23 +3007,31 @@ fn render_folder_tree_node(
         if let Some(group) = node.group {
             ui.selectable_value(
                 next_filter,
-                Some(ActiveLibraryFilter { kind: group.kind, key: group.key.clone() }),
+                Some(ActiveLibraryFilter {
+                    kind: group.kind,
+                    key: group.key.clone(),
+                }),
                 name,
             );
         }
     } else {
-        egui::CollapsingHeader::new(name).default_open(false).show(ui, |ui| {
-            if let Some(group) = node.group {
-                ui.selectable_value(
-                    next_filter,
-                    Some(ActiveLibraryFilter { kind: group.kind, key: group.key.clone() }),
-                    "All in folder",
-                );
-            }
-            for (child_name, child_node) in &node.children {
-                render_folder_tree_node(ui, child_name, child_node, next_filter);
-            }
-        });
+        egui::CollapsingHeader::new(name)
+            .default_open(false)
+            .show(ui, |ui| {
+                if let Some(group) = node.group {
+                    ui.selectable_value(
+                        next_filter,
+                        Some(ActiveLibraryFilter {
+                            kind: group.kind,
+                            key: group.key.clone(),
+                        }),
+                        "All in folder",
+                    );
+                }
+                for (child_name, child_node) in &node.children {
+                    render_folder_tree_node(ui, child_name, child_node, next_filter);
+                }
+            });
     }
 }
 
@@ -3060,36 +3079,54 @@ fn render_library_shelf(
                 ui.selectable_value(&mut next_filter, None, "All comics");
 
                 let groups = app.library.groups();
-                let builtins = groups.iter().filter(|g| g.kind == LibraryGroupKind::Builtin);
+                let builtins = groups
+                    .iter()
+                    .filter(|g| g.kind == LibraryGroupKind::Builtin);
                 for group in builtins {
                     ui.selectable_value(
                         &mut next_filter,
-                        Some(ActiveLibraryFilter { kind: group.kind, key: group.key.clone() }),
-                        group_label(group)
+                        Some(ActiveLibraryFilter {
+                            kind: group.kind,
+                            key: group.key.clone(),
+                        }),
+                        group_label(group),
                     );
                 }
 
-                let series = groups.iter().filter(|g| g.kind == LibraryGroupKind::Series).collect::<Vec<_>>();
+                let series = groups
+                    .iter()
+                    .filter(|g| g.kind == LibraryGroupKind::Series)
+                    .collect::<Vec<_>>();
                 if !series.is_empty() {
                     ui.separator();
-                    egui::CollapsingHeader::new("Series").default_open(true).show(ui, |ui| {
-                        for group in series {
-                            ui.selectable_value(
-                                &mut next_filter,
-                                Some(ActiveLibraryFilter { kind: group.kind, key: group.key.clone() }),
-                                group_label(group)
-                            );
-                        }
-                    });
+                    egui::CollapsingHeader::new("Series")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            for group in series {
+                                ui.selectable_value(
+                                    &mut next_filter,
+                                    Some(ActiveLibraryFilter {
+                                        kind: group.kind,
+                                        key: group.key.clone(),
+                                    }),
+                                    group_label(group),
+                                );
+                            }
+                        });
                 }
 
-                let folders = groups.iter().filter(|g| g.kind == LibraryGroupKind::Folder).collect::<Vec<_>>();
+                let folders = groups
+                    .iter()
+                    .filter(|g| g.kind == LibraryGroupKind::Folder)
+                    .collect::<Vec<_>>();
                 if !folders.is_empty() {
                     ui.separator();
-                    egui::CollapsingHeader::new("Folders").default_open(true).show(ui, |ui| {
-                        // Render folder tree
-                        render_folder_tree(ui, &folders, &mut next_filter);
-                    });
+                    egui::CollapsingHeader::new("Folders")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            // Render folder tree
+                            render_folder_tree(ui, &folders, &mut next_filter);
+                        });
                 }
             });
 
@@ -3101,10 +3138,7 @@ fn render_library_shelf(
     controls.shelf_open = shelf_open;
 }
 
-fn render_library_status(
-    ui: &mut egui::Ui,
-    app: &mut ComicReaderApp<egui::TextureHandle>,
-) {
+fn render_library_status(ui: &mut egui::Ui, app: &mut ComicReaderApp<egui::TextureHandle>) {
     if let Some(status_text) = &app.library.status_text {
         ui.label(egui::RichText::new(status_text).color(EDITOR_TEXT_MUTED));
     }
@@ -3120,9 +3154,7 @@ fn render_about_window(ctx: &egui::Context, open: &mut bool) {
         .resizable(false)
         .show(ctx, |ui| {
             ui.label("cbr-egui");
-            ui.label(
-                egui::RichText::new("A CBR/CBZ/PDF comic reader.").color(EDITOR_TEXT_MUTED),
-            );
+            ui.label(egui::RichText::new("A CBR/CBZ/PDF comic reader.").color(EDITOR_TEXT_MUTED));
             ui.add_space(6.0);
             ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
         });
@@ -3170,7 +3202,10 @@ const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
     (
         "Mouse",
         &[
-            ("Click left / right side", "Previous / next page (direction-aware)"),
+            (
+                "Click left / right side",
+                "Previous / next page (direction-aware)",
+            ),
             ("Scroll wheel", "Turn pages at fit zoom, pan when zoomed"),
             ("Pinch  /  Ctrl + scroll", "Zoom at pointer"),
             ("Drag", "Pan a zoomed page"),
@@ -3258,14 +3293,24 @@ fn render_library_toolbar(
                 }
 
                 ui.separator();
-                if icon_toggle(ui, controls.shelf_open, icon::SIDEBAR_SIMPLE, "Toggle shelf")
-                    .clicked()
+                if icon_toggle(
+                    ui,
+                    controls.shelf_open,
+                    icon::SIDEBAR_SIMPLE,
+                    "Toggle shelf",
+                )
+                .clicked()
                 {
                     controls.shelf_open = !controls.shelf_open;
                 }
                 let mut select_mode = app.library.select_mode;
-                if icon_toggle(ui, select_mode, icon::CHECK_SQUARE, "Select multiple comics")
-                    .clicked()
+                if icon_toggle(
+                    ui,
+                    select_mode,
+                    icon::CHECK_SQUARE,
+                    "Select multiple comics",
+                )
+                .clicked()
                 {
                     select_mode = !select_mode;
                     app.library.select_mode = select_mode;
@@ -3300,7 +3345,8 @@ fn render_library_filter_controls(
         .active_filter
         .as_ref()
         .and_then(|active| {
-            app.library.groups()
+            app.library
+                .groups()
                 .iter()
                 .find(|group| group.kind == active.kind && group.key == active.key)
         })
@@ -3315,7 +3361,9 @@ fn render_library_filter_controls(
             .selected_text(selected_label)
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut next_filter, None, "All comics");
-                for group in app.library.groups()
+                for group in app
+                    .library
+                    .groups()
                     .iter()
                     .filter(|group| group.kind == LibraryGroupKind::Builtin)
                 {
@@ -3328,7 +3376,9 @@ fn render_library_filter_controls(
                         group_label(group),
                     );
                 }
-                for group in app.library.groups()
+                for group in app
+                    .library
+                    .groups()
                     .iter()
                     .filter(|group| group.kind == LibraryGroupKind::Series)
                 {
@@ -3341,7 +3391,9 @@ fn render_library_filter_controls(
                         group_label(group),
                     );
                 }
-                for group in app.library.groups()
+                for group in app
+                    .library
+                    .groups()
                     .iter()
                     .filter(|group| group.kind == LibraryGroupKind::Folder)
                 {
@@ -3376,10 +3428,26 @@ fn render_library_filter_controls(
                 crate::app::LibrarySortOption::Number => "Number",
             })
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut sort_option, crate::app::LibrarySortOption::Title, "Title");
-                ui.selectable_value(&mut sort_option, crate::app::LibrarySortOption::DateAdded, "Date Added");
-                ui.selectable_value(&mut sort_option, crate::app::LibrarySortOption::Series, "Series");
-                ui.selectable_value(&mut sort_option, crate::app::LibrarySortOption::Number, "Number");
+                ui.selectable_value(
+                    &mut sort_option,
+                    crate::app::LibrarySortOption::Title,
+                    "Title",
+                );
+                ui.selectable_value(
+                    &mut sort_option,
+                    crate::app::LibrarySortOption::DateAdded,
+                    "Date Added",
+                );
+                ui.selectable_value(
+                    &mut sort_option,
+                    crate::app::LibrarySortOption::Series,
+                    "Series",
+                );
+                ui.selectable_value(
+                    &mut sort_option,
+                    crate::app::LibrarySortOption::Number,
+                    "Number",
+                );
             });
         if sort_option != app.library.sort_option {
             app.library.sort_option = sort_option;
@@ -3490,13 +3558,19 @@ fn library_tile(
                 egui::StrokeKind::Inside,
             );
         }
-        let title_color = if is_selected { EDITOR_GREEN } else { EDITOR_TEXT };
+        let title_color = if is_selected {
+            EDITOR_GREEN
+        } else {
+            EDITOR_TEXT
+        };
         // Single-line truncated labels keep the tile height constant.
         ui.add(egui::Label::new(egui::RichText::new(&item.title).color(title_color)).truncate());
         if let Some(subtitle) = &item.subtitle {
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(subtitle).color(EDITOR_TEXT_MUTED).small(),
+                    egui::RichText::new(subtitle)
+                        .color(EDITOR_TEXT_MUTED)
+                        .small(),
                 )
                 .truncate(),
             );
@@ -3507,13 +3581,21 @@ fn library_tile(
             let progress = item.current_page as f32 / item.page_count as f32;
             ui.add(egui::ProgressBar::new(progress).desired_width(GRID_TILE_WIDTH));
         } else {
-            ui.label(egui::RichText::new("Unread").color(EDITOR_TEXT_MUTED).small());
+            ui.label(
+                egui::RichText::new("Unread")
+                    .color(EDITOR_TEXT_MUTED)
+                    .small(),
+            );
         }
         if item.is_read {
             paint_read_badge(ui, response.rect);
         }
         response.context_menu(|ui| {
-            let label = if item.is_read { "Mark as unread" } else { "Mark as read" };
+            let label = if item.is_read {
+                "Mark as unread"
+            } else {
+                "Mark as read"
+            };
             if ui.button(label).clicked() {
                 ui.close_menu();
                 event = Some(LibraryItemEvent::SetRead {
@@ -3682,7 +3764,11 @@ fn library_list_row(
     };
 
     response.context_menu(|ui| {
-        let label = if item.is_read { "Mark as unread" } else { "Mark as read" };
+        let label = if item.is_read {
+            "Mark as unread"
+        } else {
+            "Mark as read"
+        };
         if ui.button(label).clicked() {
             ui.close_menu();
             event = Some(LibraryItemEvent::SetRead {
@@ -3761,72 +3847,6 @@ fn fit_image_size(source: egui::Vec2, bounds: egui::Vec2) -> egui::Vec2 {
     source * scale
 }
 
-fn apply_editor_text_styles(style: &mut egui::Style) {
-    style
-        .text_styles
-        .insert(egui::TextStyle::Heading, egui::FontId::monospace(20.0));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Body, egui::FontId::monospace(14.0));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Button, egui::FontId::monospace(13.0));
-    style
-        .text_styles
-        .insert(egui::TextStyle::Small, egui::FontId::monospace(11.0));
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(8.0, 4.0);
-    style.spacing.interact_size.y = 26.0;
-}
-
-fn editor_dark_visuals() -> egui::Visuals {
-    let mut visuals = egui::Visuals::dark();
-    visuals.override_text_color = Some(EDITOR_TEXT);
-    visuals.panel_fill = EDITOR_BACKGROUND;
-    visuals.window_fill = EDITOR_PANEL;
-    visuals.window_stroke = editor_card_stroke();
-    visuals.window_corner_radius = 4.0.into();
-    visuals.menu_corner_radius = 4.0.into();
-    visuals.faint_bg_color = EDITOR_PANEL_DARK;
-    visuals.extreme_bg_color = EDITOR_PANEL_DARK;
-    visuals.code_bg_color = EDITOR_PANEL_DARK;
-    visuals.hyperlink_color = EDITOR_CYAN;
-    visuals.warn_fg_color = EDITOR_ORANGE;
-    visuals.error_fg_color = egui::Color32::from_rgb(233, 104, 104);
-    visuals.selection.bg_fill = EDITOR_PANEL_ACTIVE;
-    visuals.selection.stroke = egui::Stroke::new(1.0, EDITOR_CYAN);
-
-    visuals.widgets.noninteractive.bg_fill = EDITOR_PANEL;
-    visuals.widgets.noninteractive.weak_bg_fill = EDITOR_PANEL_DARK;
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, EDITOR_WIDGET_HOVER);
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, EDITOR_TEXT);
-    visuals.widgets.noninteractive.corner_radius = 4.0.into();
-
-    visuals.widgets.inactive.bg_fill = EDITOR_WIDGET;
-    visuals.widgets.inactive.weak_bg_fill = EDITOR_WIDGET;
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, EDITOR_WIDGET_HOVER);
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, EDITOR_TEXT);
-    visuals.widgets.inactive.corner_radius = 4.0.into();
-
-    visuals.widgets.hovered.bg_fill = EDITOR_WIDGET_HOVER;
-    visuals.widgets.hovered.weak_bg_fill = EDITOR_PANEL_ACTIVE;
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, EDITOR_CYAN);
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, EDITOR_TEXT);
-    visuals.widgets.hovered.corner_radius = 4.0.into();
-
-    visuals.widgets.active.bg_fill = EDITOR_PANEL_ACTIVE;
-    visuals.widgets.active.weak_bg_fill = EDITOR_PANEL_ACTIVE;
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, EDITOR_GREEN);
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, EDITOR_CYAN);
-    visuals.widgets.active.corner_radius = 4.0.into();
-
-    visuals.widgets.open = visuals.widgets.hovered;
-    visuals.button_frame = true;
-    visuals.collapsing_header_frame = true;
-    visuals.striped = false;
-    visuals
-}
-
 fn open_file_location(path: &str) {
     // Resolve first. The value comes from the database, and on Windows it is
     // interpolated into a single /select, argument that CommandLineToArgvW
@@ -3847,7 +3867,11 @@ fn open_file_location(path: &str) {
     {
         // Reject anything that could break out of the single composed
         // argument rather than passing it to the shell's parser.
-        if path.as_os_str().to_string_lossy().contains(['"', '\r', '\n']) {
+        if path
+            .as_os_str()
+            .to_string_lossy()
+            .contains(['"', '\r', '\n'])
+        {
             return;
         }
         let arg = format!("/select,{}", path.display());
@@ -4132,7 +4156,13 @@ impl EguiComicReaderApp {
 
         match service.save_progress(snapshot.comic_id, snapshot.current_page, snapshot.is_read) {
             Ok(_) => {
-                if let Some(item) = self.inner.library.items.iter_mut().find(|item| item.comic_id == snapshot.comic_id) {
+                if let Some(item) = self
+                    .inner
+                    .library
+                    .items
+                    .iter_mut()
+                    .find(|item| item.comic_id == snapshot.comic_id)
+                {
                     item.current_page = snapshot.current_page;
                     item.is_read = snapshot.is_read;
                 }
@@ -4142,9 +4172,7 @@ impl EguiComicReaderApp {
                 let needs_config_save = !self.config.resume_last_session;
                 self.config.resume_last_session = true;
                 self.last_checkpointed_progress = Some(snapshot);
-                if needs_config_save
-                    && let Err(error) = self.config.save(&self.config_path)
-                {
+                if needs_config_save && let Err(error) = self.config.save(&self.config_path) {
                     let message = format!("Config save failed: {error}");
                     self.record_lifecycle_error(message.clone());
                     return Err(message);

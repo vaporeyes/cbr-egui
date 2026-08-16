@@ -9,8 +9,8 @@ use crate::decode::{
     CancellationToken, DecodePurpose, DecodeRequestId, ImageAdjustments, Rotation, WorkerPool,
 };
 use crate::library::{
-    ActiveLibraryFilter, ArchivePage, ComicAvailability, LibraryError, LibraryGridItem,
-    LibraryGroup, LibraryGroupKind, LibraryService, ComicMetadataDisplay,
+    ActiveLibraryFilter, ArchivePage, ComicAvailability, ComicMetadataDisplay, LibraryError,
+    LibraryGridItem, LibraryGroup, LibraryGroupKind, LibraryService,
 };
 use crate::vfs::ArchiveReader;
 use crate::viewer::{
@@ -18,6 +18,7 @@ use crate::viewer::{
     ViewerState, ZoomPanState,
 };
 
+pub mod theme;
 pub mod ui;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -735,8 +736,14 @@ impl LibraryViewState {
             .filter_map(|(index, item)| {
                 if !query.is_empty() {
                     let title_match = item.title.to_lowercase().contains(&query);
-                    let series_match = item.series.as_deref().is_some_and(|s| s.to_lowercase().contains(&query));
-                    let writer_match = item.writer.as_deref().is_some_and(|w| w.to_lowercase().contains(&query));
+                    let series_match = item
+                        .series
+                        .as_deref()
+                        .is_some_and(|s| s.to_lowercase().contains(&query));
+                    let writer_match = item
+                        .writer
+                        .as_deref()
+                        .is_some_and(|w| w.to_lowercase().contains(&query));
                     if !title_match && !series_match && !writer_match {
                         return None;
                     }
@@ -766,7 +773,9 @@ impl LibraryViewState {
             LibrarySortOption::Title => self
                 .visible_indices
                 .sort_by(|&a, &b| natord::compare(&self.items[a].title, &self.items[b].title)),
-            LibrarySortOption::DateAdded => self.visible_indices.sort_by(|&a, &b| self.items[b].comic_id.cmp(&self.items[a].comic_id)),
+            LibrarySortOption::DateAdded => self
+                .visible_indices
+                .sort_by(|&a, &b| self.items[b].comic_id.cmp(&self.items[a].comic_id)),
             LibrarySortOption::Series => self.visible_indices.sort_by(|&a, &b| {
                 let s_a = self.items[a].series.as_deref().unwrap_or("");
                 let s_b = self.items[b].series.as_deref().unwrap_or("");
