@@ -16,6 +16,12 @@ fn thumbnail_cache_key_is_stable_for_source_and_fingerprint() {
         cache_key_for_source("/books/a.cbz", "123"),
         cache_key_for_source("/books/a.cbz", "456")
     );
+    // The two fields are separated, so a shift of characters across the
+    // boundary cannot produce the same key.
+    assert_ne!(
+        cache_key_for_source("/books/ab.cbz", "1"),
+        cache_key_for_source("/books/a", "b.cbz1")
+    );
 }
 
 #[test]

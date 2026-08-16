@@ -1,5 +1,4 @@
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 
@@ -105,11 +104,17 @@ impl Drop for ThumbnailWorkerPool {
     }
 }
 
+/// Names the cache file for a comic's cover. blake3 rather than DefaultHasher:
+/// the standard library makes no promise that DefaultHasher's algorithm is
+/// stable across releases, so a toolchain upgrade would silently rename every
+/// cover and force the whole library to regenerate.
 pub fn cache_key_for_source(source_path: &str, source_fingerprint: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source_path.hash(&mut hasher);
-    source_fingerprint.hash(&mut hasher);
-    format!("{:016x}.png", hasher.finish())
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(source_path.as_bytes());
+    // Length-prefixed separator so ("ab", "c") and ("a", "bc") cannot collide.
+    hasher.update(b"\0");
+    hasher.update(source_fingerprint.as_bytes());
+    format!("{}.png", &hasher.finalize().to_hex()[..32])
 }
 
 pub fn cache_path_for_source(
