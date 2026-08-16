@@ -67,6 +67,11 @@ impl LibraryStorage {
                 PRIMARY KEY (comic_id, page_index),
                 FOREIGN KEY(comic_id) REFERENCES comics(id) ON DELETE CASCADE
             );
+
+            -- delete_metadata_if_unreferenced counts comics per metadata row,
+            -- once per comic during a reconcile. Without this the count is a
+            -- full table scan and the reconcile becomes quadratic.
+            CREATE INDEX IF NOT EXISTS idx_comics_metadata_id ON comics(metadata_id);
             ",
         )?;
         self.add_column_if_missing("metadata", "series", "TEXT NULL")?;
@@ -371,6 +376,36 @@ impl LibraryStorage {
                 "SELECT comic_id, current_page, is_read, updated_at FROM progress WHERE comic_id = ?1",
                 [comic_id],
                 progress_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Most recently updated progress row for an available, readable comic.
+    /// Done as one join rather than listing every comic and querying progress
+    /// per row, which cost one statement per comic in the library at startup.
+    pub fn last_read_comic(&self) -> Result<Option<(Comic, Progress)>, LibraryError> {
+        self.connection
+            .query_row(
+                "SELECT c.id, c.path, c.hash, c.page_count, c.metadata_id, c.availability,
+                        c.thumbnail_key, p.comic_id, p.current_page, p.is_read, p.updated_at
+                 FROM comics c
+                 JOIN progress p ON p.comic_id = c.id
+                 WHERE c.availability = 1 AND c.page_count > 0
+                 ORDER BY p.updated_at DESC, c.id DESC
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        comic_from_row(row)?,
+                        Progress {
+                            comic_id: row.get(7)?,
+                            current_page: row.get(8)?,
+                            is_read: row.get(9)?,
+                            updated_at: row.get(10)?,
+                        },
+                    ))
+                },
             )
             .optional()
             .map_err(Into::into)

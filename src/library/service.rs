@@ -222,19 +222,7 @@ impl LibraryService {
     }
 
     pub fn last_read_comic(&self) -> Result<Option<(Comic, Progress)>, LibraryError> {
-        let mut candidates = self
-            .list_comics()?
-            .into_iter()
-            .filter(|comic| comic.availability == ComicAvailability::Available)
-            .filter_map(|comic| {
-                self.get_progress(comic.id)
-                    .ok()
-                    .flatten()
-                    .map(|progress| (comic, progress))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by_key(|(_, progress)| progress.updated_at);
-        Ok(candidates.pop())
+        self.storage.last_read_comic()
     }
 
     /// Removes a comic from the library. The comic row and its progress are

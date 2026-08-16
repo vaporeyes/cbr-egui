@@ -255,6 +255,38 @@ fn resumes_most_recently_updated_progress_not_highest_page() {
 }
 
 #[test]
+fn resume_skips_unreadable_comics_in_favour_of_older_readable_progress() {
+    let (_dir, service) = service();
+    let readable = service
+        .upsert_comic(ComicInput {
+            path: "/library/readable.cbz".to_owned(),
+            hash: "readable".to_owned(),
+            page_count: 30,
+            metadata_id: None,
+        })
+        .expect("readable comic");
+    let pageless = service
+        .upsert_comic(ComicInput {
+            path: "/library/pageless.cbz".to_owned(),
+            hash: "pageless".to_owned(),
+            page_count: 0,
+            metadata_id: None,
+        })
+        .expect("pageless comic");
+
+    service.save_progress(readable.id, 7, false).expect("older");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    service.save_progress(pageless.id, 0, false).expect("newer");
+
+    // The newest progress row belongs to a comic with nothing to show, so
+    // resuming has to fall through to the most recent readable one.
+    let (resumed, progress) = service.last_read_comic().expect("resume").expect("session");
+
+    assert_eq!(resumed.id, readable.id);
+    assert_eq!(progress.current_page, 7);
+}
+
+#[test]
 fn recorded_cover_key_comes_back_as_a_ready_grid_item() {
     let (_dir, service) = service();
     let comic = service
