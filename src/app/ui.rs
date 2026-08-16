@@ -2652,14 +2652,24 @@ impl Default for LibraryRootControls {
 /// Only files inside the managed store are deleted, so an external original
 /// (e.g. a legacy in-place library row) is never touched.
 fn delete_store_file(path: &str, store_root: &Path) {
-    let path = Path::new(path);
-    if !path.starts_with(store_root) {
+    // Compare resolved paths, not lexical prefixes. A symlink inside the store
+    // pointing outside it passes a `starts_with` check while the removal lands
+    // somewhere else entirely.
+    let (Ok(resolved), Ok(root)) = (Path::new(path).canonicalize(), store_root.canonicalize())
+    else {
+        return;
+    };
+    if !resolved.starts_with(&root) {
         return;
     }
-    if std::fs::remove_file(path).is_err() {
+    if std::fs::remove_file(&resolved).is_err() {
         return;
     }
-    if let Some(parent) = path.parent()
+    // Clean up the now-empty content-hash directory, but never the store root
+    // itself, which is expected to outlive its contents.
+    if let Some(parent) = resolved.parent()
+        && parent != root
+        && parent.starts_with(&root)
         && parent
             .read_dir()
             .map(|mut entries| entries.next().is_none())
