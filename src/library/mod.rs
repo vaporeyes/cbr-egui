@@ -9,7 +9,7 @@ pub mod thumbnails;
 
 pub use errors::{LibraryError, MetadataError};
 pub use import::{ImportSummary, ImportedComic, import_comic_file, import_paths};
-pub use metadata::{parse_comic_info_xml, read_archive_metadata};
+pub use metadata::{document_metadata, parse_comic_info_xml, read_archive_metadata};
 pub use models::{
     ActiveLibraryFilter, ArchivePage, Bookmark, Comic, ComicAvailability, ComicInput,
     ComicMetadata, ComicMetadataDisplay, CoverThumbnail, Folder, LibraryComicRow, LibraryGridItem,

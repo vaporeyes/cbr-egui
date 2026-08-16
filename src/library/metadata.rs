@@ -30,15 +30,40 @@ pub fn parse_comic_info_xml(bytes: &[u8]) -> Result<ComicMetadata, MetadataError
     })
 }
 
+/// Builds comic metadata from the title and author a document format reports.
+///
+/// PDF and DjVu both describe a document with a title and an author and
+/// nothing that corresponds to a series, issue number, or penciller, so those
+/// stay empty rather than being guessed at from the title. Returns None when
+/// the document named neither, so a book with an empty metadata block is
+/// treated as having none at all.
+pub fn document_metadata(title: Option<String>, author: Option<String>) -> Option<ComicMetadata> {
+    let title = empty_to_none(title);
+    let writer = empty_to_none(author);
+    if title.is_none() && writer.is_none() {
+        return None;
+    }
+    Some(ComicMetadata {
+        id: None,
+        series: None,
+        title,
+        number: None,
+        writer,
+        penciller: None,
+    })
+}
+
 pub fn read_archive_metadata(
     reader: &mut dyn ArchiveReader,
 ) -> Result<Option<ComicMetadata>, MetadataError> {
+    // A ComicInfo.xml was authored for this specific comic, so it describes it
+    // better than whatever the containing document happens to carry.
     for path in ["ComicInfo.xml", "comicinfo.xml"] {
         if let Some(bytes) = reader.read_entry(path)? {
             return parse_comic_info_xml(&bytes).map(Some);
         }
     }
-    Ok(None)
+    Ok(reader.document_metadata()?)
 }
 
 fn empty_to_none(value: Option<String>) -> Option<String> {

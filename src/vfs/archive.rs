@@ -2,7 +2,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use crate::library::models::ArchivePage;
+use crate::library::models::{ArchivePage, ComicMetadata};
 
 use super::ordering::{is_page_image_path, sort_natural};
 
@@ -26,6 +26,16 @@ pub trait ArchiveReader {
     fn list_pages(&mut self) -> Result<Vec<ArchivePage>, ArchiveError>;
     fn read_page(&mut self, path: &str) -> Result<Vec<u8>, ArchiveError>;
     fn read_entry(&mut self, path: &str) -> Result<Option<Vec<u8>>, ArchiveError>;
+
+    /// Metadata carried by the document format itself.
+    ///
+    /// Defaults to none, which is correct for the archive formats: a zip or rar
+    /// has no document-level metadata of its own, only whatever ComicInfo.xml
+    /// entry it contains, and `read_entry` already exposes that. Document
+    /// formats such as PDF and DjVu override this.
+    fn document_metadata(&mut self) -> Result<Option<ComicMetadata>, ArchiveError> {
+        Ok(None)
+    }
 }
 
 pub fn build_pages<I, S>(paths: I) -> Vec<ArchivePage>

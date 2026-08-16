@@ -166,9 +166,65 @@ fn djvu_books_import_into_the_managed_store() {
     assert_eq!(imported.page_count, 4);
     assert!(imported.stored_path.starts_with(&store));
     assert!(imported.stored_path.exists());
-    // A DjVu book carries no ComicInfo.xml. That is an absence, not a failure,
-    // so the import still succeeds with no metadata.
+    // This fixture carries no metadata block at all, so there is nothing to
+    // capture; the import still succeeds.
     assert!(imported.metadata.is_none());
+}
+
+#[test]
+fn djvu_import_captures_embedded_document_metadata() {
+    let dir = tempfile::tempdir().expect("dir");
+    let store = dir.path().join("store");
+    let source = dir.path().join("titled.djvu");
+    write_djvu_with_metadata(&source, "The Hunting of the Snark", "Lewis Carroll");
+
+    let imported = import_comic_file(&source, &store).expect("import djvu");
+
+    let metadata = imported.metadata.expect("metadata captured on import");
+    assert_eq!(metadata.title.as_deref(), Some("The Hunting of the Snark"));
+    assert_eq!(metadata.writer.as_deref(), Some("Lewis Carroll"));
+}
+
+#[test]
+fn djvu_metadata_reaches_the_library_grid() {
+    let dir = tempfile::tempdir().expect("dir");
+    let store = dir.path().join("store");
+    let source = dir.path().join("titled.djvu");
+    write_djvu_with_metadata(&source, "The Hunting of the Snark", "Lewis Carroll");
+    let service = LibraryService::initialize(&dir.path().join("library.sqlite")).expect("service");
+
+    let imported = import_comic_file(&source, &store).expect("import");
+    service.persist_imported_comic(&imported).expect("persist");
+
+    let item = service
+        .library_grid_items()
+        .expect("grid items")
+        .pop()
+        .expect("one item");
+    // The author drives the tile subtitle and is what library search matches on.
+    assert_eq!(item.writer.as_deref(), Some("Lewis Carroll"));
+    assert_eq!(item.subtitle.as_deref(), Some("Lewis Carroll"));
+}
+
+/// Encodes a single-page DjVu carrying a METz metadata chunk.
+fn write_djvu_with_metadata(path: &Path, title: &str, author: &str) {
+    let mut pixmap = djvu_rs::Pixmap::white(48, 64);
+    for y in 16..32 {
+        for x in 12..24 {
+            pixmap.set_rgb(x, y, 40, 40, 40);
+        }
+    }
+    let metadata = djvu_rs::metadata::DjVuMetadata {
+        title: Some(title.to_owned()),
+        author: Some(author.to_owned()),
+        ..Default::default()
+    };
+    let bytes = djvu_rs::djvu_encode::PageEncoder::from_pixmap(&pixmap)
+        .with_quality(djvu_rs::djvu_encode::EncodeQuality::Quality)
+        .with_metadata(metadata)
+        .encode()
+        .expect("encode djvu with metadata");
+    std::fs::write(path, bytes).expect("write djvu fixture");
 }
 
 fn write_djvu_fixture(path: &Path, page_count: usize) {

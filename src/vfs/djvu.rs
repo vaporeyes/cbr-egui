@@ -9,7 +9,8 @@ use djvu_rs::djvu_render::{RenderOptions, render_pixmap};
 use image::ImageFormat;
 
 use super::archive::{ArchiveError, ArchiveReader};
-use crate::library::models::ArchivePage;
+use crate::library::metadata::document_metadata;
+use crate::library::models::{ArchivePage, ComicMetadata};
 
 /// Extensions handled by this reader. DjVu is published under both the long
 /// name and the historical 8.3 short form.
@@ -128,6 +129,20 @@ impl ArchiveReader for DjvuArchiveReader {
                 .write_to(&mut cursor, ImageFormat::Png)
                 .map_err(|err| ArchiveError::Read(err.to_string()))?;
             Ok(Some(cursor.into_inner()))
+        })
+    }
+
+    fn document_metadata(&mut self) -> Result<Option<ComicMetadata>, ArchiveError> {
+        with_document(&self.path, |document| {
+            // A book with no METa chunk simply has no metadata, which is not a
+            // failure; only a malformed one is.
+            let Some(metadata) = document
+                .metadata()
+                .map_err(|err| ArchiveError::Read(err.to_string()))?
+            else {
+                return Ok(None);
+            };
+            Ok(document_metadata(metadata.title, metadata.author))
         })
     }
 }

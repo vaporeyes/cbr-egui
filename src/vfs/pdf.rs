@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use image::ImageFormat;
-use pdfium_render::prelude::{PdfDocument, PdfRenderConfig, Pdfium};
+use pdfium_render::prelude::{PdfDocument, PdfDocumentMetadataTagType, PdfRenderConfig, Pdfium};
 
 use super::archive::{ArchiveError, ArchiveReader};
-use crate::library::models::ArchivePage;
+use crate::library::metadata::document_metadata;
+use crate::library::models::{ArchivePage, ComicMetadata};
 
 // The PDFium binding is leaked once for the whole process so parsed documents
 // can borrow it for 'static. It was previously leaked per thread, which is not
@@ -132,6 +133,17 @@ impl ArchiveReader for PdfArchiveReader {
                 .write_to(&mut cursor, ImageFormat::Png)
                 .map_err(|err| ArchiveError::Read(err.to_string()))?;
             Ok(Some(cursor.into_inner()))
+        })
+    }
+
+    fn document_metadata(&mut self) -> Result<Option<ComicMetadata>, ArchiveError> {
+        with_document(&self.path, |document| {
+            let metadata = document.metadata();
+            let tag = |kind| metadata.get(kind).map(|tag| tag.value().to_owned());
+            Ok(document_metadata(
+                tag(PdfDocumentMetadataTagType::Title),
+                tag(PdfDocumentMetadataTagType::Author),
+            ))
         })
     }
 }

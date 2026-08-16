@@ -234,3 +234,50 @@ fn write_zip_entries(file: std::fs::File) {
     zip.write_all(b"notes").expect("notes bytes");
     zip.finish().expect("finish zip");
 }
+
+#[test]
+fn djvu_reports_its_embedded_document_metadata() {
+    let dir = tempfile::tempdir().expect("dir");
+    let book = dir.path().join("titled.djvu");
+    write_djvu_with_metadata(&book, "The Hunting of the Snark", "Lewis Carroll");
+    let mut reader = DjvuArchiveReader::new(&book);
+
+    let metadata = reader
+        .document_metadata()
+        .expect("metadata lookup")
+        .expect("metadata present");
+
+    assert_eq!(metadata.title.as_deref(), Some("The Hunting of the Snark"));
+    assert_eq!(metadata.writer.as_deref(), Some("Lewis Carroll"));
+}
+
+#[test]
+fn djvu_without_metadata_reports_none() {
+    let dir = tempfile::tempdir().expect("dir");
+    let book = dir.path().join("bare.djvu");
+    write_djvu_fixture(&book, &[(32, 48)]);
+    let mut reader = DjvuArchiveReader::new(&book);
+
+    assert_eq!(reader.document_metadata().expect("metadata lookup"), None);
+}
+
+/// Encodes a single-page DjVu carrying a METz metadata chunk.
+fn write_djvu_with_metadata(path: &std::path::Path, title: &str, author: &str) {
+    let mut pixmap = djvu_rs::Pixmap::white(48, 64);
+    for y in 16..32 {
+        for x in 12..24 {
+            pixmap.set_rgb(x, y, 40, 40, 40);
+        }
+    }
+    let metadata = djvu_rs::metadata::DjVuMetadata {
+        title: Some(title.to_owned()),
+        author: Some(author.to_owned()),
+        ..Default::default()
+    };
+    let bytes = djvu_rs::djvu_encode::PageEncoder::from_pixmap(&pixmap)
+        .with_quality(djvu_rs::djvu_encode::EncodeQuality::Quality)
+        .with_metadata(metadata)
+        .encode()
+        .expect("encode djvu with metadata");
+    std::fs::write(path, bytes).expect("write djvu fixture");
+}

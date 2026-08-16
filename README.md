@@ -93,6 +93,14 @@ Help > Keyboard Shortcuts.
 | `.pdf` | [`pdfium-render`] |
 | `.djvu` / `.djv` | [`djvu-rs`] |
 
+## Metadata
+
+Series, title, issue number, writer, and penciller are read from a
+`ComicInfo.xml` entry when the archive has one. PDF and DjVu books instead
+carry their own document metadata, so their title and author are used when
+there is no `ComicInfo.xml`; those formats describe a document rather than an
+issue of a series, so the remaining fields stay empty.
+
 ## Building
 
 Requires a recent stable Rust toolchain (2024 edition).
