@@ -18,6 +18,7 @@ use crate::viewer::{
     ViewerState, ZoomPanState,
 };
 
+pub mod controls;
 pub mod reader;
 pub mod theme;
 pub mod ui;
