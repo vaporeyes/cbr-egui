@@ -8,7 +8,7 @@ use crossbeam_channel::{Receiver, bounded};
 use eframe::egui;
 
 use crate::app::ComicReaderApp;
-use crate::app::ui::{default_thumbnail_cache_root, open_grid_item_in_reader};
+use crate::app::library_view::{default_thumbnail_cache_root, open_grid_item_in_reader};
 use crate::config::{AppConfig, default_library_store_root};
 use crate::library::{
     ComicAvailability, ImportSummary, LibraryGridItem, LibraryService, ScannedComic,

@@ -19,6 +19,7 @@ use crate::viewer::{
 };
 
 pub mod controls;
+pub mod library_view;
 pub mod reader;
 pub mod theme;
 pub mod ui;
