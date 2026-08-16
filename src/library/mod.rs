@@ -16,8 +16,8 @@ pub use models::{
     LibraryGroup, LibraryGroupKind, LibraryRoot, LibraryScanStatus, Progress, ThumbnailStatus,
 };
 pub use scanner::{
-    ScannedComic, archive_page_count, discover_supported_archives, is_supported_archive_path,
-    scan_library_root, source_fingerprint,
+    SUPPORTED_COMIC_EXTENSIONS, ScannedComic, archive_page_count, discover_supported_archives,
+    is_supported_archive_path, scan_library_root, source_fingerprint,
 };
 pub use service::LibraryService;
 pub use thumbnails::{

@@ -175,3 +175,56 @@ fn write_cbz_with_png(path: &std::path::Path, width: u32, height: u32) {
         .expect("page bytes");
     zip.finish().expect("finish zip");
 }
+
+#[test]
+fn thumbnail_worker_generates_a_cover_for_a_djvu_book() {
+    let dir = tempfile::tempdir().expect("dir");
+    let book = dir.path().join("book.djvu");
+    let cache_path = dir.path().join("thumb.png");
+    write_djvu_fixture(&book, 2);
+    let pool = ThumbnailWorkerPool::start(1, 4).expect("pool");
+    pool.submit(ThumbnailRequest {
+        source_path: book.to_string_lossy().into_owned(),
+        source_fingerprint: "fingerprint".to_owned(),
+        cache_path: cache_path.clone(),
+    })
+    .expect("submit");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let result = loop {
+        if let Some(result) = pool.try_recv() {
+            break result;
+        }
+        assert!(std::time::Instant::now() < deadline, "thumbnail timed out");
+    };
+
+    // The cover comes from the first page, rendered and downscaled like any
+    // other format's.
+    assert_eq!(result.outcome.expect("thumbnail"), [48, 64]);
+    assert!(image::open(&cache_path).is_ok());
+}
+
+fn write_djvu_fixture(path: &std::path::Path, page_count: usize) {
+    let pages = (0..page_count)
+        .map(|index| {
+            let mut pixmap = djvu_rs::Pixmap::white(48, 64);
+            let shade = 30 + (index as u8) * 40;
+            for y in 16..32 {
+                for x in 12..24 {
+                    pixmap.set_rgb(x, y, shade, shade, shade);
+                }
+            }
+            pixmap
+        })
+        .collect::<Vec<_>>();
+
+    let bytes = djvu_rs::djvu_encode::encode_djvm_layered_shared(
+        &pages,
+        djvu_rs::djvu_encode::EncodeQuality::Quality,
+        300,
+        None,
+        2,
+    )
+    .expect("encode djvu fixture");
+    std::fs::write(path, bytes).expect("write djvu fixture");
+}

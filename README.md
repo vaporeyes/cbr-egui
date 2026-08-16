@@ -1,6 +1,6 @@
 # cbr-egui
 
-A native CBR / CBZ / PDF comic reader built in Rust with [egui].
+A native CBR / CBZ / PDF / DjVu comic and book reader built in Rust with [egui].
 
 ![cbr-egui](assets/cbr-egui.png)
 
@@ -91,6 +91,7 @@ Help > Keyboard Shortcuts.
 | `.cbz` / `.zip` | [`zip`] |
 | `.cbr` / `.rar` | [`unrar`] |
 | `.pdf` | [`pdfium-render`] |
+| `.djvu` / `.djv` | [`djvu-rs`] |
 
 ## Building
 
@@ -102,6 +103,8 @@ cargo run --release
 
 PDF rendering requires the `pdfium` shared library to be available at
 runtime — see the [pdfium-render docs][pdfium-render] for platform setup.
+
+DjVu decoding is pure Rust and needs no native library.
 
 ## Tests
 
@@ -116,10 +119,12 @@ cargo test
 - `src/decode/` — image decode pipeline (rotation, adjustments, worker pool).
 - `src/library/` — managed store, import, SQLite-backed metadata.
 - `src/cache/` — page texture cache.
-- `src/vfs/` — archive readers (zip / rar / pdf).
+- `src/vfs/` — archive readers (zip / rar / pdf / djvu).
 - `tests/` — integration tests.
 
 [egui]: https://github.com/emilk/egui
 [`zip`]: https://crates.io/crates/zip
 [`unrar`]: https://crates.io/crates/unrar
 [pdfium-render]: https://crates.io/crates/pdfium-render
+[`pdfium-render`]: https://crates.io/crates/pdfium-render
+[`djvu-rs`]: https://crates.io/crates/djvu-rs

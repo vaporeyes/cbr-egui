@@ -4,12 +4,14 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 pub mod archive;
+pub mod djvu;
 pub mod ordering;
 pub mod pdf;
 pub mod rar;
 pub mod zip;
 
 pub use archive::{ArchiveError, ArchiveReader, build_pages};
+pub use djvu::{DJVU_EXTENSIONS, DjvuArchiveReader};
 pub use ordering::{is_hidden_metadata_path, is_page_image_path, sort_natural};
 pub use pdf::PdfArchiveReader;
 pub use rar::RarArchiveReader;
@@ -28,6 +30,9 @@ pub fn reader_for_path(path: &Path) -> Result<Box<dyn ArchiveReader>, ArchiveErr
         "cbz" | "zip" => Ok(Box::new(ZipArchiveReader::new(path))),
         "cbr" | "rar" => Ok(Box::new(RarArchiveReader::new(path))),
         "pdf" => Ok(Box::new(PdfArchiveReader::new(path))),
+        _ if DJVU_EXTENSIONS.contains(&extension.as_str()) => {
+            Ok(Box::new(DjvuArchiveReader::new(path)))
+        }
         _ => Err(ArchiveError::UnsupportedFormat(path.display().to_string())),
     }
 }

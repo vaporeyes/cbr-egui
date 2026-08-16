@@ -162,7 +162,51 @@ fn reconciliation_preserves_the_content_hash_of_known_comics() {
         }])
         .expect("reconcile");
 
-    let reloaded = service.get_comic(imported.id).expect("lookup").expect("row");
+    let reloaded = service
+        .get_comic(imported.id)
+        .expect("lookup")
+        .expect("row");
     assert_eq!(reloaded.hash, "blake3-content-hash");
     assert_eq!(reloaded.availability, ComicAvailability::Available);
+}
+
+#[test]
+fn djvu_books_are_discovered_and_report_their_page_count() {
+    assert!(is_supported_archive_path("book.djvu"));
+    assert!(is_supported_archive_path("book.djv"));
+    assert!(is_supported_archive_path("BOOK.DJVU"));
+
+    let dir = tempfile::tempdir().expect("dir");
+    write_djvu_fixture(&dir.path().join("book.djvu"), 3);
+
+    let scanned = scan_library_root(dir.path()).expect("scan");
+
+    assert_eq!(scanned.len(), 1);
+    assert_eq!(scanned[0].page_count, 3);
+}
+
+/// Encodes a real DjVu bundle with `page_count` pages.
+fn write_djvu_fixture(path: &std::path::Path, page_count: usize) {
+    let pages = (0..page_count)
+        .map(|index| {
+            let mut pixmap = djvu_rs::Pixmap::white(48, 64);
+            let shade = 30 + (index as u8) * 40;
+            for y in 16..32 {
+                for x in 12..24 {
+                    pixmap.set_rgb(x, y, shade, shade, shade);
+                }
+            }
+            pixmap
+        })
+        .collect::<Vec<_>>();
+
+    let bytes = djvu_rs::djvu_encode::encode_djvm_layered_shared(
+        &pages,
+        djvu_rs::djvu_encode::EncodeQuality::Quality,
+        300,
+        None,
+        2,
+    )
+    .expect("encode djvu fixture");
+    std::fs::write(path, bytes).expect("write djvu fixture");
 }

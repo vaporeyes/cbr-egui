@@ -19,7 +19,7 @@ use crate::app::{ComicReaderApp, LibraryViewMode};
 use crate::config::AppConfig;
 use crate::library::{
     ActiveLibraryFilter, ComicAvailability, LibraryGridItem, LibraryGroupKind, LibraryService,
-    ThumbnailStatus,
+    SUPPORTED_COMIC_EXTENSIONS, ThumbnailStatus,
 };
 
 pub const GRID_TILE_WIDTH: f32 = 190.0;
@@ -228,7 +228,7 @@ pub(crate) fn render_library_menu_bar(
                     if add_files {
                         ui.close_menu();
                         if let Some(files) = rfd::FileDialog::new()
-                            .add_filter("Comics", &["cbz", "cbr", "pdf"])
+                            .add_filter("Comics", SUPPORTED_COMIC_EXTENSIONS)
                             .set_directory(import_pick_directory(config))
                             .pick_files()
                         {
@@ -609,7 +609,7 @@ pub(crate) fn render_library_toolbar(
                 if icon_button_enabled(ui, !importing, icon::FILE_PLUS, "Add comic files\u{2026}")
                     .clicked()
                     && let Some(files) = rfd::FileDialog::new()
-                        .add_filter("Comics", &["cbz", "cbr", "pdf"])
+                        .add_filter("Comics", SUPPORTED_COMIC_EXTENSIONS)
                         .set_directory(import_pick_directory(config))
                         .pick_files()
                 {

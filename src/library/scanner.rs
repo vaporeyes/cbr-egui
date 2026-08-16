@@ -15,6 +15,12 @@ pub struct ScannedComic {
     pub metadata: Option<ComicMetadata>,
 }
 
+/// Extensions the library will import. Narrower than what `vfs` can read:
+/// bare `.zip` and `.rar` open fine in the reader but are not assumed to be
+/// comics when sweeping a folder. This is the one list the file dialogs and
+/// the folder scanner share, so a new format is declared in a single place.
+pub const SUPPORTED_COMIC_EXTENSIONS: &[&str] = &["cbz", "cbr", "pdf", "djvu", "djv"];
+
 pub fn is_supported_archive_path(path: impl AsRef<Path>) -> bool {
     let Some(extension) = path
         .as_ref()
@@ -25,7 +31,7 @@ pub fn is_supported_archive_path(path: impl AsRef<Path>) -> bool {
         return false;
     };
 
-    matches!(extension.as_str(), "cbz" | "cbr" | "pdf")
+    SUPPORTED_COMIC_EXTENSIONS.contains(&extension.as_str())
 }
 
 pub fn discover_supported_archives(root: impl AsRef<Path>) -> Result<Vec<PathBuf>, LibraryError> {

@@ -1,8 +1,8 @@
 use std::io::Write;
 
 use cbr_egui::vfs::{
-    ArchiveError, ArchiveReader, PdfArchiveReader, RarArchiveReader, ZipArchiveReader, build_pages,
-    is_page_image_path, read_page_bytes,
+    ArchiveError, ArchiveReader, DjvuArchiveReader, PdfArchiveReader, RarArchiveReader,
+    ZipArchiveReader, build_pages, is_page_image_path, read_page_bytes,
 };
 
 #[test]
@@ -70,6 +70,102 @@ fn pdf_reader_reports_missing_runtime_recoverably() {
         error,
         ArchiveError::BackendUnavailable(_) | ArchiveError::Read(_) | ArchiveError::Io(_)
     ));
+}
+
+#[test]
+fn djvu_lists_every_page_and_renders_them_as_images() {
+    let dir = tempfile::tempdir().expect("dir");
+    let book = dir.path().join("book.djvu");
+    write_djvu_fixture(&book, &[(64, 96), (80, 100), (48, 72)]);
+    let mut reader = DjvuArchiveReader::new(&book);
+
+    let pages = reader.list_pages().expect("list pages");
+    let paths = pages
+        .iter()
+        .map(|page| page.path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, ["page_1.png", "page_2.png", "page_3.png"]);
+
+    // Each page must come back as decodable image bytes at its own size, which
+    // is what the decode pipeline expects from every reader.
+    for (index, expected) in [(0, (64, 96)), (1, (80, 100)), (2, (48, 72))] {
+        let bytes = reader.read_page(&paths[index]).expect("read page");
+        let image = image::load_from_memory(&bytes).expect("decode rendered page");
+        assert_eq!((image.width(), image.height()), expected);
+    }
+}
+
+#[test]
+fn djvu_is_reachable_through_extension_dispatch() {
+    let dir = tempfile::tempdir().expect("dir");
+    // Both the long name and the historical short form are DjVu.
+    for name in ["book.djvu", "book.djv", "BOOK.DJVU"] {
+        let path = dir.path().join(name);
+        write_djvu_fixture(&path, &[(32, 48)]);
+
+        let bytes = read_page_bytes(&path, "page_1.png").expect("read through dispatch");
+        let image = image::load_from_memory(&bytes).expect("decode");
+        assert_eq!((image.width(), image.height()), (32, 48));
+    }
+}
+
+#[test]
+fn djvu_missing_and_non_page_entries_are_distinguished() {
+    let dir = tempfile::tempdir().expect("dir");
+    let book = dir.path().join("book.djvu");
+    write_djvu_fixture(&book, &[(32, 48)]);
+    let mut reader = DjvuArchiveReader::new(&book);
+
+    // A name that is not a page at all is an absence, so metadata probing can
+    // report "no ComicInfo.xml" rather than failing the import.
+    assert!(reader.read_entry("ComicInfo.xml").expect("probe").is_none());
+    // A page number past the end is a genuine miss.
+    assert!(matches!(
+        reader.read_page("page_9.png"),
+        Err(ArchiveError::NotFound(_))
+    ));
+}
+
+#[test]
+fn corrupt_djvu_reports_a_recoverable_error() {
+    let dir = tempfile::tempdir().expect("dir");
+    let book = dir.path().join("book.djvu");
+    std::fs::write(&book, b"this is not a djvu document").expect("write");
+    let mut reader = DjvuArchiveReader::new(&book);
+
+    assert!(matches!(
+        reader.list_pages(),
+        Err(ArchiveError::CorruptArchive(_))
+    ));
+}
+
+/// Encodes a real multi-page DjVu bundle, one page per requested size.
+fn write_djvu_fixture(path: &std::path::Path, sizes: &[(u32, u32)]) {
+    let pages = sizes
+        .iter()
+        .enumerate()
+        .map(|(index, &(width, height))| {
+            let mut pixmap = djvu_rs::Pixmap::white(width, height);
+            // Some ink so the encoder has foreground to segment.
+            let shade = 30 + (index as u8) * 40;
+            for y in height / 4..height / 2 {
+                for x in width / 4..width / 2 {
+                    pixmap.set_rgb(x, y, shade, shade, shade);
+                }
+            }
+            pixmap
+        })
+        .collect::<Vec<_>>();
+
+    let bytes = djvu_rs::djvu_encode::encode_djvm_layered_shared(
+        &pages,
+        djvu_rs::djvu_encode::EncodeQuality::Quality,
+        300,
+        None,
+        2,
+    )
+    .expect("encode djvu fixture");
+    std::fs::write(path, bytes).expect("write djvu fixture");
 }
 
 #[test]

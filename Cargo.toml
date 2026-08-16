@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 blake3 = "1"
 crossbeam-channel = "0.5"
+djvu-rs = "0.28.0"
 eframe = "0.31"
 egui-phosphor = "0.9"
 image = "0.25"

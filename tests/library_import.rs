@@ -153,3 +153,45 @@ fn persisting_reimport_does_not_duplicate_comic() {
     assert_eq!(first_comic.id, second_comic.id);
     assert_eq!(service.list_comics().expect("list").len(), 1);
 }
+
+#[test]
+fn djvu_books_import_into_the_managed_store() {
+    let dir = tempfile::tempdir().expect("dir");
+    let store = dir.path().join("store");
+    let source = dir.path().join("book.djvu");
+    write_djvu_fixture(&source, 4);
+
+    let imported = import_comic_file(&source, &store).expect("import djvu");
+
+    assert_eq!(imported.page_count, 4);
+    assert!(imported.stored_path.starts_with(&store));
+    assert!(imported.stored_path.exists());
+    // A DjVu book carries no ComicInfo.xml. That is an absence, not a failure,
+    // so the import still succeeds with no metadata.
+    assert!(imported.metadata.is_none());
+}
+
+fn write_djvu_fixture(path: &Path, page_count: usize) {
+    let pages = (0..page_count)
+        .map(|index| {
+            let mut pixmap = djvu_rs::Pixmap::white(48, 64);
+            let shade = 30 + (index as u8) * 40;
+            for y in 16..32 {
+                for x in 12..24 {
+                    pixmap.set_rgb(x, y, shade, shade, shade);
+                }
+            }
+            pixmap
+        })
+        .collect::<Vec<_>>();
+
+    let bytes = djvu_rs::djvu_encode::encode_djvm_layered_shared(
+        &pages,
+        djvu_rs::djvu_encode::EncodeQuality::Quality,
+        300,
+        None,
+        2,
+    )
+    .expect("encode djvu fixture");
+    std::fs::write(path, bytes).expect("write djvu fixture");
+}
