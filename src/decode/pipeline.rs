@@ -199,13 +199,8 @@ pub struct DecodeResult {
 }
 
 pub fn decode_page(request: DecodeRequest) -> DecodeResult {
-    let outcome = if request
-        .cancellation_token
-        .as_ref()
-        .is_some_and(CancellationToken::is_cancelled)
-    {
-        Err(DecodeError::Image("decode request cancelled".to_owned()))
-    } else {
+    let cancel = request.cancellation_token.as_ref();
+    let outcome = abort_if_cancelled(cancel).and_then(|()| {
         // Reading the archive happens here, on the worker thread, so page
         // decompression never stalls the GUI frame loop.
         resolve_source_bytes(&request.source).and_then(|bytes| {
@@ -214,9 +209,10 @@ pub fn decode_page(request: DecodeRequest) -> DecodeResult {
                 request.target_size,
                 request.rotation,
                 request.adjustments,
+                cancel,
             )
         })
-    };
+    });
     DecodeResult {
         request_id: request.request_id,
         page_index: request.page_index,
@@ -242,6 +238,7 @@ fn decode_bytes(
     target_size: Option<[u32; 2]>,
     rotation: Rotation,
     adjustments: ImageAdjustments,
+    cancel: Option<&CancellationToken>,
 ) -> Result<egui::ColorImage, DecodeError> {
     if bytes.is_empty() {
         return Err(DecodeError::EmptyBytes);
@@ -260,9 +257,15 @@ fn decode_bytes(
         });
     }
 
+    // Each stage below is a full-page pass. Re-check between them so a page the
+    // reader has already navigated away from stops costing work, instead of
+    // running to completion and holding up whatever is on screen now.
+    abort_if_cancelled(cancel)?;
     let mut image = limited_reader(bytes)?
         .decode()
         .map_err(|err| DecodeError::Image(err.to_string()))?;
+
+    abort_if_cancelled(cancel)?;
     if let Some([target_width, target_height]) = target_size
         && target_width > 0
         && target_height > 0
@@ -271,6 +274,7 @@ fn decode_bytes(
         image = image.resize(target_width, target_height, FilterType::Lanczos3);
     }
 
+    abort_if_cancelled(cancel)?;
     let image = match rotation {
         Rotation::None => image,
         Rotation::Cw90 => image.rotate90(),
@@ -290,6 +294,7 @@ fn decode_bytes(
         image
     };
 
+    abort_if_cancelled(cancel)?;
     let mut rgba = image.to_rgba8();
     let (width, height) = rgba.dimensions();
 
@@ -336,6 +341,13 @@ fn decode_bytes(
         [width as usize, height as usize],
         rgba.as_raw(),
     ))
+}
+
+fn abort_if_cancelled(cancel: Option<&CancellationToken>) -> Result<(), DecodeError> {
+    if cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Err(DecodeError::Cancelled);
+    }
+    Ok(())
 }
 
 /// Builds an image reader with allocation and dimension limits applied. The

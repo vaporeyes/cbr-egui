@@ -109,9 +109,21 @@ fn cancelled_decode_request_returns_recoverable_error() {
     let result = decode_page(request);
 
     assert_eq!(result.request_id, DecodeRequestId(77));
-    assert!(
-        matches!(result.outcome, Err(DecodeError::Image(message)) if message.contains("cancelled"))
-    );
+    assert!(matches!(result.outcome, Err(DecodeError::Cancelled)));
+}
+
+#[test]
+fn dropping_a_pool_with_undrained_results_does_not_block() {
+    // Sessions are dropped on the GUI thread with results still in flight and
+    // nothing draining them. Reaching the end of this test is the assertion: a
+    // bounded result channel plus a join in Drop parks the worker in `send`
+    // and hangs here forever.
+    let pool = WorkerPool::start(2, 4).expect("worker pool");
+    for id in 0..16 {
+        let _ = pool.submit(request(id, id as usize, png_bytes(8, 8), None));
+    }
+
+    drop(pool);
 }
 
 #[test]

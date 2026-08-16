@@ -1,6 +1,6 @@
 use std::thread::{self, JoinHandle};
 
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 
 use super::error::WorkerError;
 use super::pipeline::{DecodeRequest, DecodeResult, decode_page};
@@ -21,7 +21,12 @@ impl WorkerPool {
         }
 
         let (request_sender, request_receiver) = bounded::<DecodeRequest>(queue_bound);
-        let (result_sender, result_receiver) = bounded::<DecodeResult>(queue_bound);
+        // Results are unbounded so a worker can never block handing one back.
+        // A bounded result channel deadlocks shutdown: nothing drains it while
+        // the pool is being torn down, so a full channel would park a worker in
+        // `send` forever. Depth stays bounded anyway, because a result only
+        // exists for a request that got through the bounded request queue.
+        let (result_sender, result_receiver) = unbounded::<DecodeResult>();
         let handles = (0..worker_count)
             .map(|_| spawn_worker(request_receiver.clone(), result_sender.clone()))
             .collect();
@@ -58,11 +63,14 @@ impl WorkerPool {
 }
 
 impl Drop for WorkerPool {
+    /// Signals shutdown without waiting. Pools are dropped on the GUI thread
+    /// whenever a comic is closed or rotated, and joining there stalls the
+    /// frame for however long the in-progress decodes take. Closing the request
+    /// channel is enough: each worker finishes its current page, sees the
+    /// closed channel, and exits. Callers that need the threads gone
+    /// deterministically use `shutdown`.
     fn drop(&mut self) {
         self.request_sender.take();
-        for handle in self.handles.drain(..) {
-            let _ = handle.join();
-        }
     }
 }
 

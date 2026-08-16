@@ -6,6 +6,8 @@ pub enum DecodeError {
     EmptyBytes,
     #[error("image decode failed: {0}")]
     Image(String),
+    #[error("decode request cancelled")]
+    Cancelled,
     #[error("decoded image dimensions are too large: {width}x{height}")]
     ImageTooLarge { width: u32, height: u32 },
 }
