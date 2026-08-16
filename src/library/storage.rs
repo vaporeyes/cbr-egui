@@ -86,18 +86,30 @@ impl LibraryStorage {
         Ok(())
     }
 
+    /// `table`, `column`, and `definition` are compile-time literals from
+    /// `initialize_schema`; none of them are interpolated from runtime input.
     fn add_column_if_missing(
         &self,
         table: &str,
         column: &str,
         definition: &str,
     ) -> Result<(), LibraryError> {
-        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
-        match self.connection.execute_batch(&sql) {
-            Ok(()) => Ok(()),
-            Err(err) if err.to_string().contains("duplicate column name") => Ok(()),
-            Err(err) => Err(err.into()),
+        // Ask the schema rather than matching on the text of the error. The
+        // "duplicate column name" wording is not a stable interface, and
+        // mistaking it for a real failure turns a no-op migration into a
+        // startup failure that leaves the app without a database.
+        let already_present = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+            params![table, column],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if already_present {
+            return Ok(());
         }
+
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+        self.connection.execute_batch(&sql)?;
+        Ok(())
     }
 
     /// Begins a transaction on the shared connection. All other storage methods

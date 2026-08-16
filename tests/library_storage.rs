@@ -32,6 +32,31 @@ fn initializes_required_schema() {
 }
 
 #[test]
+fn reopening_an_existing_database_reruns_migrations_cleanly() {
+    let dir = tempfile::tempdir().expect("dir");
+    let db_path = dir.path().join("library.sqlite");
+
+    let first = LibraryService::initialize(&db_path).expect("initialize");
+    let comic = first
+        .upsert_comic(ComicInput {
+            path: "/library/book.cbz".to_owned(),
+            hash: "hash".to_owned(),
+            page_count: 10,
+            metadata_id: None,
+        })
+        .expect("comic");
+    drop(first);
+
+    // Startup replays every add-column migration against a database that
+    // already has the columns. That path must be decided from the schema, not
+    // from the wording of a SQLite error.
+    let second = LibraryService::initialize(&db_path).expect("reinitialize");
+
+    assert_eq!(second.list_comics().expect("list").len(), 1);
+    assert!(second.get_comic(comic.id).expect("lookup").is_some());
+}
+
+#[test]
 fn creates_root_and_nested_folders() {
     let (_dir, service) = service();
 
