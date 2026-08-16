@@ -21,8 +21,8 @@ use crate::decode::{
 };
 use crate::library::{
     ActiveLibraryFilter, ComicAvailability, ImportSummary, LibraryGridItem, LibraryGroupKind,
-    LibraryService, ThumbnailRequest, ThumbnailStatus, ThumbnailWorkerPool, cache_path_for_source,
-    discover_supported_archives, import_paths,
+    LibraryService, ThumbnailCacheError, ThumbnailRequest, ThumbnailStatus, ThumbnailWorkerPool,
+    cache_path_for_source, discover_supported_archives, import_paths,
 };
 use crate::vfs::{self, ArchiveReader};
 use crate::viewer::layout::{Size2, ViewMode};
@@ -2557,6 +2557,11 @@ impl LibraryRootControls {
                     item.thumbnail_status = ThumbnailStatus::Loading;
                     scheduled_this_frame += 1;
                 }
+                // A full queue is backpressure, not a failure: leave the item
+                // Missing so it is retried once the workers drain, and stop
+                // scheduling this frame rather than burning through the rest of
+                // the library marking every comic as failed.
+                Err(ThumbnailCacheError::QueueFull) => break,
                 Err(error) => {
                     item.thumbnail_status = ThumbnailStatus::Failed {
                         message: error.to_string(),
