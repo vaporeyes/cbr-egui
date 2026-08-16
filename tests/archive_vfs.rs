@@ -2,7 +2,7 @@ use std::io::Write;
 
 use cbr_egui::vfs::{
     ArchiveError, ArchiveReader, PdfArchiveReader, RarArchiveReader, ZipArchiveReader, build_pages,
-    is_page_image_path,
+    is_page_image_path, read_page_bytes,
 };
 
 #[test]
@@ -72,23 +72,58 @@ fn pdf_reader_reports_missing_runtime_recoverably() {
     ));
 }
 
+#[test]
+fn cached_reader_serves_repeated_and_alternating_archives() {
+    // read_page_bytes keeps the last reader per thread so the zip central
+    // directory is not reparsed per page and the rar cursor survives. The
+    // cache is keyed by path, so it must not serve one archive's bytes for
+    // another, and must stay correct when a path is revisited.
+    let dir = tempfile::tempdir().expect("dir");
+    let first = dir.path().join("first.cbz");
+    let second = dir.path().join("second.cbz");
+    write_zip_fixture(&first);
+    write_zip_fixture(&second);
+
+    for _ in 0..3 {
+        assert_eq!(
+            read_page_bytes(&first, "page_1.jpg").expect("first archive"),
+            b"one"
+        );
+        assert_eq!(
+            read_page_bytes(&first, "page_2.jpg").expect("same archive again"),
+            b"two"
+        );
+        assert_eq!(
+            read_page_bytes(&second, "page_10.jpg").expect("second archive"),
+            b"ten"
+        );
+    }
+}
+
+fn write_zip_fixture(path: &std::path::Path) {
+    let file = std::fs::File::create(path).expect("zip file");
+    write_zip_entries(file);
+}
+
 fn zip_fixture() -> tempfile::NamedTempFile {
     let file = tempfile::NamedTempFile::new().expect("zip file");
-    {
-        let mut zip = zip::ZipWriter::new(file.reopen().expect("reopen fixture"));
-        let options = zip::write::SimpleFileOptions::default();
-        zip.start_file("page_10.jpg", options).expect("page 10");
-        zip.write_all(b"ten").expect("page 10 bytes");
-        zip.start_file("page_1.jpg", options).expect("page 1");
-        zip.write_all(b"one").expect("page 1 bytes");
-        zip.start_file("page_2.jpg", options).expect("page 2");
-        zip.write_all(b"two").expect("page 2 bytes");
-        zip.start_file("__MACOSX/page_3.jpg", options)
-            .expect("hidden");
-        zip.write_all(b"hidden").expect("hidden bytes");
-        zip.start_file("notes.txt", options).expect("notes");
-        zip.write_all(b"notes").expect("notes bytes");
-        zip.finish().expect("finish zip");
-    }
+    write_zip_entries(file.reopen().expect("reopen fixture"));
     file
+}
+
+fn write_zip_entries(file: std::fs::File) {
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    zip.start_file("page_10.jpg", options).expect("page 10");
+    zip.write_all(b"ten").expect("page 10 bytes");
+    zip.start_file("page_1.jpg", options).expect("page 1");
+    zip.write_all(b"one").expect("page 1 bytes");
+    zip.start_file("page_2.jpg", options).expect("page 2");
+    zip.write_all(b"two").expect("page 2 bytes");
+    zip.start_file("__MACOSX/page_3.jpg", options)
+        .expect("hidden");
+    zip.write_all(b"hidden").expect("hidden bytes");
+    zip.start_file("notes.txt", options).expect("notes");
+    zip.write_all(b"notes").expect("notes bytes");
+    zip.finish().expect("finish zip");
 }

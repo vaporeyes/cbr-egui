@@ -1,6 +1,7 @@
 // ABOUTME: Virtual filesystem layer dispatching archive formats to their readers.
 // ABOUTME: Exposes the reader factory used by both the UI and the decode workers.
-use std::path::Path;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 
 pub mod archive;
 pub mod ordering;
@@ -31,8 +32,37 @@ pub fn reader_for_path(path: &Path) -> Result<Box<dyn ArchiveReader>, ArchiveErr
     }
 }
 
+thread_local! {
+    // Caches the reader for the archive this thread last touched. Building a
+    // reader per page throws away everything the format needs to be efficient:
+    // the zip central directory is reparsed for every page, and the rar cursor
+    // restarts from the front of the archive. One slot is enough because a
+    // worker reads pages of one comic at a time.
+    static READER: RefCell<Option<CachedReader>> = const { RefCell::new(None) };
+}
+
+struct CachedReader {
+    path: PathBuf,
+    reader: Box<dyn ArchiveReader>,
+}
+
 /// Reads a single page's raw bytes by entry path. Decode workers call this so
 /// archive decompression stays off the GUI thread.
 pub fn read_page_bytes(archive_path: &Path, page_path: &str) -> Result<Vec<u8>, ArchiveError> {
-    reader_for_path(archive_path)?.read_page(page_path)
+    READER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if !slot
+            .as_ref()
+            .is_some_and(|cached| cached.path == archive_path)
+        {
+            // Drop the previous reader before opening the next one.
+            *slot = None;
+            *slot = Some(CachedReader {
+                path: archive_path.to_path_buf(),
+                reader: reader_for_path(archive_path)?,
+            });
+        }
+        let cached = slot.as_mut().expect("reader cached above");
+        cached.reader.read_page(page_path)
+    })
 }
