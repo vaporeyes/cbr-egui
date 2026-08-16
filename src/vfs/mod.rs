@@ -51,9 +51,9 @@ struct CachedReader {
 pub fn read_page_bytes(archive_path: &Path, page_path: &str) -> Result<Vec<u8>, ArchiveError> {
     READER.with(|cell| {
         let mut slot = cell.borrow_mut();
-        if !slot
+        if slot
             .as_ref()
-            .is_some_and(|cached| cached.path == archive_path)
+            .is_none_or(|cached| cached.path != archive_path)
         {
             // Drop the previous reader before opening the next one.
             *slot = None;

@@ -119,7 +119,10 @@ pub fn responsive_grid_columns(available_width: f32, tile_width: f32, gap: f32) 
 }
 
 pub enum LibraryItemEvent {
-    Open(LibraryGridItem),
+    /// Boxed so the enum stays small. Every visible tile returns an
+    /// `Option<LibraryItemEvent>` each frame, and inlining the grid item made
+    /// that a ~300 byte move per tile to carry a payload only a click uses.
+    Open(Box<LibraryGridItem>),
     SetRead { comic_id: i64, is_read: bool },
     Remove { comic_id: i64 },
     /// The cached cover file could not be read back. Emitted from the render
@@ -141,7 +144,7 @@ pub fn render_library_grid<T>(
 
     let columns = responsive_grid_columns(ui.available_width(), GRID_TILE_WIDTH, GRID_GAP).max(1);
     let mut event = None;
-    let total_rows = (visible_indices.len() + columns - 1) / columns;
+    let total_rows = visible_indices.len().div_ceil(columns);
 
     egui::ScrollArea::vertical().show_rows(
         ui,
@@ -197,14 +200,13 @@ pub fn render_library_list(
         |ui, row_range| {
             ui.spacing_mut().item_spacing.y = 6.0;
             for index in row_range {
-                if let Some(&item_index) = visible_indices.get(index) {
-                    if let Some(item) = items.get(item_index) {
+                if let Some(&item_index) = visible_indices.get(index)
+                    && let Some(item) = items.get(item_index) {
                         let is_selected = selected_ids.contains(&item.comic_id);
                         if let Some(e) = library_list_row(ui, item, is_selected, thumbnail_textures) {
                             event = Some(e);
                         }
                     }
-                }
             }
         },
     );
@@ -1661,11 +1663,10 @@ fn handle_library_item_event(
             }
         }
         Some(LibraryItemEvent::SetRead { comic_id, is_read }) => {
-            if let Some(service) = library_service {
-                if let Err(err) = app.set_comic_read(service, comic_id, is_read) {
+            if let Some(service) = library_service
+                && let Err(err) = app.set_comic_read(service, comic_id, is_read) {
                     app.library.status_text = Some(format!("Failed to update read state: {err}"));
                 }
-            }
         }
         Some(LibraryItemEvent::Remove { comic_id }) => {
             controls.remove_comics(app, library_service, &[comic_id]);
@@ -1808,11 +1809,10 @@ pub fn route_app_update(
                 }
                 process_reader_view_command(ctx, app, &item);
             }
-            if let Some(session) = &mut app.reading {
-                if session.show_info_panel {
+            if let Some(session) = &mut app.reading
+                && session.show_info_panel {
                     render_reader_info_panel(ctx, session);
                 }
-            }
             if let Some(session) = &mut app.reading {
                 viewer::ui::render_viewer_panel(ctx, &mut session.viewer_state);
             }
@@ -3430,7 +3430,7 @@ fn library_tile(
             }
         });
         if response.clicked() {
-            event = Some(LibraryItemEvent::Open(item.clone()));
+            event = Some(LibraryItemEvent::Open(Box::new(item.clone())));
         }
         event
     })
@@ -3599,7 +3599,7 @@ fn library_list_row(
         }
     });
     if response.clicked() {
-        event = Some(LibraryItemEvent::Open(item.clone()));
+        event = Some(LibraryItemEvent::Open(Box::new(item.clone())));
     }
     event
 }

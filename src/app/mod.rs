@@ -614,10 +614,10 @@ impl<T> ComicReaderApp<T> {
                 reading.set_current_page(target);
             }
         }
-        if let Ok(Some(row)) = service.get_comic_row(comic_id) {
-            if let Some(reading) = &mut self.reading {
-                reading.metadata = Some(row.metadata);
-            }
+        if let Ok(Some(row)) = service.get_comic_row(comic_id)
+            && let Some(reading) = &mut self.reading
+        {
+            reading.metadata = Some(row.metadata);
         }
         if let Some(reading) = &mut self.reading {
             match service.list_bookmarks(comic_id) {
@@ -727,8 +727,8 @@ impl LibraryViewState {
             .filter_map(|(index, item)| {
                 if !query.is_empty() {
                     let title_match = item.title.to_lowercase().contains(&query);
-                    let series_match = item.series.as_deref().map_or(false, |s| s.to_lowercase().contains(&query));
-                    let writer_match = item.writer.as_deref().map_or(false, |w| w.to_lowercase().contains(&query));
+                    let series_match = item.series.as_deref().is_some_and(|s| s.to_lowercase().contains(&query));
+                    let writer_match = item.writer.as_deref().is_some_and(|w| w.to_lowercase().contains(&query));
                     if !title_match && !series_match && !writer_match {
                         return None;
                     }

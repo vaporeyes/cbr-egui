@@ -57,11 +57,10 @@ pub fn try_relaunch_via_bundle() -> Option<i32> {
 #[cfg(target_os = "macos")]
 fn write_if_changed(path: &std::path::Path, contents: &str) -> Option<()> {
     use std::fs;
-    if let Ok(existing) = fs::read_to_string(path) {
-        if existing == contents {
+    if let Ok(existing) = fs::read_to_string(path)
+        && existing == contents {
             return Some(());
         }
-    }
     fs::write(path, contents).ok()?;
     Some(())
 }

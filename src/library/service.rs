@@ -158,7 +158,7 @@ impl LibraryService {
                 let folder = folder_parts(&comic.path);
                 let series = clean_string(row.metadata.series.clone());
                 let progress = progress_map.get(&comic.id);
-                let is_read = progress.map_or(false, |p| p.is_read);
+                let is_read = progress.is_some_and(|p| p.is_read);
                 let current_page = progress.map_or(0, |p| p.current_page);
                 LibraryGridItem {
                     comic_id: comic.id,
