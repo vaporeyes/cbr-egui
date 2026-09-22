@@ -1,3 +1,5 @@
+// ABOUTME: Renders paged and continuous comic-reader views with egui.
+// ABOUTME: Handles viewer input, zoom, pan, navigation, and status overlays.
 use eframe::egui;
 
 use crate::viewer::layout::{
@@ -77,10 +79,7 @@ fn render_ready_page(
         .show_viewport(ui, |ui, _viewport| {
             let offset = state.zoom_pan.pan_offset;
             let image_size = egui::vec2(display_size.width, display_size.height);
-            let canvas_size = egui::vec2(
-                display_size.width.max(viewport.width),
-                display_size.height.max(viewport.height),
-            );
+            let canvas_size = paged_canvas_size(viewport);
 
             let (rect, response) =
                 ui.allocate_exact_size(canvas_size, egui::Sense::click_and_drag());
@@ -109,8 +108,7 @@ fn render_ready_page(
             if response.clicked()
                 && let Some(pos) = response.interact_pointer_pos()
             {
-                click_navigation =
-                    click_zone_navigation(pos, visible, state.reading_direction);
+                click_navigation = click_zone_navigation(pos, visible, state.reading_direction);
             }
             if response.double_clicked()
                 && let Some(pos) = response.interact_pointer_pos()
@@ -157,6 +155,13 @@ fn render_ready_page(
     }
 
     render_status_chrome(ui, state);
+}
+
+fn paged_canvas_size(viewport: Size2) -> egui::Vec2 {
+    // ZoomPanState already keeps the translated image within the viewport's
+    // pan bounds. A larger scroll canvas clips the translated image at its
+    // original unshifted bounds when the reader pans toward an edge.
+    egui::vec2(viewport.width, viewport.height)
 }
 
 /// Maps a click inside the visible viewport to a page-turn command. The outer
@@ -564,4 +569,16 @@ fn paint_side_message(ui: &mut egui::Ui, pos: egui::Pos2, message: &str) {
 
 fn next_page_id(status: &PageStatus<egui::TextureHandle>) -> Option<crate::viewer::PageId> {
     status.page_id()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paged_canvas_stays_at_viewport_size_when_zoomed_page_is_larger() {
+        let viewport = Size2::new(1000.0, 800.0);
+
+        assert_eq!(paged_canvas_size(viewport), egui::vec2(1000.0, 800.0));
+    }
 }
