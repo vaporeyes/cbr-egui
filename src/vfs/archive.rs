@@ -1,3 +1,5 @@
+// ABOUTME: Defines archive page access and format-independent payloads.
+// ABOUTME: Preserves backend errors and separates encoded bytes from rendered pixels.
 use std::path::Path;
 
 use thiserror::Error;
@@ -8,6 +10,8 @@ use super::ordering::{is_page_image_path, sort_natural};
 
 #[derive(Debug, Error)]
 pub enum ArchiveError {
+    #[error("resource limit exceeded: {0}")]
+    ResourceLimit(String),
     #[error("unsupported archive format: {0}")]
     UnsupportedFormat(String),
     #[error("archive backend is unavailable: {0}")]
@@ -27,6 +31,14 @@ pub trait ArchiveReader {
     fn read_page(&mut self, path: &str) -> Result<Vec<u8>, ArchiveError>;
     fn read_entry(&mut self, path: &str) -> Result<Option<Vec<u8>>, ArchiveError>;
 
+    fn page_data(
+        &mut self,
+        path: &str,
+        _target: Option<[u32; 2]>,
+    ) -> Result<PageData, ArchiveError> {
+        self.read_page(path).map(PageData::Encoded)
+    }
+
     /// Metadata carried by the document format itself.
     ///
     /// Defaults to none, which is correct for the archive formats: a zip or rar
@@ -36,6 +48,11 @@ pub trait ArchiveReader {
     fn document_metadata(&mut self) -> Result<Option<ComicMetadata>, ArchiveError> {
         Ok(None)
     }
+}
+
+pub enum PageData {
+    Encoded(Vec<u8>),
+    Pixels(image::DynamicImage),
 }
 
 pub fn build_pages<I, S>(paths: I) -> Vec<ArchivePage>

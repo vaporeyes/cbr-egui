@@ -1,3 +1,5 @@
+// ABOUTME: Discovers comic files and reads archive metadata for library scans.
+// ABOUTME: Separates explicit open formats from automatic folder discovery.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -17,9 +19,18 @@ pub struct ScannedComic {
 
 /// Extensions the library will import. Narrower than what `vfs` can read:
 /// bare `.zip` and `.rar` open fine in the reader but are not assumed to be
-/// comics when sweeping a folder. This is the one list the file dialogs and
-/// the folder scanner share, so a new format is declared in a single place.
+/// comics when sweeping a folder. Explicit opens use OPENABLE_COMIC_EXTENSIONS.
 pub const SUPPORTED_COMIC_EXTENSIONS: &[&str] = &["cbz", "cbr", "pdf", "djvu", "djv"];
+pub const OPENABLE_COMIC_EXTENSIONS: &[&str] = &["cbz", "zip", "cbr", "rar", "pdf", "djvu", "djv"];
+
+pub fn is_openable_archive_path(path: impl AsRef<Path>) -> bool {
+    path.as_ref()
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            OPENABLE_COMIC_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        })
+}
 
 pub fn is_supported_archive_path(path: impl AsRef<Path>) -> bool {
     let Some(extension) = path

@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 
 pub mod archive;
 pub mod djvu;
+pub mod limits;
 pub mod ordering;
 pub mod pdf;
 pub mod rar;
 pub mod zip;
 
-pub use archive::{ArchiveError, ArchiveReader, build_pages};
+pub use archive::{ArchiveError, ArchiveReader, PageData, build_pages};
 pub use djvu::{DJVU_EXTENSIONS, DjvuArchiveReader};
 pub use ordering::{is_hidden_metadata_path, is_page_image_path, sort_natural};
 pub use pdf::PdfArchiveReader;
@@ -49,6 +50,7 @@ thread_local! {
 struct CachedReader {
     path: PathBuf,
     reader: Box<dyn ArchiveReader>,
+    pages: Option<Vec<crate::library::ArchivePage>>,
 }
 
 /// Reads a single page's raw bytes by entry path. Decode workers call this so
@@ -65,9 +67,47 @@ pub fn read_page_bytes(archive_path: &Path, page_path: &str) -> Result<Vec<u8>, 
             *slot = Some(CachedReader {
                 path: archive_path.to_path_buf(),
                 reader: reader_for_path(archive_path)?,
+                pages: None,
             });
         }
         let cached = slot.as_mut().expect("reader cached above");
         cached.reader.read_page(page_path)
     })
+}
+
+/// Resolves page indices and rasterizes on the calling worker, never on the UI.
+pub fn read_page_data(
+    archive_path: &Path,
+    index: usize,
+    target: Option<[u32; 2]>,
+) -> Result<PageData, ArchiveError> {
+    READER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot
+            .as_ref()
+            .is_none_or(|cached| cached.path != archive_path)
+        {
+            *slot = None;
+            *slot = Some(CachedReader {
+                path: archive_path.to_path_buf(),
+                reader: reader_for_path(archive_path)?,
+                pages: None,
+            });
+        }
+        let cached = slot.as_mut().expect("reader cached above");
+        if cached.pages.is_none() {
+            cached.pages = Some(cached.reader.list_pages()?);
+        }
+        let page = cached
+            .pages
+            .as_ref()
+            .and_then(|pages| pages.get(index))
+            .ok_or_else(|| ArchiveError::NotFound(format!("page {}", index + 1)))?;
+        cached.reader.page_data(&page.path, target)
+    })
+}
+
+pub(crate) fn clear_document_cache() {
+    pdf::clear_document_cache();
+    djvu::clear_document_cache();
 }

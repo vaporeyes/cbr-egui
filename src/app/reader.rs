@@ -258,12 +258,28 @@ pub(crate) fn process_reader_navigation(
     } else {
         resolve_navigation_target(command, session.current_page_index, session.page_count)
     };
-    let is_jump = matches!(
-        command,
-        PageNavigationCommand::FirstPage
-            | PageNavigationCommand::LastPage
-            | PageNavigationCommand::GoToPage(_)
-    );
+    if let Some(session) = &mut app.reading
+        && session.viewer_state.layout_mode == ReadingLayoutMode::ContinuousVertical
+    {
+        // Continuous navigation changes the viewport, whose tracking then
+        // updates progress. Loading a paged image alone cannot move the scroll.
+        let state = &mut session.viewer_state;
+        let page_top = state
+            .continuous_canvas
+            .as_ref()
+            .and_then(|canvas| canvas.page_rects.get(next_page))
+            .map(|rect| rect.y);
+        let scroll_top = state.continuous_visible_window.as_ref().and_then(|window| {
+            let step = (window.viewport_bottom - window.viewport_top) * 0.85;
+            match command {
+                PageNavigationCommand::ScrollDown => Some(window.viewport_top + step),
+                PageNavigationCommand::ScrollUp => Some((window.viewport_top - step).max(0.0)),
+                _ => None,
+            }
+        });
+        state.continuous_pending_scroll_top = scroll_top.or(page_top);
+        return;
+    }
 
     if Some(next_page)
         != app
@@ -272,20 +288,6 @@ pub(crate) fn process_reader_navigation(
             .map(|session| session.current_page_index)
     {
         load_reader_page(ctx, app, item, next_page);
-    }
-
-    // Explicit jumps must move the continuous viewport too, since continuous
-    // mode scrolls by viewport offset rather than swapping the current page.
-    if is_jump
-        && let Some(session) = &mut app.reading
-        && session.viewer_state.layout_mode == ReadingLayoutMode::ContinuousVertical
-        && let Some(canvas) = &session.viewer_state.continuous_canvas
-        && let Some(rect) = canvas
-            .page_rects
-            .iter()
-            .find(|rect| rect.page_index == next_page)
-    {
-        session.viewer_state.continuous_pending_scroll_top = Some(rect.y);
     }
 }
 
@@ -310,7 +312,7 @@ pub(crate) fn process_reader_app_command(
         AppCommand::ToggleContinuous => toggle_reader_continuous(app),
         AppCommand::RotateLeft => rotate_reader(ctx, app, item, false),
         AppCommand::RotateRight => rotate_reader(ctx, app, item, true),
-        AppCommand::ExtractPage => extract_reader_page(app),
+        AppCommand::ExtractPage => extract_reader_page(app, item),
     }
 }
 
@@ -325,12 +327,12 @@ pub(crate) fn discard_stale_view_command(app: &mut ComicReaderApp<egui::TextureH
     }
 }
 
-fn extract_reader_page(app: &mut ComicReaderApp<egui::TextureHandle>) {
+fn extract_reader_page(app: &mut ComicReaderApp<egui::TextureHandle>, item: &LibraryGridItem) {
     let Some(session) = &mut app.reading else {
         return;
     };
     let current_page = session.current_page_index;
-    let bytes = match session.archive_cache.read_page(current_page) {
+    let bytes = match read_session_page_bytes(session, Path::new(&item.path), current_page) {
         Ok(bytes) => bytes,
         Err(err) => {
             session.viewer_state.chrome.status_text = Some(format!("Extract failed: {}", err));
@@ -597,7 +599,7 @@ fn render_page_sidebar_row(
     page_index: usize,
     current_page: usize,
 ) -> bool {
-    let Some(session) = &app.reading else {
+    let Some(session) = &mut app.reading else {
         return false;
     };
     let thumbnail = session.page_thumbnails.get(&page_index).cloned();
@@ -687,28 +689,19 @@ fn schedule_page_sidebar_thumbnails(
         if submitted >= PAGE_SIDEBAR_MAX_SUBMITS_PER_FRAME {
             break;
         }
-        if session.page_thumbnails.contains_key(&page_index)
+        if session.page_thumbnails.contains(&page_index)
             || session.pending_page_thumbnails.contains(&page_index)
             || session.failed_page_thumbnails.contains(&page_index)
         {
             continue;
         }
 
-        let page_path = match resolve_session_page_path(session, Path::new(&item.path), page_index)
-        {
-            Ok(page_path) => page_path,
-            Err(_) => {
-                session.failed_page_thumbnails.insert(page_index);
-                continue;
-            }
-        };
-
         let request = DecodeRequest {
             request_id: session.page_thumbnail_request_id(page_index),
             page_index,
-            source: DecodeSource::ArchivePage {
+            source: DecodeSource::ArchiveIndex {
                 archive_path: PathBuf::from(&item.path),
-                page_path,
+                page_index,
             },
             purpose: DecodePurpose::Thumbnail,
             target_size: Some(PAGE_SIDEBAR_THUMB_TARGET),
@@ -767,7 +760,7 @@ pub(crate) fn poll_page_thumbnail_results(
                     color_image,
                     egui::TextureOptions::LINEAR,
                 );
-                session.page_thumbnails.insert(result.page_index, texture);
+                session.page_thumbnails.put(result.page_index, texture);
                 session.failed_page_thumbnails.remove(&result.page_index);
             }
             Err(_) => {
@@ -878,41 +871,14 @@ pub fn load_reader_page(
         return;
     }
 
-    if submit_direct_decode_for_session(session, &item.path).is_ok() {
-        ctx.request_repaint_after(Duration::from_millis(16));
-        return;
-    }
-
-    match read_session_page_color_image(session, &item.path, session.current_page_index) {
-        Ok((color_image, pixel_size)) => {
-            let texture = ctx.load_texture(
-                format!(
-                    "comic:{}:page:{}",
-                    item.comic_id, session.current_page_index
-                ),
-                color_image,
-                egui::TextureOptions::LINEAR,
-            );
-            let _ = session.texture_cache.insert(
-                session.current_page_index,
-                CachedPage {
-                    texture: texture.clone(),
-                    pixel_size,
-                },
-            );
-            session
-                .continuous_scroll
-                .record_actual(session.current_page_index, pixel_size);
-            session.viewer_state.set_ready(page_id, texture, pixel_size);
+    match submit_direct_decode_for_session(session, &item.path) {
+        Ok(()) => ctx.request_repaint_after(Duration::from_millis(16)),
+        Err(crate::decode::WorkerError::QueueFull) => {
+            // Retry next frame; backpressure must never trigger a GUI decode.
+            session.viewer_state.page_status = PageStatus::Empty;
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
-        Err(message) => {
-            session.continuous_scroll.record_failure(
-                session.current_page_index,
-                Size2::ZERO,
-                message.clone(),
-            );
-            session.viewer_state.set_failed(page_id, message);
-        }
+        Err(error) => session.viewer_state.set_failed(page_id, error.to_string()),
     }
 }
 
@@ -983,45 +949,23 @@ pub fn read_archive_page_color_image(
     Ok((color_image, pixel_size))
 }
 
-fn read_session_page_color_image<T>(
-    session: &mut ReadingSession<T>,
-    archive_path: impl AsRef<Path>,
-    page_index: usize,
-) -> Result<(egui::ColorImage, Size2), String> {
-    let bytes = read_session_page_bytes(session, archive_path.as_ref(), page_index)?;
-    let result = decode_page(DecodeRequest {
-        request_id: DecodeRequestId(page_index as u64),
-        page_index,
-        purpose: DecodePurpose::Direct,
-        source: DecodeSource::Bytes(bytes),
-        target_size: None,
-        rotation: session.rotation,
-        adjustments: session.adjustments,
-        cancellation_token: None,
-    });
-    let color_image = result.outcome.map_err(|err| err.to_string())?;
-    let pixel_size = Size2::new(color_image.size[0] as f32, color_image.size[1] as f32);
-    Ok((color_image, pixel_size))
-}
-
 fn submit_direct_decode_for_session<T>(
     session: &mut ReadingSession<T>,
     archive_path: &str,
-) -> Result<(), String> {
+) -> Result<(), crate::decode::WorkerError> {
     let page_index = session.current_page_index;
-    let page_path = resolve_session_page_path(session, Path::new(archive_path), page_index)?;
     let worker_pool = session
         .decode_worker_pool
         .as_ref()
-        .ok_or_else(|| "Decode worker pool is unavailable".to_owned())?;
+        .ok_or(crate::decode::WorkerError::ShutDown)?;
     let request_id = session.prefetch.next_request_id();
     let cancellation_token = CancellationToken::new();
     let request = DecodeRequest {
         request_id,
         page_index,
-        source: DecodeSource::ArchivePage {
+        source: DecodeSource::ArchiveIndex {
             archive_path: PathBuf::from(archive_path),
-            page_path,
+            page_index,
         },
         purpose: DecodePurpose::Direct,
         target_size: None,
@@ -1029,7 +973,7 @@ fn submit_direct_decode_for_session<T>(
         adjustments: session.adjustments,
         cancellation_token: Some(cancellation_token.clone()),
     };
-    worker_pool.submit(request).map_err(|err| err.to_string())?;
+    worker_pool.submit(request)?;
     session.prefetch.track_in_flight(
         page_index,
         request_id,
@@ -1052,14 +996,9 @@ pub fn dispatch_prefetch_for_session<T>(
     let mut submitted = 0;
 
     for page_index in candidates {
-        let Ok(page_path) = resolve_session_page_path(session, Path::new(archive_path), page_index)
-        else {
-            session
-                .prefetch
-                .failed_pages
-                .insert(page_index, "archive page read failed".to_owned());
+        if session.prefetch.failed_pages.contains_key(&page_index) {
             continue;
-        };
+        }
         let Some(worker_pool) = &session.decode_worker_pool else {
             break;
         };
@@ -1068,9 +1007,9 @@ pub fn dispatch_prefetch_for_session<T>(
         let request = DecodeRequest {
             request_id,
             page_index,
-            source: DecodeSource::ArchivePage {
+            source: DecodeSource::ArchiveIndex {
                 archive_path: PathBuf::from(archive_path),
-                page_path,
+                page_index,
             },
             purpose: DecodePurpose::Prefetch,
             target_size: None,
@@ -1110,24 +1049,12 @@ pub fn dispatch_continuous_prefetch_for_session<T>(
     let mut submitted = 0;
     for page_index in candidates {
         if session.texture_cache.contains(page_index)
+            || session.prefetch.failed_pages.contains_key(&page_index)
             || session.prefetch.queued_pages.contains(&page_index)
             || session.prefetch.in_flight.contains_key(&page_index)
         {
             continue;
         }
-        let Ok(page_path) = resolve_session_page_path(session, Path::new(archive_path), page_index)
-        else {
-            session
-                .prefetch
-                .failed_pages
-                .insert(page_index, "archive page read failed".to_owned());
-            session.continuous_scroll.record_failure(
-                page_index,
-                Size2::ZERO,
-                "archive page read failed",
-            );
-            continue;
-        };
         let Some(worker_pool) = &session.decode_worker_pool else {
             break;
         };
@@ -1136,12 +1063,14 @@ pub fn dispatch_continuous_prefetch_for_session<T>(
         let request = DecodeRequest {
             request_id,
             page_index,
-            source: DecodeSource::ArchivePage {
+            source: DecodeSource::ArchiveIndex {
                 archive_path: PathBuf::from(archive_path),
-                page_path,
+                page_index,
             },
             purpose: DecodePurpose::Prefetch,
-            target_size: None,
+            // Sixteen visible/overdraw pages must fit the 256 MiB texture
+            // budget, including one full-resolution directly loaded page.
+            target_size: Some([1920, 1920]),
             rotation: session.rotation,
             adjustments: session.adjustments,
             cancellation_token: Some(cancellation_token.clone()),
@@ -1365,21 +1294,6 @@ fn ensure_session_archive_cache<T>(
 
 fn archive_reader_for_path(path: &Path) -> Result<Box<dyn ArchiveReader>, String> {
     vfs::reader_for_path(path).map_err(|err| err.to_string())
-}
-
-/// Resolves the archive entry path for a page index without reading its bytes.
-/// The cheap page-list lookup stays on the GUI thread; the actual decompression
-/// is deferred to the decode worker via `DecodeSource::ArchivePage`.
-fn resolve_session_page_path<T>(
-    session: &mut ReadingSession<T>,
-    archive_path: &Path,
-    page_index: usize,
-) -> Result<String, String> {
-    ensure_session_archive_cache(session, archive_path)?;
-    session
-        .archive_cache
-        .page_entry_path(page_index)
-        .ok_or_else(|| format!("Page {} is not available", page_index + 1))
 }
 
 /// Parses a 1-based page number from user input into a clamped 0-based index.

@@ -390,10 +390,13 @@ fn paint_current_page_or_spread(
                 ..
             },
         ) => {
-            let (left_display, right_display) =
+            let (mut left_display, mut right_display) =
                 spread_page_sizes(left_size, *right_size, state.viewport_size, state.view_mode);
             let ordered_pages =
                 ordered_spread_pages(*left_page_id, *right_page_id, state.reading_direction);
+            if ordered_pages.0 != *left_page_id {
+                std::mem::swap(&mut left_display, &mut right_display);
+            }
             let left_display = left_display.scaled(state.zoom_pan.zoom);
             let right_display = right_display.scaled(state.zoom_pan.zoom);
             let total = egui::vec2(

@@ -11,9 +11,9 @@ use crate::app::ComicReaderApp;
 use crate::app::library_view::{default_thumbnail_cache_root, open_grid_item_in_reader};
 use crate::config::{AppConfig, default_library_store_root};
 use crate::library::{
-    ComicAvailability, ImportSummary, LibraryGridItem, LibraryService, ScannedComic,
-    ThumbnailCacheError, ThumbnailRequest, ThumbnailStatus, ThumbnailWorkerPool,
-    cache_path_for_source, discover_supported_archives, import_paths, scan_library_root,
+    ComicAvailability, ImportSummary, LibraryGridItem, LibraryService, ThumbnailCacheError,
+    ThumbnailRequest, ThumbnailStatus, ThumbnailWorkerPool, cache_path_for_source,
+    discover_supported_archives, import_paths, scan_library_root,
 };
 
 /// Upper bound on resident cover textures; covers scroll in and out of view,
@@ -25,11 +25,22 @@ const THUMBNAIL_TEXTURE_CACHE_CAPACITY: usize = 256;
 /// can spend without making a large library crawl.
 const MAX_THUMBNAIL_STATS_PER_FRAME: usize = 64;
 
+struct ImportCompletion {
+    summary: ImportSummary,
+    items: Vec<LibraryGridItem>,
+}
+
+struct RescanCompletion {
+    count: usize,
+    items: Vec<LibraryGridItem>,
+}
+
 pub struct LibraryRootControls {
-    import_result_receiver: Option<Receiver<Result<ImportSummary, String>>>,
-    rescan_result_receiver: Option<Receiver<Result<Vec<ScannedComic>, String>>>,
+    import_result_receiver: Option<Receiver<Result<ImportCompletion, String>>>,
+    rescan_result_receiver: Option<Receiver<Result<RescanCompletion, String>>>,
     open_first_after_import: bool,
     store_root: PathBuf,
+    database_path: Option<PathBuf>,
     thumbnail_pool: Option<ThumbnailWorkerPool>,
     pending_thumbnails: HashSet<String>,
     pub(crate) thumbnail_textures: lru::LruCache<String, egui::TextureHandle>,
@@ -52,6 +63,7 @@ impl LibraryRootControls {
             rescan_result_receiver: None,
             open_first_after_import: false,
             store_root: default_library_store_root(),
+            database_path: None,
             thumbnail_pool: ThumbnailWorkerPool::start(2, 16).ok(),
             pending_thumbnails: HashSet::new(),
             thumbnail_textures: lru::LruCache::new(
@@ -62,6 +74,10 @@ impl LibraryRootControls {
             about_open: false,
             shortcuts_open: false,
         }
+    }
+
+    pub(crate) fn set_database_path(&mut self, path: Option<&Path>) {
+        self.database_path = path.map(Path::to_path_buf);
     }
 
     pub(crate) fn is_importing(&self) -> bool {
@@ -85,10 +101,19 @@ impl LibraryRootControls {
             return;
         }
         let store_root = self.store_root.clone();
+        let database_path = self.database_path.clone();
         let (sender, receiver) = bounded(1);
         self.rescan_result_receiver = Some(receiver);
         thread::spawn(move || {
-            let result = scan_library_root(&store_root).map_err(|error| error.to_string());
+            let result = (|| {
+                let scanned = scan_library_root(&store_root).map_err(|error| error.to_string())?;
+                let service = background_service(database_path.as_deref())?;
+                let items = persist_scanned_comics_to_grid_items(&service, &scanned)?;
+                Ok(RescanCompletion {
+                    count: scanned.len(),
+                    items,
+                })
+            })();
             let _ = sender.send(result);
         });
     }
@@ -96,31 +121,23 @@ impl LibraryRootControls {
     pub(crate) fn poll_rescan(
         &mut self,
         app: &mut ComicReaderApp<egui::TextureHandle>,
-        library_service: Option<&LibraryService>,
+        _library_service: Option<&LibraryService>,
     ) {
         let Some(receiver) = &self.rescan_result_receiver else {
             return;
         };
-        let Ok(result) = receiver.try_recv() else {
-            return;
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                Err("Rescan worker stopped unexpectedly".to_owned())
+            }
         };
         self.rescan_result_receiver = None;
 
-        let scanned = match result {
-            Ok(scanned) => scanned,
-            Err(message) => {
-                app.library.status_text = Some(format!("Rescan failed: {message}"));
-                return;
-            }
-        };
-        let Some(service) = library_service else {
-            app.library.status_text = Some("Library database unavailable".to_owned());
-            return;
-        };
-
-        match persist_scanned_comics_to_grid_items(service, &scanned) {
-            Ok(items) => {
-                app.library.items = items;
+        match result {
+            Ok(completion) => {
+                app.library.items = completion.items;
                 app.library.refresh_filter_cache();
                 let unavailable = app
                     .library
@@ -128,35 +145,36 @@ impl LibraryRootControls {
                     .iter()
                     .filter(|item| item.availability == ComicAvailability::Unavailable)
                     .count();
-                app.library.status_text = Some(if unavailable > 0 {
-                    format!(
-                        "Rescanned {} comic(s); {unavailable} no longer on disk",
-                        scanned.len()
-                    )
-                } else {
-                    format!("Rescanned {} comic(s)", scanned.len())
-                });
+                app.library.status_text = Some(format!(
+                    "Rescanned {} comic(s); {unavailable} unavailable",
+                    completion.count
+                ));
             }
-            Err(message) => app.library.status_text = Some(message),
+            Err(message) => app.library.status_text = Some(format!("Rescan failed: {message}")),
         }
     }
 
     pub(crate) fn start_import_files(&mut self, files: Vec<PathBuf>) {
-        if self.is_importing() || files.is_empty() {
+        if self.is_importing() || self.is_rescanning() || files.is_empty() {
             return;
         }
         let store_root = self.store_root.clone();
+        let database_path = self.database_path.clone();
         let (sender, receiver) = bounded(1);
         self.import_result_receiver = Some(receiver);
         thread::spawn(move || {
-            let _ = sender.send(Ok(import_paths(&files, &store_root)));
+            let result = complete_import(
+                Ok(import_paths(&files, &store_root)),
+                database_path.as_deref(),
+            );
+            let _ = sender.send(result);
         });
     }
 
     /// Imports files requested from outside the UI (Finder open events, CLI
     /// arguments) and opens the first one in the reader once persisted.
     pub(crate) fn start_import_and_open(&mut self, files: Vec<PathBuf>) {
-        if self.is_importing() || files.is_empty() {
+        if self.is_importing() || self.is_rescanning() || files.is_empty() {
             return;
         }
         self.open_first_after_import = true;
@@ -164,27 +182,29 @@ impl LibraryRootControls {
     }
 
     pub(crate) fn start_import_folder(&mut self, folder: PathBuf) {
-        if self.is_importing() {
+        if self.is_importing() || self.is_rescanning() {
             return;
         }
         let store_root = self.store_root.clone();
+        let database_path = self.database_path.clone();
         let (sender, receiver) = bounded(1);
         self.import_result_receiver = Some(receiver);
         thread::spawn(move || {
             let result = discover_supported_archives(&folder)
                 .map_err(|error| error.to_string())
                 .map(|paths| import_paths(&paths, &store_root));
-            let _ = sender.send(result);
+            let _ = sender.send(complete_import(result, database_path.as_deref()));
         });
     }
 
     /// Imports a mixed batch of dropped paths: folders are expanded to their
     /// supported archives on the worker thread, files are imported directly.
     pub(crate) fn start_import_dropped(&mut self, paths: Vec<PathBuf>) {
-        if self.is_importing() || paths.is_empty() {
+        if self.is_importing() || self.is_rescanning() || paths.is_empty() {
             return;
         }
         let store_root = self.store_root.clone();
+        let database_path = self.database_path.clone();
         let (sender, receiver) = bounded(1);
         self.import_result_receiver = Some(receiver);
         thread::spawn(move || {
@@ -204,7 +224,7 @@ impl LibraryRootControls {
                 Some(message) if files.is_empty() => Err(message),
                 _ => Ok(import_paths(&files, &store_root)),
             };
-            let _ = sender.send(result);
+            let _ = sender.send(complete_import(result, database_path.as_deref()));
         });
     }
 
@@ -217,45 +237,32 @@ impl LibraryRootControls {
         let Some(receiver) = &self.import_result_receiver else {
             return;
         };
-        let Ok(result) = receiver.try_recv() else {
-            return;
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                Err("Import worker stopped unexpectedly".to_owned())
+            }
         };
 
         self.import_result_receiver = None;
         let open_after_import = std::mem::take(&mut self.open_first_after_import);
         match result {
-            Ok(summary) => {
-                let Some(service) = library_service else {
-                    app.library.status_text = Some("Library database unavailable".to_owned());
-                    return;
-                };
-                let mut added = 0usize;
-                let mut already_present = 0usize;
-                let mut error_text = None;
-                for imported in &summary.imported {
-                    match service.persist_imported_comic(imported) {
-                        Ok(_) => {
-                            if imported.already_present {
-                                already_present += 1;
-                            } else {
-                                added += 1;
-                            }
-                        }
-                        Err(error) => error_text = Some(error.to_string()),
-                    }
-                }
-                match service.library_grid_items() {
-                    Ok(items) => {
-                        app.library.items = items;
-                        app.library.refresh_filter_cache();
-                    }
-                    Err(error) => error_text = Some(error.to_string()),
-                }
+            Ok(completion) => {
+                let summary = completion.summary;
+                let already_present = summary
+                    .imported
+                    .iter()
+                    .filter(|comic| comic.already_present)
+                    .count();
+                let added = summary.imported.len() - already_present;
+                app.library.items = completion.items;
+                app.library.refresh_filter_cache();
                 app.library.status_text = Some(import_status_text(
                     added,
                     already_present,
                     summary.failures.len(),
-                    error_text,
+                    None,
                 ));
                 if open_after_import {
                     let target = summary.imported.first().and_then(|imported| {
@@ -263,7 +270,10 @@ impl LibraryRootControls {
                         app.library
                             .items
                             .iter()
-                            .find(|item| item.path == stored)
+                            .find(|item| {
+                                item.path == stored
+                                    || item.source_fingerprint == imported.content_hash
+                            })
                             .cloned()
                     });
                     if let Some(item) = target {
@@ -616,4 +626,76 @@ pub(crate) fn remember_import_dir(config: &mut AppConfig, picked: &Path) {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(picked);
     config.last_import_dir = Some(dir.to_path_buf());
+}
+
+fn background_service(path: Option<&Path>) -> Result<LibraryService, String> {
+    let path = path.ok_or_else(|| "Library database unavailable".to_owned())?;
+    LibraryService::initialize(path).map_err(|error| error.to_string())
+}
+
+fn complete_import(
+    result: Result<ImportSummary, String>,
+    path: Option<&Path>,
+) -> Result<ImportCompletion, String> {
+    let summary = result?;
+    let service = background_service(path)?;
+    service
+        .persist_import_batch(&summary.imported)
+        .map_err(|error| error.to_string())?;
+    let items = service
+        .library_grid_items()
+        .map_err(|error| error.to_string())?;
+    Ok(ImportCompletion { summary, items })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::Duration;
+
+    #[test]
+    fn import_and_rescan_commit_before_the_ui_polls() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("book.cbz");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&source).unwrap());
+        zip.start_file("page.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"page").unwrap();
+        zip.finish().unwrap();
+        let db = dir.path().join("library.sqlite");
+        let service = LibraryService::initialize(&db).unwrap();
+        let mut controls = LibraryRootControls::new();
+        controls.store_root = dir.path().join("store");
+        controls.set_database_path(Some(&db));
+        controls.start_import_files(vec![source]);
+        let completion = controls
+            .import_result_receiver
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(completion.items.len(), 1);
+        let comic = service.list_comics().unwrap().remove(0);
+        service.save_progress(comic.id, 0, true).unwrap();
+        std::fs::rename(&comic.path, dir.path().join("removed.cbz")).unwrap();
+        controls.start_rescan();
+        let completion = controls
+            .rescan_result_receiver
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            completion.items[0].availability,
+            ComicAvailability::Unavailable
+        );
+        assert_eq!(
+            service.get_comic(comic.id).unwrap().unwrap().availability,
+            ComicAvailability::Unavailable
+        );
+        assert!(service.get_progress(comic.id).unwrap().unwrap().is_read);
+    }
 }

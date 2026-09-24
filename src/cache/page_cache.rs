@@ -1,3 +1,5 @@
+// ABOUTME: Bounds page resources by entry count and optional byte budgets.
+// ABOUTME: Evicts least recently used resources and tracks cache revisions.
 use std::num::NonZeroUsize;
 
 use lru::LruCache;
@@ -21,9 +23,12 @@ pub enum PageTextureCacheError {
 /// `egui::TextureHandle`. Background decode workers must not create or insert
 /// texture handles; callers insert them only after main-thread texture upload.
 pub struct PageTextureCache<T> {
-    entries: LruCache<usize, T>,
+    entries: LruCache<usize, (T, usize)>,
     evictor: Option<Box<dyn FnMut(T)>>,
     version: u64,
+    bytes: usize,
+    byte_budget: usize,
+    weigh: fn(&T) -> usize,
     capacity_warning_emitted: bool,
 }
 
@@ -43,8 +48,26 @@ impl<T> PageTextureCache<T> {
             entries: LruCache::new(NonZeroUsize::new(capacity).expect("capacity checked")),
             evictor: None,
             version: 0,
+            bytes: 0,
+            byte_budget: usize::MAX,
+            weigh: std::mem::size_of_val,
             capacity_warning_emitted: false,
         })
+    }
+
+    pub fn with_byte_budget(
+        capacity: usize,
+        byte_budget: usize,
+        weigh: fn(&T) -> usize,
+    ) -> Result<Self, PageTextureCacheError> {
+        let mut cache = Self::new(capacity)?;
+        cache.byte_budget = byte_budget;
+        cache.weigh = weigh;
+        Ok(cache)
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.bytes
     }
 
     pub fn with_evictor(
@@ -81,22 +104,39 @@ impl<T> PageTextureCache<T> {
     }
 
     pub fn get(&mut self, page_index: usize) -> Option<&T> {
-        self.entries.get(&page_index)
+        self.entries.get(&page_index).map(|(texture, _)| texture)
     }
 
     pub fn insert(&mut self, page_index: usize, texture: T) -> Option<T> {
-        self.version = self.version.saturating_add(1);
-        let evicted = self
-            .entries
-            .push(page_index, texture)
-            .map(|(_, value)| value);
-        match (&mut self.evictor, evicted) {
-            (Some(evictor), Some(value)) => {
-                evictor(value);
-                None
-            }
-            (_, evicted) => evicted,
+        let weight = (self.weigh)(&texture);
+        if weight > self.byte_budget {
+            return Some(texture);
         }
+        self.version = self.version.saturating_add(1);
+        let mut evicted = self
+            .entries
+            .push(page_index, (texture, weight))
+            .map(|(_, entry)| entry);
+        if let Some((_, weight)) = &evicted {
+            self.bytes -= weight;
+        }
+        self.bytes += weight;
+        if let Some(evictor) = &mut self.evictor
+            && let Some((value, _)) = evicted.take()
+        {
+            evictor(value);
+        }
+        while self.bytes > self.byte_budget {
+            if let Some((_, (value, weight))) = self.entries.pop_lru() {
+                self.bytes -= weight;
+                if let Some(evictor) = &mut self.evictor {
+                    evictor(value);
+                } else {
+                    evicted = Some((value, weight));
+                }
+            }
+        }
+        evicted.map(|(value, _)| value)
     }
 
     pub fn contains(&self, page_index: usize) -> bool {
@@ -110,9 +150,10 @@ impl<T> PageTextureCache<T> {
     }
 
     pub fn clear(&mut self) {
+        self.bytes = 0;
         self.version = self.version.saturating_add(1);
         if let Some(evictor) = &mut self.evictor {
-            while let Some((_key, value)) = self.entries.pop_lru() {
+            while let Some((_key, (value, _))) = self.entries.pop_lru() {
                 evictor(value);
             }
         } else {
@@ -140,7 +181,7 @@ impl<T> PageTextureCache<T> {
 impl<T> Drop for PageTextureCache<T> {
     fn drop(&mut self) {
         if let Some(evictor) = &mut self.evictor {
-            while let Some((_key, value)) = self.entries.pop_lru() {
+            while let Some((_key, (value, _))) = self.entries.pop_lru() {
                 evictor(value);
             }
         }

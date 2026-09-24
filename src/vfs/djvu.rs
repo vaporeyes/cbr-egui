@@ -1,4 +1,4 @@
-// ABOUTME: Renders DjVu pages to PNG bytes for the unified decode pipeline.
+// ABOUTME: Renders DjVu pages to bounded pixels for the decode pipeline.
 // ABOUTME: Caches the parsed document per thread to avoid reparsing per page.
 use std::cell::RefCell;
 use std::io::Cursor;
@@ -8,7 +8,7 @@ use djvu_rs::djvu_document::DjVuDocument;
 use djvu_rs::djvu_render::{RenderOptions, render_pixmap};
 use image::ImageFormat;
 
-use super::archive::{ArchiveError, ArchiveReader};
+use super::archive::{ArchiveError, ArchiveReader, PageData};
 use crate::library::metadata::document_metadata;
 use crate::library::models::{ArchivePage, ComicMetadata};
 
@@ -64,8 +64,21 @@ fn with_document<R>(
             // Drop the previously cached document before parsing the new one,
             // so two books are never held in memory at once.
             *slot = None;
-            let bytes = std::fs::read(path)?;
-            let document = DjVuDocument::parse(&bytes)
+            let file = std::fs::File::open(path)?;
+            super::limits::check_size(file.metadata()?.len(), super::limits::MAX_DOCUMENT_BYTES)?;
+            let bytes = super::limits::read_bounded(file, super::limits::MAX_DOCUMENT_BYTES)?;
+            let options = djvu_rs::resource_limits::ParseOptions {
+                limits: Some(djvu_rs::resource_limits::ResourceLimits {
+                    max_file_bytes: Some(super::limits::MAX_DOCUMENT_BYTES),
+                    max_page_pixels: Some(super::limits::MAX_SOURCE_PIXELS),
+                    max_decoded_bytes: Some(256 * 1024 * 1024),
+                    max_render_pixels: Some(super::limits::MAX_RASTER_PIXELS),
+                    max_pages: Some(100_000),
+                    max_components: Some(200_000),
+                    ..Default::default()
+                }),
+            };
+            let document = DjVuDocument::parse_with_options(&bytes, &options)
                 .map_err(|err| ArchiveError::CorruptArchive(err.to_string()))?;
             *slot = Some(CachedDocument {
                 path: path.to_path_buf(),
@@ -95,41 +108,50 @@ impl ArchiveReader for DjvuArchiveReader {
     }
 
     fn read_entry(&mut self, path: &str) -> Result<Option<Vec<u8>>, ArchiveError> {
-        let Some(page_index) = Self::page_index(path) else {
+        if Self::page_index(path).is_none() {
             return Ok(None);
+        }
+        // Encoding is reserved for explicit raw-page extraction, not viewing.
+        let PageData::Pixels(image) = self.page_data(path, None)? else {
+            unreachable!()
         };
+        let mut cursor = Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, ImageFormat::Png)
+            .map_err(|err| ArchiveError::Read(err.to_string()))?;
+        Ok(Some(cursor.into_inner()))
+    }
+
+    fn page_data(
+        &mut self,
+        path: &str,
+        target: Option<[u32; 2]>,
+    ) -> Result<PageData, ArchiveError> {
+        let page_index =
+            Self::page_index(path).ok_or_else(|| ArchiveError::NotFound(path.to_owned()))?;
         with_document(&self.path, |document| {
             let page = document
                 .page(page_index)
                 .map_err(|_| ArchiveError::NotFound(path.to_owned()))?;
-
-            // Render at the page's own pixel dimensions. RenderOptions leaves
-            // width and height at zero by default, which the renderer rejects
-            // rather than treating as "native size".
+            // RenderOptions requires explicit dimensions. Bound both the source
+            // and output before the renderer allocates its pixel buffer.
             let (width, height) = page.dimensions();
+            let [width, height] =
+                super::limits::raster_size(u32::from(width), u32::from(height), target)?;
             let options = RenderOptions {
-                width: u32::from(width),
-                height: u32::from(height),
+                width,
+                height,
                 ..RenderOptions::default()
             };
             let pixmap =
                 render_pixmap(page, &options).map_err(|err| ArchiveError::Read(err.to_string()))?;
-
-            // Hand the decode pipeline encoded bytes like every other reader,
-            // so page decoding, limits, rotation, and adjustments stay in one
-            // place. Matches how the PDF reader bridges a rendered page.
-            let image = image::RgbaImage::from_raw(pixmap.width, pixmap.height, pixmap.data)
+            image::RgbaImage::from_raw(pixmap.width, pixmap.height, pixmap.data)
+                .map(image::DynamicImage::ImageRgba8)
                 .ok_or_else(|| {
-                    ArchiveError::Read(
-                        "rendered page dimensions do not match its pixels".to_owned(),
-                    )
-                })?;
-            let mut cursor = Cursor::new(Vec::new());
-            image
-                .write_to(&mut cursor, ImageFormat::Png)
-                .map_err(|err| ArchiveError::Read(err.to_string()))?;
-            Ok(Some(cursor.into_inner()))
+                    ArchiveError::Read("rendered dimensions do not match pixels".to_owned())
+                })
         })
+        .map(PageData::Pixels)
     }
 
     fn document_metadata(&mut self) -> Result<Option<ComicMetadata>, ArchiveError> {
@@ -145,4 +167,10 @@ impl ArchiveReader for DjvuArchiveReader {
             Ok(document_metadata(metadata.title, metadata.author))
         })
     }
+}
+
+pub(crate) fn clear_document_cache() {
+    DOCUMENT.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
 }

@@ -1,3 +1,5 @@
+// ABOUTME: Stores comic metadata, provenance, bookmarks, and reading progress.
+// ABOUTME: Migrates existing SQLite libraries without replacing comic identities.
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -83,6 +85,9 @@ impl LibraryStorage {
         self.add_column_if_missing("comics", "availability", "INTEGER NOT NULL DEFAULT 1")?;
         self.add_column_if_missing("comics", "thumbnail_key", "TEXT NULL")?;
         self.add_column_if_missing("progress", "updated_at", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_column_if_missing("comics", "source_path", "TEXT NULL")?;
+        self.connection
+            .execute_batch("CREATE INDEX IF NOT EXISTS idx_comics_hash ON comics(hash)")?;
         Ok(())
     }
 
@@ -284,7 +289,8 @@ impl LibraryStorage {
                 m.title,
                 m.number,
                 m.writer,
-                m.penciller
+                m.penciller,
+                c.source_path
             FROM comics c
             LEFT JOIN metadata m ON m.id = c.metadata_id
             WHERE c.id = ?1
@@ -305,6 +311,33 @@ impl LibraryStorage {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn get_comic_by_hash(&self, hash: &str) -> Result<Option<Comic>, LibraryError> {
+        self.connection
+            .query_row(
+                comic_select_sql("WHERE hash = ?1 ORDER BY id LIMIT 1").as_str(),
+                [hash],
+                comic_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_source_path(&self, comic_id: i64, source_path: &str) -> Result<(), LibraryError> {
+        self.connection.execute(
+            "UPDATE comics SET source_path = COALESCE(source_path, ?2) WHERE id = ?1",
+            params![comic_id, source_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn relocate_comic(&self, comic_id: i64, path: &str) -> Result<(), LibraryError> {
+        self.connection.execute(
+            "UPDATE comics SET path = ?2 WHERE id = ?1",
+            params![comic_id, path],
+        )?;
+        Ok(())
     }
 
     pub fn list_comics(&self) -> Result<Vec<Comic>, LibraryError> {
@@ -331,7 +364,8 @@ impl LibraryStorage {
                 m.title,
                 m.number,
                 m.writer,
-                m.penciller
+                m.penciller,
+                c.source_path
             FROM comics c
             LEFT JOIN metadata m ON m.id = c.metadata_id
             ORDER BY c.path
@@ -439,9 +473,9 @@ impl LibraryStorage {
     }
 
     pub fn list_progress(&self) -> Result<std::collections::HashMap<i64, Progress>, LibraryError> {
-        let mut statement = self.connection.prepare(
-            "SELECT comic_id, current_page, is_read, updated_at FROM progress",
-        )?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT comic_id, current_page, is_read, updated_at FROM progress")?;
         let progress_iter = statement.query_map([], progress_from_row)?;
         let mut map = std::collections::HashMap::new();
         for progress in progress_iter {
@@ -538,6 +572,7 @@ fn comic_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Comic> {
 fn library_comic_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryComicRow> {
     let page_count = row.get::<_, u32>(3)?;
     Ok(LibraryComicRow {
+        source_path: row.get(12)?,
         comic: Comic {
             id: row.get(0)?,
             path: row.get(1)?,

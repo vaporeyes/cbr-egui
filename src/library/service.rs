@@ -1,23 +1,40 @@
-use std::path::Path;
+// ABOUTME: Coordinates transactional library updates and presentation models.
+// ABOUTME: Preserves imported source provenance and existing reading identities.
+use std::path::{Path, PathBuf};
 
 use super::errors::LibraryError;
 use super::import::ImportedComic;
 use super::models::{
     Bookmark, Comic, ComicAvailability, ComicInput, ComicMetadata, ComicMetadataDisplay, Folder,
-    LibraryGridItem, Progress, ThumbnailStatus, LibraryComicRow,
+    LibraryComicRow, LibraryGridItem, Progress, ThumbnailStatus,
 };
 use super::scanner::ScannedComic;
 use super::storage::LibraryStorage;
 
 pub struct LibraryService {
     storage: LibraryStorage,
+    db_path: PathBuf,
 }
 
 impl LibraryService {
     pub fn initialize(db_path: &Path) -> Result<Self, LibraryError> {
         Ok(Self {
             storage: LibraryStorage::open(db_path)?,
+            db_path: db_path.to_path_buf(),
         })
+    }
+
+    pub fn database_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    pub fn persist_import_batch(&self, comics: &[ImportedComic]) -> Result<(), LibraryError> {
+        let transaction = self.storage.transaction()?;
+        for comic in comics {
+            self.persist_imported_comic_inner(comic)?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn create_folder(
@@ -128,12 +145,29 @@ impl LibraryService {
     /// Records an imported (copied) comic in the database, keyed by its managed
     /// store path. Re-importing the same file reuses the existing metadata row
     /// and refreshes the comic in place.
-    pub fn persist_imported_comic(
+    pub fn persist_imported_comic(&self, imported: &ImportedComic) -> Result<Comic, LibraryError> {
+        let transaction = self.storage.transaction()?;
+        let comic = self.persist_imported_comic_inner(imported)?;
+        transaction.commit()?;
+        Ok(comic)
+    }
+
+    fn persist_imported_comic_inner(
         &self,
         imported: &ImportedComic,
     ) -> Result<Comic, LibraryError> {
-        let path = imported.stored_path.to_string_lossy().into_owned();
-        let existing = self.storage.get_comic_by_path(&path)?;
+        let mut path = imported.stored_path.to_string_lossy().into_owned();
+        let existing = self
+            .storage
+            .get_comic_by_path(&path)?
+            .or(self.storage.get_comic_by_hash(&imported.content_hash)?);
+        if let Some(existing) = &existing {
+            if Path::new(&existing.path).is_file() {
+                path = existing.path.clone();
+            } else {
+                self.storage.relocate_comic(existing.id, &path)?;
+            }
+        }
         let previous_metadata_id = existing.as_ref().and_then(|comic| comic.metadata_id);
         let metadata_id = imported
             .metadata
@@ -147,6 +181,8 @@ impl LibraryService {
             page_count: imported.page_count,
             metadata_id,
         })?;
+        self.storage
+            .set_source_path(comic.id, &imported.source_path.to_string_lossy())?;
         if let Some(previous_metadata_id) = previous_metadata_id
             && Some(previous_metadata_id) != metadata_id
         {
@@ -164,14 +200,23 @@ impl LibraryService {
             .into_iter()
             .map(|row| {
                 let comic = row.comic;
-                let folder = folder_parts(&comic.path);
+                // Legacy managed rows cannot recover their original folders.
+                // Do not expose the content hash as a user-facing folder name.
+                let managed = Path::new(&comic.path)
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name.to_string_lossy() == comic.hash);
+                let source = row.source_path.as_deref();
+                let folder = source
+                    .and_then(folder_parts)
+                    .or_else(|| (!managed).then(|| folder_parts(&comic.path)).flatten());
                 let series = clean_string(row.metadata.series.clone());
                 let progress = progress_map.get(&comic.id);
                 let is_read = progress.is_some_and(|p| p.is_read);
                 let current_page = progress.map_or(0, |p| p.current_page);
                 LibraryGridItem {
                     comic_id: comic.id,
-                    title: std::path::Path::new(&comic.path)
+                    title: std::path::Path::new(source.unwrap_or(&comic.path))
                         .file_stem()
                         .and_then(|value| value.to_str())
                         .unwrap_or(&comic.path)

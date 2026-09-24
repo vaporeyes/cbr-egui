@@ -1,6 +1,5 @@
 // ABOUTME: Decodes raw page image bytes into egui color images for display.
 // ABOUTME: Defines cancellation-aware decode request and result payloads.
-use std::borrow::Cow;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{
@@ -24,7 +23,7 @@ const MAX_DECODE_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
 /// textures at 16384 px and `load_texture` has no error path, so a page above
 /// the driver limit uploads as garbage or fails outright. Pages beyond this
 /// are downscaled first.
-const MAX_TEXTURE_DIMENSION: u32 = 8_192;
+const MAX_TEXTURE_DIMENSION: u32 = crate::vfs::limits::MAX_RASTER_SIDE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DecodeRequestId(pub u64);
@@ -153,6 +152,10 @@ pub enum DecodeSource {
         archive_path: PathBuf,
         page_path: String,
     },
+    ArchiveIndex {
+        archive_path: PathBuf,
+        page_index: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -203,9 +206,9 @@ pub fn decode_page(request: DecodeRequest) -> DecodeResult {
     let outcome = abort_if_cancelled(cancel).and_then(|()| {
         // Reading the archive happens here, on the worker thread, so page
         // decompression never stalls the GUI frame loop.
-        resolve_source_bytes(&request.source).and_then(|bytes| {
-            decode_bytes(
-                bytes.as_ref(),
+        resolve_source_image(&request.source, request.target_size).and_then(|image| {
+            process_image(
+                image,
                 request.target_size,
                 request.rotation,
                 request.adjustments,
@@ -221,35 +224,42 @@ pub fn decode_page(request: DecodeRequest) -> DecodeResult {
     }
 }
 
-fn resolve_source_bytes(source: &DecodeSource) -> Result<Cow<'_, [u8]>, DecodeError> {
+fn resolve_source_image(
+    source: &DecodeSource,
+    target: Option<[u32; 2]>,
+) -> Result<image::DynamicImage, DecodeError> {
     match source {
-        DecodeSource::Bytes(bytes) => Ok(Cow::Borrowed(bytes)),
+        DecodeSource::Bytes(bytes) => load_within_limits(bytes),
         DecodeSource::ArchivePage {
             archive_path,
             page_path,
         } => crate::vfs::read_page_bytes(archive_path, page_path)
-            .map(Cow::Owned)
-            .map_err(|err| DecodeError::Image(err.to_string())),
+            .map_err(|err| DecodeError::Image(err.to_string()))
+            .and_then(|bytes| load_within_limits(&bytes)),
+        DecodeSource::ArchiveIndex {
+            archive_path,
+            page_index,
+        } => {
+            match crate::vfs::read_page_data(archive_path, *page_index, target)
+                .map_err(|err| DecodeError::Image(err.to_string()))?
+            {
+                crate::vfs::PageData::Encoded(bytes) => load_within_limits(&bytes),
+                crate::vfs::PageData::Pixels(image) => Ok(image),
+            }
+        }
     }
 }
 
-fn decode_bytes(
-    bytes: &[u8],
+fn process_image(
+    mut image: image::DynamicImage,
     target_size: Option<[u32; 2]>,
     rotation: Rotation,
     adjustments: ImageAdjustments,
     cancel: Option<&CancellationToken>,
 ) -> Result<egui::ColorImage, DecodeError> {
-    if bytes.is_empty() {
-        return Err(DecodeError::EmptyBytes);
-    }
-
     // Each stage below is a full-page pass. Re-check between them so a page the
     // reader has already navigated away from stops costing work, instead of
     // running to completion and holding up whatever is on screen now.
-    abort_if_cancelled(cancel)?;
-    let mut image = load_within_limits(bytes)?;
-
     abort_if_cancelled(cancel)?;
     if let Some([target_width, target_height]) = target_size
         && target_width > 0
@@ -269,12 +279,14 @@ fn decode_bytes(
 
     // Downscale past the driver's texture limit before the RGBA buffer is
     // materialised, so nothing unuploadable reaches `load_texture`.
-    let image = if image.width() > MAX_TEXTURE_DIMENSION || image.height() > MAX_TEXTURE_DIMENSION {
-        image.resize(
-            MAX_TEXTURE_DIMENSION,
-            MAX_TEXTURE_DIMENSION,
-            FilterType::Lanczos3,
-        )
+    let [width, height] = crate::vfs::limits::raster_size(
+        image.width(),
+        image.height(),
+        Some([MAX_TEXTURE_DIMENSION; 2]),
+    )
+    .map_err(|err| DecodeError::Image(err.to_string()))?;
+    let image = if image.width() != width || image.height() != height {
+        image.resize_exact(width, height, FilterType::Lanczos3)
     } else {
         image
     };
@@ -332,6 +344,9 @@ fn decode_bytes(
 /// The area check runs against the header so an oversized image is rejected
 /// before its pixel buffer is allocated, not after.
 pub fn load_within_limits(bytes: &[u8]) -> Result<image::DynamicImage, DecodeError> {
+    if bytes.is_empty() {
+        return Err(DecodeError::EmptyBytes);
+    }
     let (width, height) = limited_reader(bytes)?
         .into_dimensions()
         .map_err(|err| DecodeError::Image(err.to_string()))?;

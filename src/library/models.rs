@@ -1,3 +1,5 @@
+// ABOUTME: Defines persisted comics and display models for library browsing.
+// ABOUTME: Keeps original source identity separate from managed object paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Comic {
     pub id: i64,
@@ -60,6 +62,7 @@ pub struct ComicMetadataDisplay {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryComicRow {
+    pub source_path: Option<String>,
     pub comic: Comic,
     pub metadata: ComicMetadataDisplay,
 }

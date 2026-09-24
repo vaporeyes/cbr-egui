@@ -1,3 +1,5 @@
+// ABOUTME: Exposes library import, persistence, scanning, and thumbnail services.
+// ABOUTME: Shares comic records and supported format definitions with the application.
 pub mod errors;
 pub mod import;
 pub mod metadata;
@@ -16,8 +18,8 @@ pub use models::{
     LibraryGroup, LibraryGroupKind, LibraryRoot, LibraryScanStatus, Progress, ThumbnailStatus,
 };
 pub use scanner::{
-    SUPPORTED_COMIC_EXTENSIONS, ScannedComic, archive_page_count, discover_supported_archives,
-    is_supported_archive_path, scan_library_root, source_fingerprint,
+    OPENABLE_COMIC_EXTENSIONS, SUPPORTED_COMIC_EXTENSIONS, ScannedComic, archive_page_count,
+    discover_supported_archives, is_supported_archive_path, scan_library_root, source_fingerprint,
 };
 pub use service::LibraryService;
 pub use thumbnails::{

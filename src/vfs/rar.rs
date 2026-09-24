@@ -1,3 +1,5 @@
+// ABOUTME: Reads RAR comics with a reusable sequential archive cursor.
+// ABOUTME: Checks entry sizes and preserves enumeration and extraction errors.
 use std::path::{Path, PathBuf};
 
 use unrar::{CursorBeforeHeader, OpenArchive, Process};
@@ -40,10 +42,13 @@ impl RarArchiveReader {
         {
             let entry_path = header.entry().filename.to_string_lossy().into_owned();
             if entry_path == path {
+                let limit = super::limits::entry_limit(path);
+                super::limits::check_size(header.entry().unpacked_size, limit)?;
                 let (bytes, next) = header
                     .read()
                     .map_err(|err| ArchiveError::Read(err.to_string()))?;
                 self.cursor = Some(next);
+                super::limits::check_size(bytes.len() as u64, limit)?;
                 return Ok(Some(bytes));
             }
             archive = header
@@ -61,7 +66,9 @@ impl ArchiveReader for RarArchiveReader {
             .open_for_listing()
             .map_err(|err| ArchiveError::BackendUnavailable(err.to_string()))?;
         let paths = archive
-            .filter_map(|entry| entry.ok())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ArchiveError::Read(error.to_string()))?
+            .into_iter()
             .map(|entry| entry.filename.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 

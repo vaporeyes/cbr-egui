@@ -1,3 +1,5 @@
+// ABOUTME: Verifies application routing, reading state, and asynchronous page loading.
+// ABOUTME: Exercises persistence and library-to-reader transitions through public APIs.
 use cbr_egui::app::ui::{
     EguiComicReaderApp, dispatch_continuous_prefetch_for_session, dispatch_prefetch_for_session,
     empty_library_text, load_reader_page, parse_goto_target, persist_scanned_comics_to_grid_items,
@@ -16,8 +18,8 @@ use cbr_egui::library::{
     LibraryGroupKind, LibraryService, ScannedComic, ThumbnailStatus,
 };
 use cbr_egui::viewer::{
-    AppCommand, ContinuousPageStatus, PageId, PageNavigationCommand, PageStatus,
-    ReadingLayoutMode, Size2, ViewCommand, ViewMode, ViewerState, VisiblePageWindow,
+    AppCommand, ContinuousPageStatus, PageId, PageNavigationCommand, PageStatus, ReadingLayoutMode,
+    Size2, ViewCommand, ViewMode, ViewerState, VisiblePageWindow,
 };
 use eframe::egui;
 use image::{ImageBuffer, ImageFormat, Rgba};
@@ -547,7 +549,9 @@ fn reopening_grid_item_restores_saved_page() {
     )
     .expect("persisted items");
     let item = items.first().expect("item").clone();
-    service.save_progress(item.comic_id, 7, false).expect("progress");
+    service
+        .save_progress(item.comic_id, 7, false)
+        .expect("progress");
 
     let mut app: ComicReaderApp<&str> = ComicReaderApp::default();
     assert!(app.open_grid_item_resuming(&service, &item));
@@ -569,7 +573,9 @@ fn reopening_grid_item_clamps_saved_page_to_last_page() {
     )
     .expect("persisted items");
     let item = items.first().expect("item").clone();
-    service.save_progress(item.comic_id, 99, false).expect("progress");
+    service
+        .save_progress(item.comic_id, 99, false)
+        .expect("progress");
 
     let mut app: ComicReaderApp<&str> = ComicReaderApp::default();
     assert!(app.open_grid_item_resuming(&service, &item));
@@ -591,7 +597,9 @@ fn reopening_finished_comic_restarts_from_first_page() {
     )
     .expect("persisted items");
     let item = items.first().expect("item").clone();
-    service.save_progress(item.comic_id, 4, true).expect("progress");
+    service
+        .save_progress(item.comic_id, 4, true)
+        .expect("progress");
 
     let mut app: ComicReaderApp<&str> = ComicReaderApp::default();
     assert!(app.open_grid_item_resuming(&service, &item));
@@ -1074,7 +1082,8 @@ fn load_reader_page_cache_miss_uses_direct_decode_worker() {
     ));
     let in_flight = session.prefetch.in_flight.get(&1).expect("direct request");
     assert_eq!(in_flight.purpose, DecodePurpose::Direct);
-    assert_eq!(session.archive_cache.page_count(), 3);
+    // Enumeration is owned by the worker; the GUI archive cache stays unopened.
+    assert_eq!(session.archive_cache.page_count(), 0);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let result = loop {
@@ -1159,10 +1168,12 @@ fn large_page_jump_cancels_stale_in_flight_prefetches() {
     session.set_current_page(50);
     let submitted = dispatch_prefetch_for_session(&mut session, "/missing/archive.cbz");
 
-    assert_eq!(submitted, 0);
+    // Missing-file errors are delivered asynchronously, after cancellation.
+    assert_eq!(submitted, 3);
     assert!(page_three.is_cancelled());
     assert!(page_four.is_cancelled());
-    assert!(session.prefetch.in_flight.is_empty());
+    assert!(!session.prefetch.in_flight.contains_key(&3));
+    assert!(!session.prefetch.in_flight.contains_key(&4));
 }
 
 #[test]

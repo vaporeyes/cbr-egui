@@ -1,4 +1,7 @@
+// ABOUTME: Loads and atomically saves application preferences.
+// ABOUTME: Resolves configuration and managed library locations.
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -52,12 +55,19 @@ impl AppConfig {
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        if let Some(parent) = path.as_ref().parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::create_dir_all(parent)?;
         let content = serde_json::to_string_pretty(&self.clone().normalized())
             .map_err(std::io::Error::other)?;
-        fs::write(path, content)
+        let mut staging = tempfile::NamedTempFile::new_in(parent)?;
+        staging.write_all(content.as_bytes())?;
+        staging.as_file().sync_all()?;
+        staging.persist(path).map_err(|error| error.error)?;
+        Ok(())
     }
 
     pub fn normalized(mut self) -> Self {

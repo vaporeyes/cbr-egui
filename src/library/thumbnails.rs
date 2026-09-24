@@ -1,3 +1,5 @@
+// ABOUTME: Generates bounded cover thumbnails on background workers.
+// ABOUTME: Publishes cache images atomically and disconnects workers on drop.
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
@@ -54,7 +56,7 @@ pub struct ThumbnailResult {
 
 pub struct ThumbnailWorkerPool {
     sender: Option<Sender<ThumbnailRequest>>,
-    receiver: Receiver<ThumbnailResult>,
+    receiver: Option<Receiver<ThumbnailResult>>,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -73,7 +75,7 @@ impl ThumbnailWorkerPool {
 
         Ok(Self {
             sender: Some(sender),
-            receiver,
+            receiver: Some(receiver),
             handles,
         })
     }
@@ -89,16 +91,17 @@ impl ThumbnailWorkerPool {
     }
 
     pub fn try_recv(&self) -> Option<ThumbnailResult> {
-        self.receiver.try_recv().ok()
+        self.receiver.as_ref()?.try_recv().ok()
     }
 }
 
 impl Drop for ThumbnailWorkerPool {
     fn drop(&mut self) {
         self.sender.take();
-        for handle in self.handles.drain(..) {
-            let _ = handle.join();
-        }
+        self.receiver.take();
+        // Detach on the GUI thread; disconnected sends terminate each worker
+        // after its active request, without draining the remaining work.
+        self.handles.clear();
     }
 }
 
@@ -134,14 +137,16 @@ pub fn cover_request_for_pages(pages: &[ArchivePage]) -> Option<&ArchivePage> {
 }
 
 pub fn thumbnail_target_size(width: u32, height: u32) -> [u32; 2] {
-    if width == 0 || height == 0 || height <= MAX_THUMBNAIL_HEIGHT {
+    if width == 0 || height == 0 {
         return [width, height];
     }
 
-    let scale = MAX_THUMBNAIL_HEIGHT as f32 / height as f32;
+    let scale = (MAX_THUMBNAIL_HEIGHT as f32 / height as f32)
+        .min(600.0 / width as f32)
+        .min(1.0);
     [
         ((width as f32) * scale).round().max(1.0) as u32,
-        MAX_THUMBNAIL_HEIGHT,
+        ((height as f32) * scale).round().max(1.0) as u32,
     ]
 }
 
@@ -152,14 +157,21 @@ pub fn write_thumbnail(
     // Covers come from untrusted archives, so they get the same dimension and
     // allocation guards as page decoding rather than the image crate defaults.
     let image = load_within_limits(bytes)?;
-    let [target_width, target_height] = thumbnail_target_size(image.width(), image.height());
-    let image = if target_height > 0 && target_height < image.height() {
-        image.resize(target_width, target_height, FilterType::Lanczos3)
-    } else {
-        image
-    };
+    write_thumbnail_image(image, cache_path.as_ref())
+}
 
-    let cache_path = cache_path.as_ref();
+fn write_thumbnail_image(
+    image: image::DynamicImage,
+    cache_path: &Path,
+) -> Result<[u32; 2], ThumbnailCacheError> {
+    let [target_width, target_height] = thumbnail_target_size(image.width(), image.height());
+    let image =
+        if target_height > 0 && (target_height < image.height() || target_width < image.width()) {
+            image.resize(target_width, target_height, FilterType::Lanczos3)
+        } else {
+            image
+        };
+
     if let Some(parent) = cache_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -181,10 +193,10 @@ fn spawn_thumbnail_worker(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         while let Ok(request) = request_receiver.recv() {
-            let outcome = read_cover_bytes(Path::new(&request.source_path))
+            let outcome = read_cover_image(Path::new(&request.source_path))
                 .map_err(|err| err.to_string())
-                .and_then(|bytes| {
-                    write_thumbnail(&bytes, &request.cache_path).map_err(|err| err.to_string())
+                .and_then(|image| {
+                    write_thumbnail_image(image, &request.cache_path).map_err(|err| err.to_string())
                 });
             let result = ThumbnailResult {
                 source_path: request.source_path,
@@ -198,11 +210,15 @@ fn spawn_thumbnail_worker(
     })
 }
 
-fn read_cover_bytes(archive_path: &Path) -> Result<Vec<u8>, ArchiveError> {
+fn read_cover_image(archive_path: &Path) -> Result<image::DynamicImage, ArchiveError> {
     let mut reader = crate::vfs::reader_for_path(archive_path)?;
     let pages = reader.list_pages()?;
     let page = cover_request_for_pages(&pages)
         .ok_or_else(|| ArchiveError::NotFound("cover page".to_owned()))?;
-    reader.read_page(&page.path)
+    match reader.page_data(&page.path, Some([600, MAX_THUMBNAIL_HEIGHT]))? {
+        crate::vfs::PageData::Encoded(bytes) => {
+            load_within_limits(&bytes).map_err(|err| ArchiveError::Read(err.to_string()))
+        }
+        crate::vfs::PageData::Pixels(image) => Ok(image),
+    }
 }
-

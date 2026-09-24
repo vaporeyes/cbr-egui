@@ -58,9 +58,10 @@ pub fn try_relaunch_via_bundle() -> Option<i32> {
 fn write_if_changed(path: &std::path::Path, contents: &str) -> Option<()> {
     use std::fs;
     if let Ok(existing) = fs::read_to_string(path)
-        && existing == contents {
-            return Some(());
-        }
+        && existing == contents
+    {
+        return Some(());
+    }
     fs::write(path, contents).ok()?;
     Some(())
 }
@@ -102,9 +103,39 @@ fn info_plist(bundle_id: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn launcher_script(env_var: &str, real_binary: &str) -> String {
-    format!(
-        "#!/bin/sh\nexport {env_var}=1\nexec \"{real_binary}\" \"$@\"\n"
-    )
+    let quoted_binary = real_binary.replace('\'', "'\"'\"'");
+    format!("#!/bin/sh\nexport {env_var}=1\nexec '{quoted_binary}' \"$@\"\n")
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    #[test]
+    fn launcher_preserves_literal_executable_path_and_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir
+            .path()
+            .join("reader 'quoted' $HOME `literal` $(literal)");
+        std::fs::write(&executable, "#!/bin/sh\nprintf '%s\\n' \"$1\"\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let launcher = dir.path().join("launcher.sh");
+        std::fs::write(
+            &launcher,
+            super::launcher_script("CBR_TEST_LAUNCHER", executable.to_str().unwrap()),
+        )
+        .unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .arg(&launcher)
+            .arg("argument with $literal")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"argument with $literal\n");
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

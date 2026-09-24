@@ -67,7 +67,15 @@ pub struct CachedPage<T> {
     pub pixel_size: crate::viewer::Size2,
 }
 
-pub const DEFAULT_RAW_PAGE_CACHE_CAPACITY: usize = 9;
+pub const DEFAULT_RAW_PAGE_CACHE_CAPACITY: usize = 1;
+const PAGE_TEXTURE_BYTE_BUDGET: usize = 256 * 1024 * 1024;
+const PAGE_THUMBNAIL_CAPACITY: usize = 128;
+
+fn cached_page_bytes<T>(page: &CachedPage<T>) -> usize {
+    (page.pixel_size.width as usize)
+        .saturating_mul(page.pixel_size.height as usize)
+        .saturating_mul(4)
+}
 
 pub struct ReadingArchiveCache {
     source_path: Option<PathBuf>,
@@ -360,7 +368,7 @@ pub struct ReadingSession<T> {
     /// Last page the sidebar auto-scrolled to; the sidebar follows navigation
     /// only when this falls behind the current page.
     pub sidebar_tracked_page: Option<usize>,
-    pub page_thumbnails: HashMap<usize, T>,
+    pub page_thumbnails: lru::LruCache<usize, T>,
     pub pending_page_thumbnails: HashSet<usize>,
     pub failed_page_thumbnails: HashSet<usize>,
     pub page_thumbnail_pool: Option<WorkerPool>,
@@ -380,7 +388,12 @@ impl<T> ReadingSession<T> {
             page_count,
             viewer_state: ViewerState::new(),
             prefetch: PrefetchRuntime::default(),
-            texture_cache: PageTextureCache::with_default_capacity(),
+            texture_cache: PageTextureCache::with_byte_budget(
+                crate::cache::DEFAULT_PAGE_CACHE_CAPACITY,
+                PAGE_TEXTURE_BYTE_BUDGET,
+                cached_page_bytes::<T>,
+            )
+            .expect("valid cache budget"),
             decode_worker_pool: WorkerPool::start(2, 16).ok(),
             continuous_scroll: ContinuousScrollState::new(),
             continuous_layout_stamp: None,
@@ -393,7 +406,9 @@ impl<T> ReadingSession<T> {
             show_adjustments: false,
             show_page_sidebar: true,
             sidebar_tracked_page: None,
-            page_thumbnails: HashMap::new(),
+            page_thumbnails: lru::LruCache::new(
+                NonZeroUsize::new(PAGE_THUMBNAIL_CAPACITY).expect("non-zero"),
+            ),
             pending_page_thumbnails: HashSet::new(),
             failed_page_thumbnails: HashSet::new(),
             page_thumbnail_pool: WorkerPool::start(1, 64).ok(),
@@ -432,7 +447,11 @@ impl<T> ReadingSession<T> {
             page_count,
             viewer_state: ViewerState::new(),
             prefetch: PrefetchRuntime::default(),
-            texture_cache: PageTextureCache::new(cache_capacity)?,
+            texture_cache: PageTextureCache::with_byte_budget(
+                cache_capacity,
+                PAGE_TEXTURE_BYTE_BUDGET,
+                cached_page_bytes::<T>,
+            )?,
             decode_worker_pool: WorkerPool::start(2, 16).ok(),
             continuous_scroll: ContinuousScrollState::new(),
             continuous_layout_stamp: None,
@@ -445,7 +464,9 @@ impl<T> ReadingSession<T> {
             show_adjustments: false,
             show_page_sidebar: true,
             sidebar_tracked_page: None,
-            page_thumbnails: HashMap::new(),
+            page_thumbnails: lru::LruCache::new(
+                NonZeroUsize::new(PAGE_THUMBNAIL_CAPACITY).expect("non-zero"),
+            ),
             pending_page_thumbnails: HashSet::new(),
             failed_page_thumbnails: HashSet::new(),
             page_thumbnail_pool: WorkerPool::start(1, 64).ok(),
@@ -542,6 +563,8 @@ pub struct ComicReaderApp<T> {
     pub state: AppState,
     pub library: LibraryViewState,
     pub reading: Option<ReadingSession<T>>,
+    pub reading_direction: ReadingDirection,
+    pub zoom_sensitivity: f32,
 }
 
 impl<T> Default for ComicReaderApp<T> {
@@ -550,13 +573,15 @@ impl<T> Default for ComicReaderApp<T> {
             state: AppState::Library,
             library: LibraryViewState::default(),
             reading: None,
+            reading_direction: ReadingDirection::LeftToRight,
+            zoom_sensitivity: crate::config::AppConfig::DEFAULT_ZOOM_SENSITIVITY,
         }
     }
 }
 
 impl<T> ComicReaderApp<T> {
     pub fn open_comic(&mut self, comic_id: i64, page_count: usize) {
-        self.open_comic_with_reading_direction(comic_id, page_count, ReadingDirection::LeftToRight);
+        self.open_comic_with_reading_direction(comic_id, page_count, self.reading_direction);
     }
 
     pub fn open_comic_with_reading_direction(
@@ -572,6 +597,7 @@ impl<T> ComicReaderApp<T> {
         self.library.selected_comic_id = Some(comic_id);
         let mut session = ReadingSession::new(comic_id, page_count);
         session.set_reading_direction(reading_direction);
+        session.viewer_state.zoom_sensitivity = self.zoom_sensitivity;
         self.reading = Some(session);
     }
 
@@ -705,6 +731,7 @@ impl<T> ComicReaderApp<T> {
     }
 
     pub fn apply_reading_direction(&mut self, direction: ReadingDirection) {
+        self.reading_direction = direction;
         if let Some(reading) = &mut self.reading {
             reading.set_reading_direction(direction);
         }

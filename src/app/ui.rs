@@ -110,6 +110,9 @@ pub fn route_app_update(
     config: &mut AppConfig,
     library_service: Option<&LibraryService>,
 ) {
+    app.apply_reading_direction(config.reading_direction);
+    app.zoom_sensitivity = config.zoom_sensitivity;
+    library_controls.set_database_path(library_service.map(LibraryService::database_path));
     if !ctx.wants_keyboard_input() && ctx.input(|input| input.key_pressed(egui::Key::F11)) {
         let fullscreen = ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
@@ -125,7 +128,7 @@ pub fn route_app_update(
     poll_decode_results(ctx, app);
     // Files opened from Finder or the command line wait here while another
     // import runs; the repaint scheduled below retries them next frame.
-    if !library_controls.is_importing() {
+    if !library_controls.is_importing() && !library_controls.is_rescanning() {
         let external_opens = crate::mac_open::take_pending();
         if !external_opens.is_empty() {
             library_controls.start_import_and_open(external_opens);
@@ -653,6 +656,7 @@ impl EguiComicReaderApp {
     }
 
     fn apply_config_to_active_session(&mut self) {
+        self.inner.zoom_sensitivity = self.config.zoom_sensitivity;
         self.inner
             .apply_reading_direction(self.config.reading_direction);
         if let Some(reading) = &mut self.inner.reading {
@@ -776,12 +780,17 @@ impl eframe::App for EguiComicReaderApp {
             self.library_service.as_ref(),
         );
         self.reconcile_resume_state_after_route(was_reading);
+        self.apply_config_to_active_session();
         self.checkpoint_active_progress_throttled(ctx);
         self.sync_window_title(ctx);
         self.render_settings_window(ctx);
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        let _ = self.flush_lifecycle_state();
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         let _ = self.flush_lifecycle_state();
     }
 }

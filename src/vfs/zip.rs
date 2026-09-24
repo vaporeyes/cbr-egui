@@ -1,5 +1,6 @@
+// ABOUTME: Reads ZIP comic entries using a retained central directory and handle.
+// ABOUTME: Bounds decompression before allocating page or metadata buffers.
 use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use zip::ZipArchive;
@@ -10,6 +11,7 @@ use crate::library::models::ArchivePage;
 pub struct ZipArchiveReader {
     path: PathBuf,
     pages_cache: Option<Vec<ArchivePage>>,
+    archive: Option<ZipArchive<File>>,
 }
 
 impl ZipArchiveReader {
@@ -17,12 +19,19 @@ impl ZipArchiveReader {
         Self {
             path: path.as_ref().to_path_buf(),
             pages_cache: None,
+            archive: None,
         }
     }
 
-    fn open(&self) -> Result<ZipArchive<File>, ArchiveError> {
-        let file = File::open(&self.path)?;
-        ZipArchive::new(file).map_err(|err| ArchiveError::CorruptArchive(err.to_string()))
+    fn open(&mut self) -> Result<&mut ZipArchive<File>, ArchiveError> {
+        if self.archive.is_none() {
+            let file = File::open(&self.path)?;
+            self.archive = Some(
+                ZipArchive::new(file)
+                    .map_err(|err| ArchiveError::CorruptArchive(err.to_string()))?,
+            );
+        }
+        Ok(self.archive.as_mut().expect("archive opened above"))
     }
 }
 
@@ -50,13 +59,14 @@ impl ArchiveReader for ZipArchiveReader {
         // No raw-bytes cache: decoded pages are already cached as textures, so the
         // OS page cache is left to serve repeat reads. This keeps the VFS layer's
         // baseline memory footprint minimal.
-        let mut archive = self.open()?;
-        let Ok(mut file) = archive.by_name(path) else {
-            return Ok(None);
+        let archive = self.open()?;
+        let file = match archive.by_name(path) {
+            Ok(file) => file,
+            Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+            Err(error) => return Err(ArchiveError::Read(error.to_string())),
         };
-        let mut bytes = Vec::with_capacity(file.size() as usize);
-        file.read_to_end(&mut bytes)
-            .map_err(|err| ArchiveError::Read(err.to_string()))?;
-        Ok(Some(bytes))
+        let limit = super::limits::entry_limit(path);
+        super::limits::check_size(file.size(), limit)?;
+        super::limits::read_bounded(file, limit).map(Some)
     }
 }

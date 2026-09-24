@@ -1,13 +1,15 @@
+// ABOUTME: Runs bounded image decode work away from the GUI thread.
+// ABOUTME: Disconnects result delivery before joining workers at shutdown.
 use std::thread::{self, JoinHandle};
 
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
 use super::error::WorkerError;
 use super::pipeline::{DecodeRequest, DecodeResult, decode_page};
 
 pub struct WorkerPool {
     request_sender: Option<Sender<DecodeRequest>>,
-    result_receiver: Receiver<DecodeResult>,
+    result_receiver: Option<Receiver<DecodeResult>>,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -21,12 +23,9 @@ impl WorkerPool {
         }
 
         let (request_sender, request_receiver) = bounded::<DecodeRequest>(queue_bound);
-        // Results are unbounded so a worker can never block handing one back.
-        // A bounded result channel deadlocks shutdown: nothing drains it while
-        // the pool is being torn down, so a full channel would park a worker in
-        // `send` forever. Depth stays bounded anyway, because a result only
-        // exists for a request that got through the bounded request queue.
-        let (result_sender, result_receiver) = unbounded::<DecodeResult>();
+        // Bound completed pixel buffers as well as requests. Shutdown drops
+        // the receiver first, waking any worker blocked on a full result queue.
+        let (result_sender, result_receiver) = bounded::<DecodeResult>(worker_count);
         let handles = (0..worker_count)
             .map(|_| spawn_worker(request_receiver.clone(), result_sender.clone()))
             .collect();
@@ -34,7 +33,7 @@ impl WorkerPool {
 
         Ok(Self {
             request_sender: Some(request_sender),
-            result_receiver,
+            result_receiver: Some(result_receiver),
             handles,
         })
     }
@@ -50,15 +49,21 @@ impl WorkerPool {
     }
 
     pub fn try_recv(&self) -> Option<DecodeResult> {
-        self.result_receiver.try_recv().ok()
+        self.result_receiver.as_ref()?.try_recv().ok()
     }
 
     pub fn shutdown(mut self) -> Result<(), WorkerError> {
         self.request_sender.take();
+        self.result_receiver.take();
+        let mut panicked = false;
         for handle in self.handles.drain(..) {
-            handle.join().map_err(|_| WorkerError::WorkerPanicked)?;
+            panicked |= handle.join().is_err();
         }
-        Ok(())
+        if panicked {
+            Err(WorkerError::WorkerPanicked)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -66,11 +71,12 @@ impl Drop for WorkerPool {
     /// Signals shutdown without waiting. Pools are dropped on the GUI thread
     /// whenever a comic is closed or rotated, and joining there stalls the
     /// frame for however long the in-progress decodes take. Closing the request
-    /// channel is enough: each worker finishes its current page, sees the
-    /// closed channel, and exits. Callers that need the threads gone
+    /// and result channels lets each worker finish its current page and exit.
+    /// Callers that need the threads gone
     /// deterministically use `shutdown`.
     fn drop(&mut self) {
         self.request_sender.take();
+        self.result_receiver.take();
     }
 }
 

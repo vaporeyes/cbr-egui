@@ -1,4 +1,4 @@
-// ABOUTME: Renders PDF pages to PNG bytes for the unified decode pipeline.
+// ABOUTME: Renders PDF pages to bounded pixels for the decode pipeline.
 // ABOUTME: Binds PDFium once per process and caches the parsed document per thread.
 use std::cell::RefCell;
 use std::io::Cursor;
@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use image::ImageFormat;
 use pdfium_render::prelude::{PdfDocument, PdfDocumentMetadataTagType, PdfRenderConfig, Pdfium};
 
-use super::archive::{ArchiveError, ArchiveReader};
+use super::archive::{ArchiveError, ArchiveReader, PageData};
 use crate::library::metadata::document_metadata;
 use crate::library::models::{ArchivePage, ComicMetadata};
 
@@ -84,6 +84,10 @@ fn with_document<R>(
         if !matches {
             // Drop the previously cached document before opening the new one.
             *slot = None;
+            super::limits::check_size(
+                std::fs::metadata(path)?.len(),
+                super::limits::MAX_DOCUMENT_BYTES,
+            )?;
             let document = pdfium
                 .load_pdf_from_file(path, None)
                 .map_err(|err| ArchiveError::Read(err.to_string()))?;
@@ -115,25 +119,53 @@ impl ArchiveReader for PdfArchiveReader {
     }
 
     fn read_entry(&mut self, path: &str) -> Result<Option<Vec<u8>>, ArchiveError> {
-        let Some(page_index) = Self::page_index(path) else {
+        if Self::page_index(path).is_none() {
             return Ok(None);
+        }
+        // Encoding is reserved for explicit raw-page extraction, not viewing.
+        let PageData::Pixels(image) = self.page_data(path, None)? else {
+            unreachable!()
         };
+        let mut cursor = Cursor::new(Vec::new());
+        image
+            .write_to(&mut cursor, ImageFormat::Png)
+            .map_err(|err| ArchiveError::Read(err.to_string()))?;
+        Ok(Some(cursor.into_inner()))
+    }
+
+    fn page_data(
+        &mut self,
+        path: &str,
+        target: Option<[u32; 2]>,
+    ) -> Result<PageData, ArchiveError> {
+        let page_index =
+            Self::page_index(path).ok_or_else(|| ArchiveError::NotFound(path.to_owned()))?;
         with_document(&self.path, |document| {
             let page = document
                 .pages()
                 .get(page_index)
                 .map_err(|_| ArchiveError::NotFound(path.to_owned()))?;
-            let image = page
-                .render_with_config(&PdfRenderConfig::new())
-                .map_err(|err| ArchiveError::Read(err.to_string()))?
-                .as_image()
-                .map_err(|err| ArchiveError::Read(err.to_string()))?;
-            let mut cursor = Cursor::new(Vec::new());
-            image
-                .write_to(&mut cursor, ImageFormat::Png)
-                .map_err(|err| ArchiveError::Read(err.to_string()))?;
-            Ok(Some(cursor.into_inner()))
+            let width = page.width().value;
+            let height = page.height().value;
+            if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+                return Err(ArchiveError::ResourceLimit(
+                    "invalid PDF page dimensions".to_owned(),
+                ));
+            }
+            // Two pixels per point gives document text a useful default resolution.
+            let [width, height] = super::limits::raster_size(
+                (width * 2.0).ceil() as u32,
+                (height * 2.0).ceil() as u32,
+                target,
+            )?;
+            page.render_with_config(
+                &PdfRenderConfig::new().set_target_size(width as i32, height as i32),
+            )
+            .map_err(|err| ArchiveError::Read(err.to_string()))?
+            .as_image()
+            .map_err(|err| ArchiveError::Read(err.to_string()))
         })
+        .map(PageData::Pixels)
     }
 
     fn document_metadata(&mut self) -> Result<Option<ComicMetadata>, ArchiveError> {
@@ -146,4 +178,10 @@ impl ArchiveReader for PdfArchiveReader {
             ))
         })
     }
+}
+
+pub(crate) fn clear_document_cache() {
+    DOCUMENT.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
 }
